@@ -315,35 +315,44 @@ A short example for a slide deck (the model sees the full schema with descriptio
   with only a type and title plots the number columns against the first column.
 - **Errors go back to the model.** If something is missing or too long, the tool answers with a list
   of exact problems (e.g. `slides[3].chart.series[0]: 2 values for 3 categories`), and the model
-  can call it again. The positions refer to the list the model sent, even after repairs.
+  can call it again. The positions refer to the list the model sent.
 - **Content that cannot be meant is rejected**, so a technically valid but useless file is not reported
   as done: a number column that holds mostly text (usually rows shifted against the columns), an empty
-  column that a formula uses (e.g. prices left out of an offer), a total on an empty column, a chart
-  column without numbers, a formula that uses its own column, a slide table with only a header row, a table
-  of contents without chapters, and more text than fits on a slide or into a slide table.
-- **Common slips are repaired:** models often send slightly different shapes, so the tool also
-  accepts `{"bullets": [...]}` instead of `{"type": "bullets", "items": [...]}`, a missing `layout`
-  (guessed from the content), `type` instead of `layout`, lists sent as one text, table rows sent as
-  plain text, Markdown lists inside a paragraph, a missing title (the first heading or slide title is
-  used, or "Pros & Cons" from the two column headings), file-name-style titles (`Report_Q3.xlsx`),
-  other names for block types (`list`, `subheading`, `toc` …) and for content fields (`content`,
-  `list`, `points` …), a slide whose content does not match its layout (a list slide with a table
-  shows the table), chart data written at slide level, sub items as a nested list, formulas without
-  `=`, columns given as plain names, and `null` for unused fields. Empty paragraphs (used as spacing)
-  are left out, an empty chart object means "no chart", a list slide without any content becomes a
-  divider slide, and a sheet that only holds a chart passes the chart to the sheet with the columns
-  it refers to. Numbered lines inside a paragraph only become a list when they count up from 1, so
-  "3. Oktober …" stays text. Markdown tables inside a paragraph become real tables, `<br>` becomes a line
-  break, formulas written into the rows (`=B2-C2`, `=B3-C3` …) become the column formula, a last row of
-  `=SUM(…)` cells or an empty "Total" row becomes the total row, and a heading that only repeats the title
-  is left out.
-- **Broken JSON is repaired too.** Long arguments often reach the tool as JSON text rather than as
+  column that a formula uses (e.g. prices left out of an offer), a total on an empty column, a total row
+  written into the rows (a last row labelled e.g. "Summe" or "Netto-Summe": it would get the column
+  formulas too, be counted twice next to a column's `total`, or add up nothing, so the model is told to use
+  `total`), a chart column without numbers,
+  a formula that uses its own column, a slide table with only a header row, a table of contents without
+  chapters, and more text than fits on a slide or into a slide table.
+- **Content is never dropped without a word.** A field the tool does not know is sent back when it holds
+  text or a list of values (`"content"` instead of `"text"`, `"formulas"`, a sheet-level `"total"`, a
+  table under `"data"`), and so is content in a field that the block or layout does not show (a paragraph's
+  `items`, text on a page break, bullets on a section slide). Unknown fields with a single number or an
+  empty value, and a chart's own `title` on a slide (the slide title is shown), are ignored.
+- **Other shapes are not guessed.** A block without `type`, a slide without `title` or a list sent as one
+  text gets an error that names the field, and the model sends it again in the right shape. Only
+  unambiguous things are accepted as they are: `null` for unused fields, `{"slides": [...]}` instead of
+  the list, list items that all start with `- ` (top-level items, not sub items), `<br>` as a line break,
+  Markdown lists and tables inside a paragraph (numbered lines only become a list when they count up from
+  1, so "3. Oktober …" stays text), numbers sent as text in an Excel column without a type, `"null"` as
+  text in a number or date column (an empty cell), a chart object without data (no chart), formulas
+  without `=`, formulas written into single cells, file-name-style titles (`Report_Q3.xlsx`), a missing title (the
+  first heading or slide title is used), and empty paragraphs used as spacing (left out). A heading that
+  only repeats the title is left out.
+- **Broken JSON is repaired.** Long arguments often reach the tool as JSON text rather than as
   structured data (the server could not parse them), with the same few mistakes: German quotes
-  closed with a straight quote (`„Hoch"`), a forgotten `}` or `]`, table rows or list items written
-  as several arrays without the outer brackets, or the other tool parameters (e.g. the title) written
-  into the same text, which are then used. Valid JSON is never changed, and a repair is only used if
-  no content is lost: text left over after the value or arguments cut off in the middle (output limit
-  reached) are reported with the position and the text right before it, so the model sends them again.
+  closed with a straight quote (`„Hoch"`), a forgotten `}` or `]`, table rows written as several
+  arrays without the outer brackets, or the other tool parameters (e.g. the title) written into the
+  same text, which are then used. Fields that end up inside a chart object because its `}` was forgotten
+  (e.g. the speaker notes) are taken back to the slide or sheet. Valid JSON is never changed, and a repair
+  is only used if no content is lost. Otherwise the error shows the text on both sides of the place and
+  names the likely slip: a quote that ends a text too early, a bracket too many, a key inside a list that
+  was not closed, a missing comma or value, a comma before `]`, a backslash or line break inside a text,
+  or arguments cut off in the middle (output limit reached).
+- **Tested on new requests:** with five requests that were not used while writing the tool, Qwen3.8 27B
+  needed the JSON repair for 8 of 40 calls (with a little thinking) and would have needed the shape
+  repairs of earlier versions for 1 of 60. Gemma 4 26B sends shapes outside the schema much more often
+  (about 4 in 10 calls of the earlier tests); the tool sends them back, which costs extra rounds.
 
 ### Valves
 

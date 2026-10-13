@@ -36,10 +36,10 @@ import json
 import logging
 import re
 import unicodedata
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, replace
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from docx import Document
 from docx.enum.section import WD_ORIENT
@@ -66,7 +66,16 @@ from pptx.shapes.placeholder import SlidePlaceholder
 from pptx.text.text import TextFrame, _Paragraph as PptxParagraph
 from pptx.util import Emu, Inches, lazyproperty
 from pptx.util import Pt as PptxPt
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 log = logging.getLogger(__name__)
 
@@ -172,12 +181,40 @@ RESULT_FAILED = "The file could not be created because of an internal error. Tel
 class Schema(BaseModel):
     model_config = ConfigDict(extra="ignore", coerce_numbers_to_str=True, allow_inf_nan=False)
     _index: int = PrivateAttr(default=-1)  # position in the list the model sent, for error messages
+    IGNORED_KEYS: ClassVar[frozenset[str]] = frozenset()  # unknown keys that may hold text without losing content
 
     @model_validator(mode="before")
     @classmethod
     def _null_means_default(cls, data: Any) -> Any:
         """Models often send null for fields they do not use."""
         return {k: v for k, v in data.items() if v is not None} if isinstance(data, dict) else data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_content_in_unknown_keys(cls, data: Any) -> Any:
+        """Unknown keys are ignored, so text under another name ('content', 'formulas', a sheet's 'total') would be
+        lost without a word. Such a key is sent back instead, with the fields there are."""
+        if isinstance(data, dict):
+            unknown = [k for k, v in data.items() if k not in cls.model_fields and k not in cls.IGNORED_KEYS]
+            key = next((k for k in unknown if has_content(data[k])), None)
+            if key is not None:
+                fields = ", ".join(cls.model_fields)
+                raise ValueError(f"'{key}' is not a field here, its content would be lost (fields: {fields})")
+        return data
+
+
+def has_content(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list | tuple):  # numbers count here: a table of numbers is content, a single "width": 12 not
+        return any(
+            has_content(item) or (isinstance(item, int | float) and not isinstance(item, bool)) for item in value
+        )
+    if isinstance(value, dict):
+        return any(has_content(item) for item in value.values())
+    if isinstance(value, BaseModel):
+        return has_content(value.model_dump())
+    return False
 
 
 class WordBlock(Schema):
@@ -197,6 +234,29 @@ class WordBlock(Schema):
     rows: list[list[str]] = Field(
         default=[], description="Table rows as lists of cell texts. The first row is the header row."
     )
+
+    @field_validator("items")
+    @classmethod
+    def _top_level(cls, items: list[str]) -> list[str]:
+        return top_level(items)
+
+    @model_validator(mode="after")
+    def _content_in_the_field_of_the_type(self) -> "WordBlock":
+        """A paragraph's 'items' or a table's 'text' is not shown; without this the block would be dropped as empty."""
+        shown = WORD_CONTENT_FIELDS.get(self.type)
+        other = next((f for f in ("text", "items", "rows") if f != shown and has_content(getattr(self, f))), None)
+        if other and shown:
+            raise ValueError(
+                f"a {self.type} block shows only '{shown}'; put the '{other}' into a block of its own type"
+            )
+        if other:
+            raise ValueError(f"a {self.type} block shows no '{other}'; put it into a block of its own type")
+        return self
+
+
+WORD_CONTENT_FIELDS = {
+    "heading": "text", "paragraph": "text", "quote": "text", "bullets": "items", "numbered": "items", "table": "rows",
+}  # fmt: skip
 
 
 class ExcelColumn(Schema):
@@ -245,6 +305,16 @@ class ExcelSheet(Schema):
     )
     chart: ExcelChart | None = Field(default=None, description="Optional chart next to the table.")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _fields_inside_the_chart(cls, data: Any) -> Any:
+        return take_out_of_chart(data, ("columns", "rows"))
+
+    @field_validator("chart", mode="before")
+    @classmethod
+    def _empty_chart_is_no_chart(cls, chart: Any) -> Any:
+        return None if isinstance(chart, dict) and not has_content(chart) else chart
+
 
 class ChartSeries(Schema):
     name: str = Field(description="Series name, shown in the legend.")
@@ -252,6 +322,7 @@ class ChartSeries(Schema):
 
 
 class SlideChart(Schema):
+    IGNORED_KEYS = frozenset({"title"})  # the slide's title is shown above the chart
     type: Literal["column", "bar", "line", "pie"] = Field(default="column", description="Chart type.")
     categories: list[str] = Field(description="Category labels (x axis or pie slices).")
     series: list[ChartSeries] = Field(description="Data series (pie: only one).")
@@ -279,18 +350,45 @@ class Slide(Schema):
     chart: SlideChart | None = Field(default=None, description="Chart data for a chart slide.")
     notes: str = Field(default="", description="Optional speaker notes.")
 
+    @field_validator("bullets", "left", "right")
+    @classmethod
+    def _top_level(cls, items: list[str]) -> list[str]:
+        return top_level(items)
 
-WORD_BLOCK_TYPES = ("heading", "paragraph", "bullets", "numbered", "table", "quote", "page_break", "table_of_contents")
-WORD_TYPE_ALIASES = {
-    "list": "bullets", "bullet": "bullets", "bullet_list": "bullets", "bulleted_list": "bullets",
-    "unordered_list": "bullets", "ordered_list": "numbered", "numbered_list": "numbered", "number_list": "numbered",
-    "text": "paragraph", "para": "paragraph", "subheading": "heading", "title": "heading", "blockquote": "quote",
-    "pagebreak": "page_break", "page-break": "page_break", "toc": "table_of_contents",
-}  # fmt: skip
+    @model_validator(mode="before")
+    @classmethod
+    def _fields_inside_the_chart(cls, data: Any) -> Any:
+        return take_out_of_chart(data, SLIDE_CONTENT_FIELDS)
+
+    @field_validator("chart", mode="before")
+    @classmethod
+    def _empty_chart_is_no_chart(cls, chart: Any) -> Any:
+        empty = isinstance(chart, dict) and not has_content([chart.get("categories"), chart.get("series")])
+        return None if empty else chart
+
+
+def take_out_of_chart(data: Any, fields: Collection[str]) -> Any:
+    """Fields of the slide or sheet written into its chart: the chart's '}' was forgotten, and loads_lenient adds
+    it only after them ('"chart": {...}, "notes": "n"' became '"chart": {..., "notes": "n"}'). Unknown keys are
+    ignored, so they would be lost; they are taken back unless the slide or sheet has a value of its own."""
+    chart = data.get("chart") if isinstance(data, dict) else None
+    if not isinstance(chart, dict) or not (moved := [k for k in fields if k in chart and data.get(k) is None]):
+        return data
+    return {**data, **{k: chart[k] for k in moved}, "chart": {k: v for k, v in chart.items() if k not in moved}}
+
+
+def top_level(items: list[str]) -> list[str]:
+    """Models used to Markdown start every item with '- '; without any top-level item these are no sub items."""
+    texts = [item.strip() for item in items if item.strip()]
+    if texts and all(text.startswith(SUB_ITEM_PREFIX) for text in texts):
+        return [item.strip()[len(SUB_ITEM_PREFIX) :].strip() for item in items]
+    return items
+
+
 WORD_BLOCKS = TypeAdapter(list[WordBlock])
 EXCEL_SHEETS = TypeAdapter(list[ExcelSheet])
 SLIDES = TypeAdapter(list[Slide])
-SLIDE_ONLY_FIELDS = set(Slide.model_fields) - set(SlideChart.model_fields)
+SLIDE_CONTENT_FIELDS = ("subtitle", "bullets", "left", "right", "left_heading", "right_heading", "table", "notes")
 
 
 class InvalidInput(ValueError):
@@ -302,7 +400,6 @@ class InvalidInput(ValueError):
 
 
 LOCATION_NOISE_RE = re.compile(r"(str|float|int|bool|list\[.*\]|function-.*)")
-POSITION_KEY = "__position__"  # added to list items before normalizing, so errors name the item the model sent
 
 
 def _location(parts: tuple[Any, ...]) -> str:
@@ -314,24 +411,12 @@ def _location(parts: tuple[Any, ...]) -> str:
     return text
 
 
-def parse_argument(
-    adapter: TypeAdapter,
-    value: Any,
-    name: str,
-    normalize: Callable[[Any, int], Any] | None = None,
-    normalize_list: Callable[[list[Any]], list[Any]] | None = None,
-    extras: dict[str, Any] | None = None,
-    rows_key: str | None = None,
-) -> Any:
+def parse_argument(adapter: TypeAdapter, value: Any, name: str, extras: dict[str, Any] | None = None) -> Any:
     """Validate a tool argument.
 
-    Some models send nested arguments as a JSON string, and small models often use slightly different
-    shapes (e.g. {"bullets": [...]} instead of {"type": "bullets", "items": [...]}). `normalize` repairs
-    such items before validation, which saves the model a second attempt. `extras` receives other tool
-    parameters that the model wrote into the same JSON text. `rows_key` names the table field whose
-    unclosed rows may have swallowed the following items (see take_out_items). Every validated item
-    remembers its position in the list the model sent (`_index`), so later error messages point to the
-    right item.
+    Some models send nested arguments as a JSON string (see loads_lenient); `extras` receives other tool
+    parameters that the model wrote into the same JSON text. Every validated item remembers its position in
+    the list (`_index`), so error messages still name the item the model sent after empty blocks were left out.
     """
     if isinstance(value, str):
         value = _loads_argument(value, name, extras)
@@ -346,30 +431,14 @@ def parse_argument(
                  " and text got lost)" for where in broken[:MAX_ERRORS_SHOWN]]
                 + [f"Write every key and string with plain double quotes and send the complete {name} again."]
             )  # fmt: skip
-        value = [{**item, POSITION_KEY: i} if isinstance(item, dict) else item for i, item in enumerate(value)]
-        if rows_key is not None:
-            value = take_out_items(value, rows_key)
-    if normalize is not None and isinstance(value, list):
-        value = [normalize(item, i) if isinstance(item, dict) else item for i, item in enumerate(value)]
-    if normalize_list is not None and isinstance(value, list):
-        value = normalize_list(value)
-    origin = (
-        [item.get(POSITION_KEY, i) if isinstance(item, dict) else i for i, item in enumerate(value)]
-        if isinstance(value, list)
-        else []
-    )
     try:
         result = adapter.validate_python(value)
     except ValidationError as e:
-        errors = []
-        for err in e.errors():
-            loc = err["loc"]
-            if loc and isinstance(loc[0], int) and loc[0] < len(origin):
-                loc = (origin[loc[0]], *loc[1:])
-            errors.append(f"{_location((name, *loc))}: {err['msg']}")
-        raise InvalidInput(errors) from e
-    for item, position in zip(result, origin, strict=False):
-        item._index = position
+        raise InvalidInput(
+            [f"{_location((name, *err['loc']))}: {err['msg'].removeprefix('Value error, ')}" for err in e.errors()]
+        ) from e
+    for i, item in enumerate(result):
+        item._index = i
     return result
 
 
@@ -379,16 +448,99 @@ def _loads_argument(text: str, name: str, extras: dict[str, Any] | None) -> Any:
         if isinstance(value, str) and value.strip()[:1] in ("[", "{"):
             value = loads_lenient(value, extras)  # JSON text encoded twice
     except json.JSONDecodeError as e:
-        before = e.doc[max(0, e.pos - 80) : e.pos].replace("\n", " ")
-        raise InvalidInput(
-            [f"{name}: the JSON is invalid at character {e.pos} ({e.msg}), right after: ...{before}"
-             f" - check the quotes and brackets there; a \" inside a text must be written as \\\""]
-        ) from e  # fmt: skip
+        raise InvalidInput([json_error_message(name, e)]) from e
     except RecursionError as e:
         raise InvalidInput([f"{name}: the JSON is nested too deeply"]) from e
     except ValueError as e:  # NaN/Infinity, numbers with thousands of digits
         raise InvalidInput([f"{name}: the JSON could not be read: {str(e)[:200]}"]) from e
     return value
+
+
+ERROR_MARK = " <<<HERE>>> "
+
+
+def json_error_message(name: str, error: json.JSONDecodeError) -> str:
+    """Show the text on both sides of the place and name the likely slip. Models repeat the same mistake when
+    they only see the text before it (an extra ']' right after the place went unnoticed four times in a row)."""
+    text, pos = error.doc, error.pos
+    start, end = max(0, pos - 60), pos + 40
+    before = ("..." if start else "") + text[start:pos].replace("\n", " ").rstrip()
+    after = text[pos:end].replace("\n", " ").lstrip() + ("..." if end < len(text) else "")
+    return (
+        f"{name}: the JSON is invalid at character {pos} ({error.msg}): {before}{ERROR_MARK}{after} - "
+        + json_error_hint(text, pos, error.msg)
+    )
+
+
+KEY_AHEAD_RE = re.compile(r'\s*"[^"\\]*"\s*:')
+
+
+def json_error_hint(text: str, pos: int, msg: str) -> str:
+    """The likely slip at the place of a JSON error, as an instruction for the model."""
+    char = text[pos : pos + 1]
+    previous = text[:pos].rstrip()[-1:]
+    if not text.strip():
+        return "the arguments are empty: send the content"
+    if msg.startswith("Unterminated string"):
+        return 'the arguments end inside a text: they were cut off (output limit), or a text ends with \\" instead of "'
+    if msg.startswith("Invalid \\escape"):
+        return "a backslash inside a text must be written as \\\\"
+    if msg.startswith("Invalid control character"):
+        return "a line break or tab inside a text must be written as \\n or \\t"
+    if pos >= len(text.rstrip()):
+        return "the arguments end in the middle (cut off, e.g. at the output limit): send them again completely"
+    if msg == "Expecting value" and char in "„“”‘’'":
+        return 'a text must start and end with a straight double quote "'
+    if msg == "Expecting value" and text.startswith(("True", "False", "None"), pos):
+        return "write true, false and null in lower case"
+    if msg == "Expecting value" and previous == ":" and char in ",}]":
+        return "a value is missing after the colon"
+    if char == ":" and open_brackets(text, pos)[-1:] == "]":
+        return "a key stands inside a list: the list before it is not closed, add ] before the key"
+    if char in ("]", "}"):
+        expected = open_brackets(text, pos)[-1:]
+        if expected != char:
+            if not expected:
+                return f"the {char} at the mark closes nothing that is open: delete it"
+            kind = "list" if expected == "]" else "object"
+            return (
+                f"the {char} at the mark does not fit: the open {kind} must be closed with {expected} first, "
+                f"or the {char} is one too many"
+            )
+        if previous == ",":
+            return f"delete the comma before the {char}"
+    if msg == "Extra data" and text[pos:].lstrip().startswith("```"):
+        return "delete the ``` after the JSON"
+    if msg == "Extra data":
+        return "more text follows the end of the value: put all items into one list, or delete the ] closing it early"
+    if char == "[" and msg.startswith("Expecting property name"):
+        return 'a list stands where a key belongs: write "key": [...], or join the lists (table rows: [[...], [...]])'
+    if previous == '"' and msg == "Expecting ',' delimiter" and KEY_AHEAD_RE.match(text, pos):
+        return "a comma is missing before the mark"
+    if msg == "Expecting ':' delimiter" and char in ",}" and open_brackets(text, pos)[-1:] == "}":
+        return 'a key without a value, or a list written with { }: an object needs "key": value, a list uses [ ]'
+    if previous == '"' and msg in ("Expecting ',' delimiter", "Expecting ':' delimiter"):
+        return (
+            'the text before the mark ends with a " that closes it too early: write a " inside a text as \\" '
+            "or use other quotation marks („…“ or '…')"
+        )
+    return 'check the quotes and brackets at the mark; a " inside a text must be written as \\"'
+
+
+def open_brackets(text: str, end: int) -> str:
+    """The closing brackets that are still owed at position `end`, innermost last ('}]}' for '{"a": [{')."""
+    stack: list[str] = []
+    in_string = escaped = False
+    for char in text[:end]:
+        if in_string:
+            escaped, in_string = (False, True) if escaped else (char == "\\", char != '"')
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            stack.append("]" if char == "[" else "}")
+        elif char in "]}" and stack and stack[-1] == char:
+            stack.pop()
+    return "".join(stack)
 
 
 HTML_BREAK_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
@@ -411,29 +563,6 @@ def _unescape_newlines(value: Any) -> Any:
     if isinstance(value, list):
         return [_unescape_newlines(item) for item in value]
     return value
-
-
-ITEM_KEYS = {"type", "layout", "title", "text", "heading", "bullets", "items", "rows", "table", "chart"}
-
-
-def take_out_items(items: list[Any], rows_key: str) -> list[Any]:
-    """'"rows": [[...], [...]], {"type": "paragraph"…}' with the table's ']' forgotten puts the following
-    items into the rows: [[...], [...], {"type": "paragraph"…}, …]. They are taken out again and follow
-    the table, in their order."""
-    result: list[Any] = []
-    for item in items:
-        rows = item.get(rows_key) if isinstance(item, dict) else None
-        first = (
-            next((i for i, row in enumerate(rows) if isinstance(row, dict)), None) if isinstance(rows, list) else None
-        )
-        if first and rows is not None and set(rows[first]) & ITEM_KEYS:
-            position = item.get(POSITION_KEY)
-            result.append({**item, rows_key: rows[:first]})
-            following = [{**f, POSITION_KEY: position} if isinstance(f, dict) else f for f in rows[first:]]
-            result.extend(take_out_items(following, rows_key))
-        else:
-            result.append(item)
-    return result
 
 
 GARBLED_KEY_RE = re.compile(r'",[a-z_]+:|\}\s*,\s*\{\s*[a-z_]+:')  # 'paragraph",text:', '},{text:' in a text
@@ -609,11 +738,12 @@ def _trailing_parameters(rest: str) -> dict[str, Any] | None:
     return {}
 
 
-ARRAY_VALUE_RE = re.compile(r'"[^"\\]*"\s*:\s*\[')
+ARRAY_VALUE_RE = re.compile(r'"(?:rows|table)"\s*:\s*\[')  # only table rows: wrapped list items would be lists in lists
 
 
 def wrap_array_run(text: str, pos: int) -> str | None:
-    """'"rows": ["a"], ["b"], ["c"]}' -> '"rows": [["a"], ["b"], ["c"]]}'; None if the text does not look like that."""
+    """'"rows": ["a"], ["b"], ["c"]}' -> '"rows": [["a"], ["b"], ["c"]]}'; None if the text does not look like that.
+    Only for table rows ("rows", "table"): list items written that way would become lists inside the list."""
     starts = [match.end() - 1 for match in ARRAY_VALUE_RE.finditer(text, 0, pos)]
     if not starts:
         return None
@@ -657,305 +787,6 @@ def _close_brackets(text: str) -> tuple[str, int]:
                 stack.pop()
         out.append(char)
     return "".join(out) + "".join(reversed(stack)), len(stack)
-
-
-def split_lines(text: str) -> list[str]:
-    """A list sent as one text: one item per line, without list markers."""
-    return [re.sub(r"^\s*(?:[-*•]|\d+[.)])\s+", "", line).strip() for line in text.splitlines() if line.strip()]
-
-
-def normalize_word_block(block: dict[str, Any], index: int) -> dict[str, Any]:
-    block = dict(block)
-    if not any(_filled(block.get(k)) for k in ("text", "items", "rows")):
-        nested = next(
-            (v[0] for v in block.values() if isinstance(v, list) and len(v) == 1 and isinstance(v[0], dict)), None
-        )
-        if nested is not None and set(nested) & {"type", "text", "items", "rows"}:
-            # a block inside a block: {"type": "paragraph", "bullets": [{"type": "bullets", "items": [...]}]}
-            return normalize_word_block({**nested, POSITION_KEY: block.get(POSITION_KEY)}, index)
-    if isinstance(block.get("type"), str):
-        kind = block["type"].strip().lower()
-        block["type"] = WORD_TYPE_ALIASES.get(kind, kind)
-    if "type" not in block:
-        kind = next((k for k in WORD_BLOCK_TYPES if k in block), None)
-        if kind is not None:  # {"heading": "Text"}, {"bullets": [...]}, {"table": {"rows": [...]}}
-            value = block.pop(kind)
-            block["type"] = kind
-            if isinstance(value, dict):
-                block = {**value, **block}
-            elif kind in ("bullets", "numbered"):
-                block.setdefault("items", value)
-            elif kind == "table":
-                block.setdefault("rows", value)
-            elif isinstance(value, str):
-                block.setdefault("text", value)
-        elif "rows" in block:
-            block["type"] = "table"
-        elif "items" in block:
-            block["type"] = "bullets"
-        elif "text" in block:
-            block["type"] = "paragraph"
-    content_key = WORD_CONTENT_KEYS.get(block.get("type"))
-    if content_key and not _filled(block.get(content_key)) and not _filled(block.get("text")):
-        other = _other_content(block, {"type", "level", POSITION_KEY, "text", "items", "rows"})
-        if other is not None:  # e.g. {"type": "paragraph", "content": "..."}, {"type": "bullets", "list": [...]}
-            block[content_key] = other
-    if block.get("type") in ("bullets", "numbered") and isinstance(block.get("text"), list) and not block.get("items"):
-        block["items"] = block.pop("text")  # {"type": "bullets", "text": [...]}
-    elif isinstance(block.get("text"), list):
-        block["text"] = "\n".join(_line_text(line) for line in block["text"])
-    if isinstance(block.get("items"), str):
-        block["items"] = split_lines(block["items"])
-    if isinstance(block.get("items"), list):  # [{"text": "..."}]
-        block["items"] = [_line_text(item) if isinstance(item, dict) else item for item in block["items"]]
-        if block.get("type") in ("heading", "paragraph", "quote") and not _filled(block.get("text")):
-            block["text"] = "\n".join(str(item) for item in flatten(block.pop("items")))
-    block["items"] = flatten(block.get("items"))
-    if isinstance(block["items"], list):
-        block["items"] = top_level(split_item_lines(block["items"]))
-    if isinstance(block.get("rows"), list):
-        block["rows"] = table_rows(block["rows"])
-    return block
-
-
-WORD_CONTENT_KEYS = {
-    "heading": "text", "paragraph": "text", "quote": "text", "bullets": "items", "numbered": "items", "table": "rows",
-}  # fmt: skip
-
-
-def _line_text(line: Any) -> str:
-    """Text of one entry of a list sent as text; an object is a nested block, not something to print."""
-    if isinstance(line, dict):
-        items = line.get("items")
-        return "\n".join(map(str, items)) if isinstance(items, list) else str(line.get("text") or "")
-    return str(line)
-
-
-def _filled(value: Any) -> bool:
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, list):
-        return any(_filled(item) for item in value)
-    return value is not None
-
-
-def _other_content(item: dict[str, Any], known: set[str]) -> Any:
-    """The value of the only other key that holds text or a list (the model used another name for the field)."""
-    others = [v for k, v in item.items() if k not in known and isinstance(v, str | list) and _filled(v)]
-    return others[0] if len(others) == 1 else None
-
-
-def top_level(items: list[Any]) -> list[Any]:
-    """Models used to Markdown start every item with '- '; without any top-level item these are no sub items."""
-    texts = [item.strip() for item in items if isinstance(item, str) and item.strip()]
-    if texts and all(text.startswith(SUB_ITEM_PREFIX) for text in texts):
-        return [item.strip()[len(SUB_ITEM_PREFIX) :].strip() if isinstance(item, str) else item for item in items]
-    return items
-
-
-def split_item_lines(items: list[Any]) -> list[Any]:
-    """An item with line breaks ('a\\n• b\\n• c') holds several items."""
-    result: list[Any] = []
-    for item in items:
-        if isinstance(item, str) and "\n" in item.strip():
-            result.extend(re.sub(r"^\s*[•▪◦·*]\s*", "", line).rstrip() for line in item.split("\n") if line.strip())
-        else:
-            result.append(item)
-    return result
-
-
-def flatten(items: Any) -> Any:
-    """[["a", "b"], ["c"]] -> ["a", "b", "c"] (items written as several arrays); a list right after an item
-    holds its sub items: ["a", ["a1", "a2"]] -> ["a", "- a1", "- a2"]."""
-    if not isinstance(items, list):
-        return [] if items is None else items
-    result: list[Any] = []
-    for entry in items:
-        if isinstance(entry, list):
-            sub_items = bool(result) and not isinstance(items[0], list)
-            for item in entry:
-                if isinstance(item, list):
-                    result.extend(_deep_cells(item))  # [["a"], [["b"], [["c"]]]]
-                elif sub_items and isinstance(item, str) and not item.strip().startswith(SUB_ITEM_PREFIX):
-                    result.append(SUB_ITEM_PREFIX + item.strip())
-                else:
-                    result.append(item)
-        else:
-            result.append(entry)
-    return result
-
-
-def table_rows(rows: list[Any]) -> list[Any]:
-    """Table rows in the shapes models send: a row as plain text becomes a row with one cell; a "row" that
-    only holds lists holds the next rows ([["1", "a"], [["2", "b"]]]); lists inside a row hold more cells
-    (["TOP", ["Beschluss"]]); an object in a cell gives its value ({"formula": "=SUM(D2:D6)"})."""
-    result: list[Any] = []
-    for row in rows:
-        if isinstance(row, list) and row and all(isinstance(cell, list) for cell in row):
-            result.extend(table_rows(row))
-        elif isinstance(row, list):
-            result.append([_cell_value(cell) for cell in _deep_cells(row)])
-        else:
-            result.append([_cell_value(row)])
-    return result
-
-
-def _deep_cells(row: list[Any]) -> list[Any]:
-    return [cell for item in row for cell in (_deep_cells(item) if isinstance(item, list) else [item])]
-
-
-def _cell_value(cell: Any) -> Any:
-    if isinstance(cell, dict):
-        return next((cell[k] for k in ("formula", "value", "text") if isinstance(cell.get(k), str | int | float)), "")
-    return cell
-
-
-NULL_TEXTS = {"null", "none", "nan"}
-QUOTED_RE = re.compile(r'"([^"]*)"')
-
-
-def _sheet_cell(value: Any) -> Any:
-    """'null' written as text is an empty cell; '"Rent"' (quotes inside the text) is 'Rent'."""
-    if isinstance(value, str):
-        if value.strip().lower() in NULL_TEXTS:
-            return None
-        if quoted := QUOTED_RE.fullmatch(value.strip()):
-            return quoted[1]
-    return value
-
-
-def normalize_sheet(sheet: dict[str, Any], _: int) -> dict[str, Any]:
-    sheet = dict(sheet)
-    if "columns" not in sheet and isinstance(sheet.get("headers"), list):
-        sheet["columns"] = sheet.pop("headers")
-    if isinstance(sheet.get("columns"), list):
-        columns = []
-        for column in sheet["columns"]:
-            if isinstance(column, str):
-                column = {"header": column}  # ["Item", "Amount"]
-            elif isinstance(column, dict) and "header" not in column:
-                column = {**column, "header": str(column.get("name") or column.get("title") or "")}
-            columns.append(column)
-        sheet["columns"] = columns
-    if isinstance(sheet.get("rows"), list):
-        sheet["rows"] = [[_sheet_cell(v) for v in row] for row in table_rows(sheet["rows"])]
-    chart = sheet.get("chart")
-    if isinstance(chart, dict) and isinstance(chart.get("series_rows"), list):
-        names = _deep_cells(chart["series_rows"])  # [["Income", "Expenses"]]
-        if all(isinstance(name, str) for name in names):
-            sheet["chart"] = {**chart, "series_rows": names}
-    if isinstance(chart, dict) and not any(_filled(v) for k, v in chart.items() if k != POSITION_KEY):
-        sheet.pop("chart")  # an empty chart object means "no chart"
-    return sheet
-
-
-def move_lonely_charts(sheets: list[Any]) -> list[Any]:
-    """A sheet with only a chart (the model wanted the chart on its own sheet) gives its chart to the sheet
-    that has the columns the chart refers to."""
-    result = list(sheets)
-    for lonely in [
-        s for s in sheets if isinstance(s, dict) and not s.get("columns") and isinstance(s.get("chart"), dict)
-    ]:
-        chart = lonely["chart"]
-        wanted = {
-            str(chart.get("category_column") or "").strip(),
-            *(str(v).strip() for v in chart.get("value_columns") or []),
-        }
-        for target in result:
-            headers = (
-                {str(c.get("header", "")).strip() for c in target.get("columns") or [] if isinstance(c, dict)}
-                if isinstance(target, dict)
-                else set()
-            )
-            if (
-                isinstance(target, dict)
-                and target is not lonely
-                and not target.get("chart")
-                and wanted - {""} <= headers
-                and headers
-            ):
-                target["chart"] = chart
-                result.remove(lonely)
-                break
-    return result
-
-
-SLIDE_LAYOUTS = ("title", "section", "bullets", "two_columns", "table", "chart")
-SLIDE_LAYOUT_ALIASES = {
-    "two_column": "two_columns", "two-columns": "two_columns", "columns": "two_columns", "comparison": "two_columns",
-    "list": "bullets", "bullet": "bullets", "title_slide": "title", "divider": "section",
-}  # fmt: skip
-SLIDE_ITEM_KEYS = ("items", "points", "content", "text", "body", "list")  # other names models use for bullets
-CHART_KINDS = ("column", "bar", "line", "pie")
-
-
-def normalize_slide(slide: dict[str, Any], index: int) -> dict[str, Any]:
-    slide = dict(slide)
-    if "layout" not in slide and isinstance(slide.get("type"), str):
-        slide["layout"] = slide.pop("type")  # "type": "chart" instead of "layout": "chart"
-    if isinstance(slide.get("layout"), str):
-        layout = slide["layout"].strip().lower()
-        slide["layout"] = SLIDE_LAYOUT_ALIASES.get(layout, layout)
-    if not slide.get("chart") and ("categories" in slide or "series" in slide):
-        chart = {key: slide.pop(key) for key in ("categories", "series") if key in slide}
-        kind = next((key for key in ("type", "layout") if slide.get(key) in CHART_KINDS), None)
-        if kind is not None:
-            chart["type"] = slide.pop(kind)  # {"type": "pie", "categories": ...}
-        slide["chart"] = chart
-    if slide.get("layout") in ("title", "section") and not slide.get("subtitle"):
-        text = next((slide.pop(k) for k in SLIDE_ITEM_KEYS if isinstance(slide.get(k), str) and slide[k].strip()), None)
-        if text is not None:
-            slide["subtitle"] = text
-    target = "table" if slide.get("layout") == "table" else "bullets"
-    if not _filled(slide.get(target)):  # e.g. {"layout": "bullets", "items": [...]}
-        key = next((k for k in SLIDE_ITEM_KEYS if isinstance(slide.get(k), str | list) and _filled(slide[k])), None)
-        if key is not None:
-            slide[target] = slide.pop(key)
-    left = slide.get("left")
-    if (
-        isinstance(left, list)
-        and len(left) == 2
-        and all(isinstance(column, list) for column in left)
-        and not _filled(slide.get("right"))
-    ):  # '"left": [...], [...]' with the "right" key forgotten
-        slide["left"], slide["right"] = left
-    for key in ("bullets", "left", "right"):
-        if isinstance(slide.get(key), str):
-            slide[key] = split_lines(slide[key])
-        slide[key] = flatten(slide.get(key))
-        if isinstance(slide[key], list):
-            slide[key] = top_level(split_item_lines(slide[key]))
-    if isinstance(slide.get("table"), dict) and "rows" in slide["table"]:
-        slide["table"] = slide["table"]["rows"]
-    if isinstance(slide.get("table"), list):
-        slide["table"] = table_rows(slide["table"])
-    if isinstance(slide.get("chart"), dict):  # e.g. "notes" written inside the chart after a missing '}'
-        chart = dict(slide["chart"])
-        for key in set(chart) & SLIDE_ONLY_FIELDS:
-            slide.setdefault(key, chart.pop(key))
-        if slide.get("layout") in CHART_KINDS:  # "type": "pie" next to the chart object
-            chart.setdefault("type", slide["layout"])
-            slide["layout"] = "chart"
-        slide["chart"] = chart
-    if not slide.get("title") and slide.get("left_heading") and slide.get("right_heading"):
-        slide["title"] = f"{slide['left_heading']} & {slide['right_heading']}"  # comparison slide without title
-    content = {
-        "chart": bool(slide.get("chart")),
-        "table": _filled(slide.get("table")),
-        "two_columns": _filled(slide.get("left")) or _filled(slide.get("right")),
-        "bullets": _filled(slide.get("bullets")),
-    }
-    present = next((layout for layout, filled in content.items() if filled), None)
-    layout = slide.get("layout")
-    if layout is None:
-        slide["layout"] = present or ("title" if index == 0 else "section")
-    elif present and (
-        layout not in SLIDE_LAYOUTS or layout == "section" or (layout in content and not content[layout])
-    ):
-        slide["layout"] = present  # e.g. a bullets slide that carries a table: show the table
-    elif layout in ("bullets", "two_columns") and not present:
-        slide["layout"] = "section"  # a list slide without any items: show its title as a divider
-    return slide
 
 
 class Checker:
@@ -1646,6 +1477,9 @@ def parse_date(text: str) -> date | datetime | None:
     return None
 
 
+NULL_TEXTS = {"null", "none", "nan"}
+
+
 def convert_value(value: str | float | None, column_type: str, decimal_comma: bool | None = None) -> tuple[Any, bool]:
     """Return (cell value, is_typed). Values that do not fit the column type stay text (is_typed False).
 
@@ -1839,74 +1673,36 @@ def _column_problems(sheet: ExcelSheet, where: str, formulas: dict[int, str], de
                     f"{where}.columns[{used}] ('{sheet.columns[used].header.strip()}') is empty, but the formula of "
                     f"'{sheet.columns[c].header.strip()}' uses it: fill in its values"
                 )
+    if problem := _total_row_problem(sheet, rows, where, formulas):
+        problems.append(problem)
     return problems
 
 
-ROW_TOTAL_RE = re.compile(
-    r"=(SUM|SUMME|AVERAGE|MITTELWERT|MIN|MAX|COUNTA?|ANZAHL2?)\(\$?([A-Z]{1,3})\$?2:\$?([A-Z]{1,3})\$?([0-9]+)\)",
+# 'Summe', 'Netto-Summe', 'Summe Ausgaben', 'Gesamt (EUR):' …; the whole label: 'Total Quality Management' is none
+TOTAL_ROW_LABEL_RE = re.compile(
+    r"(?:(?:netto|brutto|zwischen|gesamt)[- ]?)?"
+    r"(?:summe(?:\s+[^\W\d_]+)?|gesamt(?:summe|betrag|kosten|preis)?(?:\s+(?:netto|brutto))?|insgesamt|total|sum)"
+    r"\s*(?:\([^()]*\))?\s*:?",
     re.IGNORECASE,
 )
-ROW_TOTAL_FUNCTIONS = {
-    "SUM": "sum", "SUMME": "sum", "AVERAGE": "average", "MITTELWERT": "average", "MIN": "min", "MAX": "max",
-    "COUNT": "count", "COUNTA": "count", "ANZAHL": "count", "ANZAHL2": "count",
-}  # fmt: skip
-TOTAL_LABEL_RE = re.compile(r"\b(summe|gesamt\w*|insgesamt|total|sum)\b", re.IGNORECASE)
-ROW_CELL_RE = re.compile(r"(?<![A-Za-z0-9_$])(\$?[A-Za-z]{1,3})([0-9]+)(?![0-9A-Za-z_(])")
 
 
-def formulas_from_rows(sheet: ExcelSheet) -> ExcelSheet:
-    """Formulas the model wrote into the rows instead of the column definition: '=B2-C2', '=B3-C3' …
-    become the column formula '=B{row}-C{row}', and a last row of '=SUM(B2:B7)' cells becomes the
-    total row. Cell values are never written as formulas, so otherwise the user would see formula text."""
-    rows = align_rows(sheet)
-    columns = list(sheet.columns)
-    if len(rows) >= 2:
-        totals: dict[int, str] = {}
-        for c, value in enumerate(rows[-1]):
-            if isinstance(value, str) and value.strip().startswith("="):
-                match = ROW_TOTAL_RE.fullmatch(re.sub(r"\s+", "", value))
-                letter = get_column_letter(c + 1)
-                if not match or match[2].upper() != letter or match[3].upper() != letter or int(match[4]) != len(rows):
-                    totals = {}
-                    break
-                totals[c] = ROW_TOTAL_FUNCTIONS[match[1].upper()]
-        others = [v for c, v in enumerate(rows[-1]) if c not in totals and v is not None and str(v).strip()]
-        if totals and all(isinstance(v, str) for v in others):  # only a label such as "Summe" besides the sums
-            rows = rows[:-1]
-            for c, function in totals.items():
-                columns[c] = columns[c].model_copy(update={"total": function})
-        elif (
-            len(others) == 1
-            and isinstance(rows[-1][0], str)
-            and len(rows[-1][0]) <= 40
-            and TOTAL_LABEL_RE.search(rows[-1][0])
-            and not any(column.formula.strip() for column in columns[:1])
-        ):  # an empty "Summe" row: the model wanted a total row, the tool adds a computed one
-            rows = rows[:-1]
-            if not any(column.total != "none" for column in columns):
-                factors = {  # quantity and price of '=B{row}*C{row}': their sum means nothing
-                    _column_number(letters) - 1
-                    for column in columns
-                    if re.search(r"[*/]", column.formula)
-                    for letters in FORMULA_CELL_RE.findall(column.formula.upper().replace("{ROW}", "{row}"))
-                }
-                for c, column in enumerate(columns[1:], start=1):
-                    numbers = any(isinstance(row[c], float) for row in rows)
-                    if c not in factors and (column.type in NUMBER_TYPES or (numbers and not column.formula.strip())):
-                        columns[c] = column.model_copy(update={"total": "sum"})
-    for c, column in enumerate(columns):
-        values = [(r, row[c]) for r, row in enumerate(rows) if row[c] is not None and str(row[c]).strip()]
-        if column.formula.strip() or not values:
-            continue
-        if not all(isinstance(v, str) and v.strip().startswith("=") for _, v in values):
-            continue
-        patterns = {
-            ROW_CELL_RE.sub(lambda m, n=r + 2: m[1] + "{row}" if int(m[2]) == n else m[0], v.strip()) for r, v in values
-        }
-        if len(patterns) == 1:
-            columns[c] = column.model_copy(update={"formula": patterns.pop()})
-            rows = [[None if i == c else v for i, v in enumerate(row)] for row in rows]
-    return sheet.model_copy(update={"columns": columns, "rows": rows})
+def _total_row_problem(sheet: ExcelSheet, rows: list[list[Any]], where: str, formulas: dict[int, str]) -> str | None:
+    """A total row written into the rows: with column formulas it gets them too (quantity * price of the total
+    row), next to a column's "total" it is counted twice, and without its own values it adds up nothing. The
+    column's "total" builds a correct one."""
+    label = rows[-1][0] if len(rows) >= 2 and rows[-1] else None
+    if not isinstance(label, str) or not TOTAL_ROW_LABEL_RE.fullmatch(to_plain(label).strip()):
+        return None
+    numbers = bool(formulas) or any(c.total != "none" or c.type in NUMBER_TYPES for c in sheet.columns[1:])
+    others = [v for c, v in enumerate(rows[-1]) if c > 0 and c not in formulas and v is not None and str(v).strip()]
+    totals = any(c.total != "none" for c in sheet.columns)
+    if not numbers or (others and not formulas and not totals):
+        return None  # nothing to add up, or the model's own sums ('=SUM(…)' cells are written as formulas)
+    return (
+        f"{where}.rows[{len(rows) - 1}] ('{label.strip()}') is a total row: remove it and set \"total\" "
+        '(e.g. "sum") on the columns to add up; the tool adds the total row with the right formulas'
+    )
 
 
 def cell_formula(value: Any, column: ExcelColumn) -> str | None:
@@ -1930,7 +1726,10 @@ def infer_column_types(sheet: ExcelSheet, decimal_comma: bool | None = None) -> 
     columns = []
     for c, column in enumerate(sheet.columns):
         if "type" not in column.model_fields_set and not column.formula.strip():
-            kind = _number_kind([row[c] for row in rows if row[c] is not None and str(row[c]).strip()], decimal_comma)
+            values = [
+                row[c] for row in rows if row[c] is not None and str(row[c]).strip().lower() not in {"", *NULL_TEXTS}
+            ]
+            kind = _number_kind(values, decimal_comma)
             if kind is not None:
                 column = column.model_copy(update={"type": kind})
         columns.append(column)
@@ -1959,6 +1758,19 @@ def _number_kind(values: list[Any], decimal_comma: bool | None) -> str | None:
     if not kinds or len(special) > 1:
         return None
     return special.pop() if special else "number"
+
+
+def blank_null_texts(sheet: ExcelSheet) -> ExcelSheet:
+    """'null' written as text is an empty cell in number and date columns (in a text column it may be a word)."""
+    types = [column.type for column in sheet.columns]
+    rows = [
+        [
+            None if c < len(types) and types[c] != "text" and str(v).strip().lower() in NULL_TEXTS else v
+            for c, v in enumerate(row)
+        ]
+        for row in align_rows(sheet)
+    ]
+    return sheet.model_copy(update={"rows": rows})
 
 
 def has_totals(sheet: ExcelSheet) -> bool:
@@ -2160,7 +1972,7 @@ class XlsxWriter:
 def build_xlsx(
     sheets: list[ExcelSheet], currency: str, texts: dict[str, str], decimal_comma: bool | None = None
 ) -> bytes:
-    sheets = [infer_column_types(formulas_from_rows(sheet), decimal_comma) for sheet in sheets]
+    sheets = [blank_null_texts(infer_column_types(sheet, decimal_comma)) for sheet in sheets]
     formulas = check_excel(sheets, decimal_comma)
     return XlsxWriter(currency, texts, decimal_comma).render(sheets, formulas)
 
@@ -2187,6 +1999,12 @@ CHART_TYPES = {
 }
 
 
+SHOWN_ON = {  # the layouts that show a field; on other slides its content would be lost
+    "subtitle": ("title", "section"), "bullets": ("bullets",), "left": ("two_columns",), "right": ("two_columns",),
+    "left_heading": ("two_columns",), "right_heading": ("two_columns",), "table": ("table",), "chart": ("chart",),
+}  # fmt: skip
+
+
 def check_slides(title: str, slides: list[Slide]) -> None:
     check = Checker()
     check.text(title)
@@ -2203,6 +2021,12 @@ def check_slides(title: str, slides: list[Slide]) -> None:
             check.require(
                 len(items) <= MAX_SLIDE_ITEMS,
                 f"{where}.{field_name}: at most {MAX_SLIDE_ITEMS} items per slide, split the content over more slides",
+            )
+        for field_name, layouts in SHOWN_ON.items():
+            check.require(
+                slide.layout in layouts or not has_content(getattr(slide, field_name)),
+                f"{where}: '{field_name}' is not shown on a {slide.layout} slide; use layout {' or '.join(layouts)}"
+                " for it, or leave it out",
             )
         too_much = f"{where}: too much text for one slide; split it over two slides or move details into the notes"
         if slide.layout == "bullets":
@@ -2699,7 +2523,7 @@ class Tools:
 
         def build() -> tuple[str, bytes]:
             extras: dict[str, Any] = {}  # parameters the model wrote into the blocks text
-            parsed = parse_argument(WORD_BLOCKS, blocks, "blocks", normalize_word_block, extras=extras, rows_key="rows")
+            parsed = parse_argument(WORD_BLOCKS, blocks, "blocks", extras)
             parsed = [block for block in parsed if not is_empty_block(block)]
             given = {k: _unescape_newlines(str(v or extras.get(k) or "")) for k, v in
                      (("title", title), ("subtitle", subtitle), ("header_text", header_text))}  # fmt: skip
@@ -2740,7 +2564,7 @@ class Tools:
 
         def build() -> tuple[str, bytes]:
             extras: dict[str, Any] = {}
-            parsed = parse_argument(EXCEL_SHEETS, sheets, "sheets", normalize_sheet, move_lonely_charts, extras)
+            parsed = parse_argument(EXCEL_SHEETS, sheets, "sheets", extras)
             given = str(title or extras.get("title") or "")
             display_title = tidy_title(given) or (tidy_title(parsed[0].name) if parsed else "")
             decimal_comma = self.valves.language == "de"
@@ -2775,7 +2599,7 @@ class Tools:
 
         def build() -> tuple[str, bytes]:
             extras: dict[str, Any] = {}
-            parsed = parse_argument(SLIDES, slides, "slides", normalize_slide, extras=extras, rows_key="table")
+            parsed = parse_argument(SLIDES, slides, "slides", extras)
             display_title = tidy_title(str(title or extras.get("title") or "")) or next(
                 (tidy_title(s.title) for s in parsed if s.title.strip()), ""
             )

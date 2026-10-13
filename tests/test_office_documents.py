@@ -280,26 +280,19 @@ def test_word_title(title: str, first_heading: str | None, expected_title: str, 
         assert (first_heading in texts[1:]) == heading_kept
 
 
-def test_word_repairs_common_model_shapes() -> None:
-    blocks = [
-        {"heading": "Intro", "level": 2},
-        {"text": "Plain paragraph"},
-        {"bullets": ["a", "b"]},
-        {"numbered": "1. x\n2. y"},
-        {"table": {"rows": [["H"], ["v"]]}},
-        {"items": ["c"]},
-        {"type": "table", "rows": [["H1", "H2"], "only text"]},
-        {"type": "bullets", "text": ["d", "e"]},
-        {"type": "paragraph", "text": ["line 1", "line 2"]},
-    ]
-    doc, _, _ = word(blocks=json.dumps(blocks), title="Doc")  # nested arguments sent as a JSON string
-    paragraphs = [(p.style.name, p.text) for p in doc.paragraphs]
-    assert ("Heading 2", "Intro") in paragraphs and ("Normal", "Plain paragraph") in paragraphs
-    assert [t for s, t in paragraphs if s == "List Bullet"] == ["a", "b", "c", "d", "e"]
-    assert ("Normal", "line 1\nline 2") in paragraphs
-    assert [t for s, t in paragraphs if s == "List Number"] == ["x", "y"]
-    assert doc.tables[0].rows[1].cells[0].text == "v"
-    assert [c.text for c in doc.tables[1].rows[1].cells] == ["only text", ""]
+def test_shapes_outside_the_schema_are_rejected() -> None:
+    """Other shapes are not guessed: the error names the field, so the model sends it again in the right shape."""
+    doc, _, _ = word(blocks=json.dumps([{"type": "paragraph", "text": "x"}]), title="T")  # sent as a JSON string
+    assert doc.paragraphs[1].text == "x"
+    result = invalid("create_word_file", blocks=[{"heading": "Intro"}, {"type": "list", "items": ["a"]}])
+    assert "blocks[0]: 'heading' is not a field here, its content would be lost (fields: type, text" in result
+    assert "blocks[1].type: Input should be 'heading'" in result
+    result = invalid("create_excel_file", sheets=[{"name": "Data", "headers": ["Month"], "rows": [["Jan"]]}])
+    assert "sheets[0]: 'headers' is not a field here" in result and "(fields: name, columns, rows, chart)" in result
+    slides = [{"layout": "two_columns", "left_heading": "Pros", "right_heading": "Cons", "left": ["a"], "right": ["b"]}]
+    assert "slides[0].title: Field required" in invalid("create_powerpoint_file", slides=slides)
+    slides = [{"layout": "bullets", "title": "Next steps", "bullets": []}]
+    assert "slides[0] (bullets): 'bullets' is empty" in invalid("create_powerpoint_file", slides=slides)
 
 
 def test_word_invalid_input() -> None:
@@ -313,15 +306,15 @@ def test_word_invalid_input() -> None:
     assert "the document has no content" in invalid("create_word_file", blocks=[{"type": "paragraph", "text": " "}])
 
 
-def test_word_empty_blocks_aliases_and_toc_block() -> None:
+def test_word_empty_blocks_and_toc_block() -> None:
     blocks = [
-        {"type": "Paragraph", "text": "Intro"},
+        {"type": "paragraph", "text": "Intro"},
         {"type": "paragraph", "text": ""},  # spacing, left out
         {"type": "heading", "text": " "},
-        {"type": "toc"},
-        {"type": "list", "items": ["a"]},
-        {"type": "ordered_list", "items": ["b"]},
-        {"type": "subheading", "text": "Part", "level": 2},
+        {"type": "table_of_contents"},
+        {"type": "bullets", "items": ["a"]},
+        {"type": "numbered", "items": ["b"]},
+        {"type": "heading", "text": "Part", "level": 2},
         {"type": "paragraph", "text": "Body " * 25},
     ]
     doc, _, _ = word(blocks=blocks, title="T", table_of_contents=True)
@@ -348,7 +341,7 @@ def test_json_text_is_repaired() -> None:
         '[{"layout": "chart", "title": "C", "chart": {"categories": ["a"], "series": [{"name": "s", "values": [1]}],'
         ' "notes": "n"}, {"layout": "bullets", "title": "B", "bullets": ["x"]}]'
     )
-    slides = od.parse_argument(od.SLIDES, missing_brace, "slides", od.normalize_slide)
+    slides = od.parse_argument(od.SLIDES, missing_brace, "slides")
     assert [s.layout for s in slides] == ["chart", "bullets"] and slides[0].notes == "n"
     assert od.loads_lenient('{"a": "„x\\" ok"}') == {"a": '„x" ok'}  # valid JSON is never changed
     # a forgotten "}" before "]", followed by other tool parameters written into the same text
@@ -363,23 +356,152 @@ def test_json_text_is_repaired() -> None:
     # table rows and list items written as several arrays without the outer brackets
     run = '[{"layout": "table", "title": "T", "table": ["A", "B"], ["1", "2"], ["3", "4"], "notes": "n"}]'
     assert od.loads_lenient(run)[0]["table"] == [["A", "B"], ["1", "2"], ["3", "4"]]
-    items = '[{"type": "bullets", "items": ["a", "b"], ["c"]}]'
-    (block,) = od.parse_argument(od.WORD_BLOCKS, items, "blocks", od.normalize_word_block)
-    assert block.items == ["a", "b", "c"]
     assert od.wrap_array_run('{"a": [1], "b": 2}', 9) is None  # nothing to wrap
     result = invalid("create_word_file", blocks='[{"type": "paragraph", "text": "a" "b"}]')
-    assert (
-        "the JSON is invalid at character 35" in result
-        and 'right after: ...[{"type": "paragraph", "text": "a"' in result
-    )
+    assert "at character 35 (Expecting ',' delimiter): [{\"type\"" in result
+    assert '"text": "a" <<<HERE>>> "b"}]' in result
+    assert 'the text before the mark ends with a " that closes it too early' in result
 
 
-def test_comparison_slide_without_title() -> None:
-    prs, _ = powerpoint(
-        [{"layout": "two_columns", "left_heading": "Pros", "right_heading": "Cons", "left": ["a"], "right": ["b"]}],
-        title="Deck",
+def test_content_is_never_dropped_silently() -> None:
+    """Unknown keys are ignored by the schema, so content under another name is sent back instead of being lost."""
+    assert "blocks[0]: 'content' is not a field here, its content would be lost" in invalid(
+        "create_word_file", blocks=[{"type": "paragraph", "content": "Important"}, {"type": "paragraph", "text": "x"}]
     )
-    assert prs.slides[0].shapes.title.text == "Pros & Cons"
+    # the retry after "type: Field required": the type is added, the old key kept
+    assert "blocks[0]: 'heading' is not a field here" in invalid(
+        "create_word_file", blocks=[{"type": "heading", "heading": "Einleitung"}, {"type": "paragraph", "text": "x"}]
+    )
+    assert "a paragraph block shows only 'text'; put the 'items' into a block of its own type" in invalid(
+        "create_word_file", blocks=[{"type": "paragraph", "items": ["a", "b"]}]
+    )
+    assert "slides[0]: 'text' is not a field here" in invalid(
+        "create_powerpoint_file", slides=[{"layout": "title", "title": "Deck", "text": "Subtitle"}]
+    )
+    result = invalid("create_powerpoint_file", slides=[{"layout": "section", "title": "Agenda", "bullets": ["a"]}])
+    assert "slides[0] (section): 'bullets' is not shown on a section slide; use layout bullets for it" in result
+    sheet = {"name": "S", "columns": [{"header": "A"}, {"header": "B", "type": "number"}], "rows": [["x", 1]],
+             "total": {"B": "sum"}}  # fmt: skip
+    assert "sheets[0]: 'total' is not a field here" in invalid("create_excel_file", sheets=[sheet])
+    column = {"header": "B", "type": "number", "formulas": "=A{row}*2"}
+    sheet = {"name": "S", "columns": [{"header": "A", "type": "number"}, column], "rows": [[1, None]]}
+    assert "sheets[0].columns[1]: 'formulas' is not a field here" in invalid("create_excel_file", sheets=[sheet])
+    assert "blocks[0]: 'data' is not a field here" in invalid(
+        "create_word_file",
+        blocks=[{"type": "table", "data": [[2024, 1], [2025, 2]]}],  # numbers in a list are content
+    )
+    assert "a page_break block shows no 'text'" in invalid(
+        "create_word_file", blocks=[{"type": "paragraph", "text": "x"}, {"type": "page_break", "text": "Kapitel 2"}]
+    )
+    # harmless: the slide title is shown above the chart, numbers and empty values hold no text
+    chart = {"title": "Umsatz", "categories": ["a"], "series": [{"name": "s", "values": [1]}]}
+    powerpoint([{"layout": "chart", "title": "T", "chart": chart, "number": 3, "style": ""}], title="D")
+
+
+def test_fields_written_into_the_chart_are_taken_back() -> None:
+    chart = {"categories": ["a"], "series": [{"name": "s", "values": [1]}], "notes": "n"}
+    (slide,) = od.parse_argument(od.SLIDES, [{"layout": "chart", "title": "T", "notes": None, "chart": chart}], "s")
+    assert slide.notes == "n" and slide.chart is not None
+    sheet = {
+        "name": "S",
+        "columns": [{"header": "A"}, {"header": "B", "type": "number"}],
+        "chart": {"type": "line", "category_column": "A", "value_columns": ["B"], "rows": [["x", 1], ["y", 2]]},
+    }
+    ws = excel([sheet])[0]["S"]  # fmt: skip
+    assert ws["B3"].value == 2 and len(ws._charts) == 1
+    empty = {**MONTHS_AS_COLUMNS, "chart": {"category_column": None, "value_columns": []}}
+    assert not excel([empty])[0]["Budget"]._charts  # an empty chart object means "no chart"
+    slide = {
+        "layout": "bullets",
+        "title": "B",
+        "bullets": ["a"],
+        "chart": {"type": "column", "categories": [], "series": []},
+    }
+    powerpoint([slide], title="D")  # a slide chart without data is no chart, so nothing is lost
+
+
+def test_total_rows_written_into_the_rows() -> None:
+    columns = [{"header": "Pos"}, {"header": "Menge", "type": "number"}, {"header": "Preis", "type": "currency"},
+               {"header": "Gesamt", "type": "currency", "formula": "=B{row}*C{row}"}]  # fmt: skip
+    own_numbers = {"name": "A", "columns": columns, "rows": [["a", 1, 2], ["b", 3, 4], ["Summe", 4, 6, None]]}
+    assert "rows[2] ('Summe') is a total row" in invalid("create_excel_file", sheets=[own_numbers])  # D4 = B4*C4
+    sums = {"name": "B", "columns": columns[:3], "rows": [["a", 1, 2], ["Summe netto:", "=SUM(B2:B2)", "=SUM(C2:C2)"]]}
+    assert excel([sums])[0]["B"]["B3"].value == "=SUM(B2:B2)"  # the model's own sums, written as formulas
+    # labels that only start like a total, and sheets without numbers, are left alone
+    titles = {
+        "name": "C",
+        "columns": [{"header": "Kurs"}],
+        "rows": [["Excel Grundlagen"], ["Total Quality Management"]],
+    }
+    tasks = {"name": "D", "columns": [{"header": "Task"}, {"header": "Owner"}, {"header": "Done"}],
+             "rows": [["Draft", "Anna", "yes"], ["Sum up results", None, None]]}  # fmt: skip
+    workbook = excel([titles, tasks])[0]
+    assert workbook["C"]["A3"].value == "Total Quality Management" and workbook["D"]["A3"].value == "Sum up results"
+    total_too = {"name": "E", "columns": [{"header": "Posten"}, {"header": "Betrag", "type": "currency", "total": "sum"}],
+                 "rows": [["Miete", 900], ["Strom", 100], ["Gesamt netto", 1000]]}  # fmt: skip
+    assert "rows[2] ('Gesamt netto') is a total row" in invalid("create_excel_file", sheets=[total_too])  # twice
+    no_columns = invalid("create_excel_file", sheets=[{"name": "S", "columns": [], "rows": [[], []]}])
+    assert "the sheet has no columns" in no_columns
+
+
+def test_null_written_as_text_in_number_columns() -> None:
+    sheet = {"name": "S", "columns": [{"header": "A"}, {"header": "B"}, {"header": "C", "type": "number"}],
+             "rows": [["x", "1.200", "null"], ["y", "null", 2], ["z", "3", None]]}  # fmt: skip
+    ws = excel([sheet], valves={"language": "de"})[0]["S"]
+    assert [ws[f"B{r}"].value for r in (2, 3, 4)] == [1200, None, 3] and ws["C2"].value is None
+    # all 'null': the checks for empty columns see empty cells, not text
+    offer = {"name": "O", "columns": [{"header": "Pos"}, {"header": "Menge", "type": "number"},
+             {"header": "Preis", "type": "currency"}, {"header": "Gesamt", "type": "currency", "formula": "=B{row}*C{row}"}],
+             "rows": [["a", 1, "null", None], ["b", 2, "null", None]]}  # fmt: skip
+    assert "columns[2] ('Preis') is empty, but the formula of 'Gesamt' uses it" in invalid(
+        "create_excel_file", sheets=[offer]
+    )
+    summe = {"name": "P", "columns": [{"header": "A"}, {"header": "B", "type": "number"}],
+             "rows": [["x", 1], ["Summe", "null"]]}  # fmt: skip
+    assert "rows[1] ('Summe') is a total row" in invalid("create_excel_file", sheets=[summe])
+    text = {"name": "T", "columns": [{"header": "Note", "type": "text"}], "rows": [["None"]]}
+    assert excel([text])[0]["T"]["A2"].value == "None"  # in a text column it may be a word
+
+
+def test_items_that_all_start_with_a_dash_and_html_breaks() -> None:
+    doc, _, _ = word(blocks=[{"type": "bullets", "items": ["- a", "- b"]}], title="T")
+    assert [p.style.name for p in doc.paragraphs if p.text in ("a", "b")] == ["List Bullet", "List Bullet"]
+    slide = {"layout": "two_columns", "title": "V", "left": ["- fast", "- cheap"], "right": ["- slow<BR/>loud"]}
+    (parsed,) = od.parse_argument(od.SLIDES, [slide], "slides")
+    assert parsed.left == ["fast", "cheap"] and parsed.right == ["slow\nloud"]
+
+
+def test_json_error_messages_point_to_the_slip() -> None:
+    """Shown on both sides of the place, with the likely slip: models repeat a mistake they cannot find."""
+
+    def message(text: str) -> str:
+        return invalid("create_word_file", blocks=text)
+
+    extra = message('[{"type": "numbered", "items": ["a", "b"]]}, {"type": "paragraph", "text": "x"}]')
+    assert '"items": ["a", "b"] <<<HERE>>> ]}, {"type"' in extra
+    assert "the open object must be closed with } first, or the ] is one too many" in extra
+    assert "the } at the mark closes nothing that is open" in message('[{"type": "paragraph", "text": "x"}]}, 1')
+    assert "delete the comma before the ]" in message('[{"type": "paragraph", "text": "x"},]')
+    assert "cut off" in message('[{"type": "paragraph", "text": "x"}, {"type": "paragraph", "text": "ab')
+    assert "a list stands where a key belongs" in message('[{"type": "table", ["a"]}]')
+    # list items written as several arrays are not wrapped (they would become lists inside the list)
+    assert "a list stands where a key belongs" in message('[{"type": "bullets", "items": ["a", "b"], ["c"]}]')
+    assert "a key stands inside a list: the list before it is not closed" in message(
+        '[{"type": "bullets", "items": ["a", "b", "level": 1}]'
+    )
+    assert "a comma is missing before the mark" in message('[{"type": "paragraph" "text": "x"}]')
+    assert "a value is missing after the colon" in message('[{"type": "paragraph", "text": ]}]')
+    assert "a backslash inside a text must be written as \\\\" in message('[{"type": "paragraph", "text": "C:\\x"}]')
+    assert "a line break or tab inside a text" in message('[{"type": "paragraph", "text": "a\tb"}]')
+    assert "the arguments are empty" in message(" ")
+    assert "put all items into one list" in message('[{"type": "paragraph", "text": "x"}], [{"type": "page_break"}]')
+    assert "they were cut off (output limit), or a text ends with" in message('[{"type": "paragraph", "text": "x\\"}]')
+    assert "a text must start and end with a straight double quote" in message(
+        '[{"type": "paragraph", "text": „Hallo“}]'
+    )
+    assert "write true, false and null in lower case" in message('[{"type": "heading", "text": "x", "level": None}]')
+    assert "a list written with { }" in message('[{"type": "bullets", "items": {"a", "b"}}]')
+    assert "delete the ``` after the JSON" in message('[{"type": "paragraph", "text": "x"}]\n```')
 
 
 def test_garbled_arguments_are_rejected() -> None:
@@ -465,26 +587,11 @@ def test_excel_chart_errors_guide_the_model() -> None:
         return invalid("create_excel_file", sheets=[{**MONTHS_AS_COLUMNS, "chart": chart}])
 
     assert "value_columns: is empty (or use series_rows" in errors({"category_column": "Category", "type": "line"})
-    ws = excel([{**MONTHS_AS_COLUMNS, "chart": {"category_column": None, "value_columns": []}}])[0]["Budget"]
-    assert not ws._charts  # an empty chart object means "no chart"
     assert "if these are row labels, use series_rows" in errors(
         {"category_column": "Category", "value_columns": ["Income"]}
     )
     assert "series_rows: 'Profit' is not in the first column (Income, Expenses)" in errors({"series_rows": ["Profit"]})
     assert "must be next to each other" in errors({"series_rows": ["Income"], "value_columns": ["Jan", "Mar"]})
-
-
-def test_excel_repairs_common_model_shapes() -> None:
-    sheets = [
-        {"name": "Data", "headers": ["Month", "Income"], "rows": [["Jan", 1], ["Feb", 2]]},
-        {"name": "More", "columns": ["A", {"name": "B", "type": "number"}, {"type": "text"}], "rows": [["x", 1, "y"]]},
-        {"name": "Chart", "chart": {"type": "line", "category_column": "Month", "value_columns": ["Income"]}},
-    ]
-    workbook, _ = excel(sheets)
-    assert workbook.sheetnames == ["Data", "More"]  # the chart-only sheet's chart moved to "Data"
-    assert len(workbook["Data"]._charts) == 1
-    assert workbook["Data"]["B2"].value == 1 and workbook["Data"]["B2"].data_type == "n"  # untyped, but numbers
-    assert [c.value for c in workbook["More"][1]] == ["A", "B", None]
 
 
 def test_excel_rows_without_formula_columns_and_german() -> None:
@@ -623,19 +730,6 @@ def test_powerpoint_structure() -> None:
     assert [s.name for s in pie.plots[0].series] == ["Sales"]
 
 
-def test_powerpoint_repairs_common_model_shapes() -> None:
-    slides = [
-        {"title": "Deck"},
-        {"title": "Points", "bullets": "- a\n- b"},
-        {"title": "Data", "table": {"rows": [["h"], ["v"]]}},
-        {"title": "Chart", "chart": {"categories": ["x"], "series": [{"name": "s", "values": [1]}]}},
-    ]
-    prs, _ = powerpoint(slides, title="Deck_2026.pptx")
-    slides_ = list(prs.slides)
-    assert slides_[1].placeholders[1].text_frame.text == "a\nb"
-    assert any(s.has_table for s in slides_[2].shapes) and any(s.has_chart for s in slides_[3].shapes)
-
-
 def test_powerpoint_invalid_input() -> None:
     slides = [
         {"layout": "bullets", "title": "", "bullets": []},
@@ -649,16 +743,11 @@ def test_powerpoint_invalid_input() -> None:
         {"layout": "chart", "title": "No chart"},
     ]
     result = invalid("create_powerpoint_file", slides=slides)
-    assert "slides[0] (section): 'title' is empty" in result  # a list slide without items becomes a divider
+    assert "slides[0] (bullets): 'title' is empty" in result and "slides[0] (bullets): 'bullets' is empty" in result
     assert "at most 12 items" in result
     assert "1 values for 2 categories" in result
     assert "at most 16 rows" in result
     assert "slides[4] (chart): 'chart' is missing" in result
-
-
-def test_list_slide_without_items_becomes_divider() -> None:
-    prs, _ = powerpoint([{"layout": "bullets", "title": "Next steps", "bullets": []}], title="Deck")
-    assert prs.slides[0].shapes.title.text == "Next steps"
 
 
 def test_bad_accent_color_falls_back() -> None:
@@ -927,7 +1016,7 @@ def test_excel_rejects_content_that_cannot_be_meant() -> None:
     assert "cells in all sheets together" in invalid("create_excel_file", sheets=[too_big])
 
 
-def test_excel_formulas_written_into_rows() -> None:
+def test_excel_formulas_written_into_cells() -> None:
     sheet = {
         "name": "Budget",
         "columns": [{"header": "Monat"}, {"header": "Ein", "type": "currency"}, {"header": "Aus", "type": "currency"},
@@ -936,8 +1025,8 @@ def test_excel_formulas_written_into_rows() -> None:
                  ["Summe", "=SUM(B2:B3)", "=SUM(C2:C3)", "=SUM(D2:D3)"]],
     }  # fmt: skip
     ws = excel([sheet])[0]["Budget"]
-    assert [ws[f"D{r}"].value for r in (2, 3)] == ["=B2-C2", "=B3-C3"]  # a real column formula now
-    assert [c.value for c in ws[4]] == ["Total", "=SUM(B2:B3)", "=SUM(C2:C3)", "=SUM(D2:D3)"]  # the total row
+    assert [ws[f"D{r}"].value for r in (2, 3)] == ["=B2-C2", "=B3-C3"] and ws["D2"].data_type == "f"
+    assert [c.value for c in ws[4]] == ["Summe", "=SUM(B2:B3)", "=SUM(C2:C3)", "=SUM(D2:D3)"]  # sums in the cells
     mixed = {**sheet, "rows": [["Jan", 4000, 2500, "=B2-C2"], ["Feb", 4200, 2600, "=SUM(B2:C3)"]]}
     ws = excel([mixed])[0]["Budget"]  # no common pattern: each cell keeps its own formula
     assert (ws["D2"].value, ws["D3"].value) == ("=B2-C2", "=SUM(B2:C3)") and ws["D3"].data_type == "f"
@@ -949,40 +1038,9 @@ def test_excel_formulas_written_into_rows() -> None:
     ws = excel([months])[0]["M"]
     assert (ws["B4"].value, ws["C4"].value, ws["B4"].data_type) == ("=B2-B3", "=C2-C3", "f")
     assert ws["A5"].value == '=HYPERLINK("http://x")' and ws["A5"].data_type == "s"  # not allowed: stays text
-    nulls = {
-        "name": "S",
-        "columns": [{"header": "A"}, {"header": "B", "type": "number"}],
-        "rows": [["x", "null"], ["y", 2]],
-    }
-    assert excel([nulls])[0]["S"]["B2"].value is None
 
 
-def test_items_swallowed_by_an_unclosed_table() -> None:
-    blocks = [
-        {"type": "table", "rows": [["A", "B"], ["1", "2"], {"type": "paragraph", "text": "After"},
-                                   {"type": "heading", "text": "H"}]},
-        {"type": "paragraph", "text": "Last"},
-    ]  # fmt: skip
-    doc, _, _ = word(blocks=blocks, title="T")
-    assert [[c.text for c in row.cells] for row in doc.tables[0].rows] == [["A", "B"], ["1", "2"]]
-    assert [p.text for p in doc.paragraphs if p.text][1:] == ["After", "H", "Last"]
-    slides = [
-        {
-            "layout": "table",
-            "title": "T",
-            "table": [["a"], ["b"], {"layout": "bullets", "title": "N", "bullets": ["x"]}],
-        }
-    ]
-    prs, _ = powerpoint(slides, title="Deck")
-    assert len(prs.slides) == 2 and prs.slides[1].shapes.title.text == "N"
-
-
-def test_html_breaks_and_items_with_line_breaks() -> None:
-    left = "• Schneller<br>• Günstiger<BR/>• Einfacher"
-    slides = [{"layout": "two_columns", "title": "Vergleich", "left": left, "right": ["Teuer\n• Langsam"]}]
-    prs, _ = powerpoint(slides, title="Deck")
-    columns = [ph.text_frame.text for ph in prs.slides[0].placeholders if ph.placeholder_format.idx in (1, 2)]
-    assert columns == ["Schneller\nGünstiger\nEinfacher", "Teuer\nLangsam"]
+def test_html_breaks_and_header_only_tables() -> None:
     doc, _, _ = word(blocks=[{"type": "table", "rows": [["A", "B"], ["x<br>y", "z"]]}], title="T")
     assert doc.tables[0].rows[1].cells[0].text == "x\ny"
     header_only = [{"layout": "table", "title": "Zeitplan", "table": [["Phase", "Zeitraum"]]}]
@@ -1013,7 +1071,7 @@ def test_findings_of_the_quality_review() -> None:
     # all items written with "- " are top-level items, not sub items
     prs, _ = powerpoint([{"layout": "bullets", "title": "Ziele", "bullets": ["- Effizienz", "- Qualität"]}], title="D")
     assert [p.level for p in prs.slides[0].placeholders[1].text_frame.paragraphs] == [0, 0]
-    # a formula that uses its own column; an empty "Netto-Summe" row becomes the total of the result
+    # a formula that uses its own column; an empty "Netto-Summe" row is sent back: "total" builds the row
     own = {"name": "S", "columns": [{"header": "Menge", "type": "number"}, {"header": "Preis", "type": "currency"},
            {"header": "Gesamt", "type": "currency", "formula": "=B{row}*C{row}"}],
            "rows": [[1, 2], [3, 4]]}  # fmt: skip
@@ -1021,7 +1079,11 @@ def test_findings_of_the_quality_review() -> None:
     total_column = {"header": "Gesamt", "type": "currency", "formula": "=A{row}*B{row}"}
     offer = {**own, "columns": [*own["columns"][:2], total_column],
              "rows": [[1, 2], [3, 4], ["Netto-Summe", None, None]]}  # fmt: skip
-    ws = excel([offer], valves={"language": "de"})[0]["S"]
+    assert "rows[2] ('Netto-Summe') is a total row: remove it and set \"total\"" in invalid(
+        "create_excel_file", sheets=[offer]
+    )
+    fixed = {**offer, "columns": [*own["columns"][:2], {**total_column, "total": "sum"}], "rows": [[1, 2], [3, 4]]}
+    ws = excel([fixed], valves={"language": "de"})[0]["S"]
     assert [c.value for c in ws[4]] == ["Summe", None, "=SUM(C2:C3)"] and ws.max_row == 4
     # unnamed sheets follow the language; chart unit at the value axis
     assert excel([{"columns": [{"header": "x"}], "rows": [["y"]]}], valves={"language": "de"})[0].sheetnames == [
@@ -1033,42 +1095,12 @@ def test_findings_of_the_quality_review() -> None:
     assert frame.chart.value_axis.axis_title.text_frame.text == "Stunden pro Woche"
 
 
-def test_nested_blocks_and_escaped_unicode() -> None:
-    blocks = [{"type": "paragraph", "bullets": [{"type": "bullets", "items": ["Datum: 12.10.", "Ort: Raum 2"]}]},
-              {"type": "paragraph", "text": ["Zeile", {"type": "bullets", "items": ["a"]}]}]  # fmt: skip
-    doc, _, _ = word(blocks=blocks, title="T", header_text="Team \\u2013 Protokoll")
-    texts = [p.text for p in doc.paragraphs]
-    assert "Datum: 12.10." in texts and not any("{" in t for t in texts)
+def test_escaped_unicode_and_garbled_text() -> None:
+    doc, _, _ = word(blocks=[{"type": "paragraph", "text": "x"}], title="T", header_text="Team \\u2013 Protokoll")
     assert doc.sections[0].header.paragraphs[0].text == "Team \N{EN DASH} Protokoll"
     garbled = [{"type": "paragraph", "text": "Phase 1 -0.2 },{text: Phase 2"}]
     assert "the arguments are garbled" in invalid("create_word_file", blocks=garbled)
     assert "the arguments are garbled" in invalid("create_word_file", blocks=[{"{type": "heading", "text": "x"}])
-
-
-def test_gemma_style_nesting() -> None:
-    rows = [["TOP", "Inhalt", ["Beschluss"]], ["1", ["läuft", ["verschoben"]]],
-            [["2", "Urlaub", "bis Freitag"], [["3", "Tickets", "Test ab 01.11."]]]]  # fmt: skip
-    blocks = [{"type": "heading", "level": 1, "items": [{"text": "Einleitung"}]}, {"type": "table", "rows": rows}]
-    doc, _, _ = word(blocks=blocks, title="T")
-    assert ("Heading 1", "Einleitung") in [(p.style.name, p.text) for p in doc.paragraphs]
-    assert [[c.text for c in row.cells] for row in doc.tables[0].rows] == [
-        ["TOP", "Inhalt", "Beschluss"], ["1", "läuft", "verschoben"], ["2", "Urlaub", "bis Freitag"],
-        ["3", "Tickets", "Test ab 01.11."],
-    ]  # fmt: skip
-    sheet = {"name": "A", "columns": [{"header": "Pos"}, {"header": "Menge", "type": "number"},
-             {"header": "Preis", "type": "currency"},
-             {"header": "Gesamt", "type": "currency", "formula": "=B{row}*C{row}"}],
-             "rows": [["a", 2, 10, None], ["b", 3, 5, None],
-                      ["Netto-Summe", "null", "null", {"formula": "=SUM(D2:D3)", "type": "currency"}]]}  # fmt: skip
-    ws = excel([sheet], valves={"language": "de"})[0]["A"]
-    assert [c.value for c in ws[4]] == ["Summe", None, None, "=SUM(D2:D3)"] and ws.max_row == 4
-    budget = {"name": "B", "columns": [{"header": "Kategorie"}, {"header": "Jan", "type": "currency"}],
-              "rows": [['"Gehalt"', 3000], ['"Miete"', 900]],
-              "chart": {"series_rows": [["Gehalt", "Miete"]]}}  # fmt: skip
-    ws = excel([budget])[0]["B"]
-    assert ws["A2"].value == "Gehalt" and len(ws._charts[0].series) == 2
-    doc, _, _ = word(blocks=[{"type": "bullets", "items": [["a"], [["b"], [["c"]]]]}], title="T")
-    assert [p.text for p in doc.paragraphs if p.style.name == "List Bullet"] == ["a", "b", "c"]
 
 
 def test_slide_table_columns_fit_long_words() -> None:
@@ -1093,15 +1125,6 @@ def test_excel_chart_with_only_type_and_title() -> None:
              "rows": [["Jan", 10], ["Feb", 12]], "chart": {"type": "line", "title": "Umsatzverlauf"}}  # fmt: skip
     (chart,) = excel([sheet])[0]["S"]._charts
     assert [s.val.numRef.f for s in chart.series] == ["'S'!$B$2:$B$3"]
-
-
-def test_excel_error_names_the_sheet_the_model_sent() -> None:
-    sheets = [
-        {"name": "Chart", "chart": {"type": "line", "category_column": "A", "value_columns": ["B"]}},
-        {"name": "Data", "columns": [{"header": "A"}, {"header": "B", "type": "number"}], "rows": [["x", 1]]},
-        {"name": "Bad", "columns": [{"header": "A", "formula": "=FOO()"}], "rows": [[None]]},
-    ]
-    assert "sheets[2].columns[0].formula" in invalid("create_excel_file", sheets=sheets)
 
 
 @pytest.mark.parametrize(
@@ -1132,19 +1155,6 @@ def test_word_numbering_and_text_lines() -> None:
     assert len(sub_lists) == 3 and sub_lists[0] == sub_lists[1] != sub_lists[2]  # each sub list restarts at 1
 
 
-def test_word_blocks_with_other_field_names() -> None:
-    blocks = [
-        {"type": "paragraph", "content": "From content"},
-        {"type": "bullets", "list": ["x", "y"]},
-        {"type": "table", "data": [["H"], ["v"]]},
-        {"type": "bullets", "items": ["a", ["a1", "a2"]]},
-    ]
-    doc, _, _ = word(blocks=blocks, title="T")
-    paragraphs = [(p.style.name, p.text) for p in doc.paragraphs]
-    assert ("Normal", "From content") in paragraphs and ("List Bullet", "y") in paragraphs
-    assert ("List Bullet 2", "a1") in paragraphs and doc.tables[0].rows[1].cells[0].text == "v"
-
-
 def test_word_title_after_spacing_and_error_positions() -> None:
     blocks = [
         {"type": "paragraph", "text": ""},
@@ -1163,34 +1173,14 @@ def test_word_title_after_spacing_and_error_positions() -> None:
 
 def test_word_settings_order() -> None:
     blocks = [
-        {"type": "toc"},
+        {"type": "table_of_contents"},
         {"type": "heading", "text": "A"},
         {"type": "paragraph", "text": "x" * 120},
-        {"type": "toc"},
+        {"type": "table_of_contents"},
     ]
     doc, _, _ = word(blocks=blocks, title="T")
     tags = [child.tag.split("}")[1] for child in doc.settings.element]
     assert tags.count("updateFields") == 1 and tags.index("updateFields") < tags.index("compat")
-
-
-def test_slides_with_other_shapes_keep_their_content() -> None:
-    slides = [
-        {"layout": "bullets", "title": "Agenda", "items": ["a", "b"]},
-        {"layout": "bullets", "title": "Plan", "table": [["Phase", "When"], ["1", "Q1"]]},
-        {"type": "chart", "title": "Shares", "categories": ["N", "S"], "series": [{"name": "x", "values": [1, 2]}]},
-        {"layout": "two_columns", "title": "Pro/Con", "left": [["fast"], ["expensive"]]},
-        {"layout": "section", "title": "Next", "content": "Q4"},
-        {"layout": "bullets", "title": "Steps", "content": "- one\n- two"},
-    ]
-    prs, _ = powerpoint(slides, title="Deck")
-    s = list(prs.slides)
-    assert s[0].placeholders[1].text_frame.text == "a\nb"
-    assert any(shape.has_table for shape in s[1].shapes)
-    assert any(shape.has_chart for shape in s[2].shapes)
-    columns = [ph.text_frame.text for ph in s[3].placeholders if ph.placeholder_format.idx in (1, 2)]
-    assert columns == ["fast", "expensive"]
-    assert "Q4" in [shape.text_frame.text for shape in s[4].shapes if shape.has_text_frame]
-    assert s[5].placeholders[1].text_frame.text == "one\ntwo"
 
 
 def test_slide_overflow() -> None:
