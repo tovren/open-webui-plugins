@@ -25,7 +25,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
@@ -38,6 +38,7 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 STUB_JS = Path(__file__).resolve().parent / "browser_stub.js"
 PLUGIN_FILES = ("response_export.py", "context_guard.py", "company_context.py", "reasoning_toggle.py")
 ALLOWED_THIRD_PARTY = {"docx", "openpyxl", "pydantic"}
+LAZY_IMPORTS = {"open_webui"}  # only imported inside functions, when running in Open WebUI
 FRONTMATTER_KEYS = {
     "title",
     "author",
@@ -185,7 +186,7 @@ def test_frontmatter(file_name: str) -> None:
         if match := pattern.match(line):
             meta[match[1]] = match[2]
     assert set(meta) == FRONTMATTER_KEYS
-    assert meta["version"] == "1.0.0"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", meta["version"])
     assert meta["license"] == "MIT"
     assert meta["required_open_webui_version"] == "0.11.4"
     assert "Security & privacy" in "\n".join(lines[: lines.index('"""', 1)])
@@ -197,7 +198,7 @@ def test_only_bundled_libraries(file_name: str) -> None:
     modules = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
     modules |= {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
     top_level = {name.split(".")[0] for name in modules}
-    assert top_level <= set(sys.stdlib_module_names) | ALLOWED_THIRD_PARTY
+    assert top_level <= set(sys.stdlib_module_names) | ALLOWED_THIRD_PARTY | LAZY_IMPORTS
 
 
 # -------------------------------------------------------------------------------- response export --
@@ -657,9 +658,11 @@ def body_with_chars(chars: int, model: str = "m") -> dict[str, Any]:
     return {"model": model, "messages": [{"role": "user", "content": "x" * chars}]}
 
 
-def run_guard(flt: Any, body: dict[str, Any]) -> tuple[dict[str, Any], Recorder]:
+def run_guard(
+    flt: Any, body: dict[str, Any], metadata: dict[str, Any] | None = None
+) -> tuple[dict[str, Any], Recorder]:
     recorder = Recorder()
-    result = asyncio.run(flt.request(body, __event_emitter__=recorder.emit))
+    result = asyncio.run(flt.request(body, __event_emitter__=recorder.emit, __metadata__=metadata))
     return result, recorder
 
 
@@ -725,6 +728,64 @@ def test_guard_per_model_override_and_misconfiguration(caplog: pytest.LogCapture
     assert "broken" in caplog.text and "x=abc" in caplog.text
     body = body_with_chars(10**6)
     assert run_guard(make_filter(cg, context_tokens=1000, answer_reserve_tokens=1000), body)[0] is body
+
+
+def stub_compaction_config(monkeypatch: pytest.MonkeyPatch, values: dict[str, Any]) -> None:
+    """Stands in for open_webui.models.config.Config, which holds the Context Compaction settings."""
+
+    async def get_many(*keys: str) -> dict[str, Any]:
+        return {key: values[key] for key in keys if key in values}
+
+    modules = {
+        "open_webui": ModuleType("open_webui"),
+        "open_webui.models": ModuleType("open_webui.models"),
+        "open_webui.models.config": SimpleNamespace(Config=SimpleNamespace(get_many=get_many)),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def test_guard_compaction_hides_hint_for_normal_growth(monkeypatch: pytest.MonkeyPatch) -> None:
+    # usable = 8000 tokens, compaction from 7000: at 80 % the chat is summarized before the limit
+    stub_compaction_config(
+        monkeypatch,
+        {"chat.context_compaction.enable": True, "chat.context_compaction.token_threshold": 7000},
+    )
+    flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=2000)
+    assert run_guard(flt, body_with_chars(22384))[1].events == []
+    # still above the compaction threshold after compaction (e.g. large documents): hint is shown
+    _, recorder = run_guard(flt, body_with_chars(7200 * 35 // 10))
+    assert len(recorder.events) == 1 and "very long" in recorder.events[0]["data"]["description"]
+    with pytest.raises(cg.ContextLimitError):
+        run_guard(flt, body_with_chars(8001 * 35 // 10))
+
+
+def test_guard_compaction_threshold_too_high(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # default threshold 80000 is above the usable 8000 tokens: compaction never runs in time
+    stub_compaction_config(monkeypatch, {"chat.context_compaction.enable": True})
+    flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=2000)
+    run_guard(flt, body_with_chars(1000))
+    assert "Context Compaction threshold" not in caplog.text  # only checked once a chat gets long
+    assert len(run_guard(flt, body_with_chars(22384))[1].events) == 1
+    with pytest.raises(cg.ContextLimitError):
+        run_guard(flt, body_with_chars(8001 * 35 // 10))
+    assert caplog.text.count("Context Compaction threshold for model 'm' (80000 tokens)") == 1
+
+
+def test_guard_compaction_threshold_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    per_model = {"params": {"compact_token_threshold": 5000}}
+    assert asyncio.run(cg.compaction_threshold(per_model)) is None  # outside Open WebUI
+    stub_compaction_config(monkeypatch, {"chat.context_compaction.enable": False})
+    assert asyncio.run(cg.compaction_threshold(per_model)) is None
+    settings = {"chat.context_compaction.enable": True, "chat.context_compaction.token_threshold": "20000"}
+    stub_compaction_config(monkeypatch, settings)
+    assert asyncio.run(cg.compaction_threshold(None)) == 20000
+    assert asyncio.run(cg.compaction_threshold(per_model)) == 5000
+    assert asyncio.run(cg.compaction_threshold({"params": {"compact_token_threshold": 30000}})) == 20000
+    stub_compaction_config(monkeypatch, {**settings, "chat.context_compaction.token_cap": 40000})
+    assert asyncio.run(cg.compaction_threshold({"params": {"compact_token_threshold": 30000}})) == 30000
 
 
 # ------------------------------------------------------------------------------- company context --

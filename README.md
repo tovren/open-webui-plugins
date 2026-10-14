@@ -120,10 +120,39 @@ and the JSON size of tool definitions and tool calls), not a real tokenizer. Low
 If `answer_reserve_tokens` is not smaller than the context size, the check is skipped and a
 warning is logged, so a misconfiguration never blocks every chat.
 
+### With Context Compaction
+
+Open WebUI's built-in [Context Compaction](https://docs.openwebui.com/troubleshooting/context-window/)
+(off by default) summarizes older messages once a chat passes a token threshold. It works together
+with the guard:
+
+- Compaction runs before the filters, so the guard checks the shortened history including the
+  summary.
+- As long as compaction will summarize the chat before the limit, the hint to start a new chat is
+  not shown. It still appears if the prompt stays above the compaction threshold, for example
+  because of large documents.
+- The guard stays the safety net. Compaction skips a turn when no earlier message can be cut off,
+  and the summary request contains the whole chat, so after a large paste it can overflow itself.
+  The guard then stops the request with its message.
+- Long tool-call loops: Open WebUI 0.12.0 also compacts between the rounds, before the guard checks
+  each round. In 0.11.4 only the guard covers a loop that keeps growing.
+- If the compaction threshold is not below the usable context, compaction never runs before the
+  guard stops a chat. The default of 80000 tokens is above most local context sizes. The guard logs
+  a warning once in that case.
+
+Set `CONTEXT_COMPACTION_TOKEN_THRESHOLD`, or a model's `compact_token_threshold`, to about **half
+the context size**, e.g. `16000` for a 32k model. Compaction is only checked at the start of a turn,
+and the summary request is about as large as the whole chat, so a threshold close to the limit
+leaves too little room.
+
+In Open WebUI 0.11.4 and 0.12.0, running `/compact` right after the guard stopped a request does
+not help: Open WebUI stores the summary on the empty error message and skips that message when it
+builds the next request. That is why the stop message suggests a new chat, not `/compact`.
+
 ### Security & privacy
 
 Read-only: the request is never modified. No network access, nothing is stored, and no message
-content is logged.
+content is logged. Open WebUI's Context Compaction settings are only read.
 
 ---
 
@@ -446,7 +475,8 @@ A short example for a slide deck (the model sees the full schema with descriptio
 ## Compatibility
 
 - Tested with **Open WebUI 0.11.4** (the version in `required_open_webui_version`). Context Guard
-  needs at least 0.11 because it uses the `request` filter hook.
+  needs at least 0.11 because it uses the `request` filter hook. Context Guard was also tested with
+  0.12.0, with and without Context Compaction.
 - Python 3.11 and 3.12. Response Export was tested with python-docx 1.1.2 and newer, and
   openpyxl 3.1. Office Documents was tested with python-docx 1.2.0, openpyxl 3.1.5 and
   python-pptx 1.0.2, the versions bundled with Open WebUI 0.11.4.

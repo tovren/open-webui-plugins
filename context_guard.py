@@ -2,7 +2,7 @@
 title: Context Guard
 author: <AUTHOR NAME>
 author_url: <URL>
-version: 1.0.0
+version: 1.1.0
 license: MIT
 required_open_webui_version: 0.11.4
 description: Estimates the prompt size right before each request is sent to the model - after document excerpts and tool results have been added - and shows a warning or stops with a clear, friendly message before the model's context window overflows.
@@ -18,10 +18,14 @@ How it works
   conversation, so the model quietly forgets earlier messages and documents.
 - The token count is an estimate (characters / chars_per_token plus a flat amount per image),
   not a real tokenizer. Lower chars_per_token to be more cautious.
+- Works together with Open WebUI's Context Compaction: compaction runs first, so the guard checks
+  the shortened history. While compaction will summarize the chat before the limit, the hint to
+  start a new chat is not shown. If the compaction threshold is not below the usable context, a
+  warning is logged once, because chats would then be stopped before they are ever compacted.
 
 Security & privacy
 - Read-only: the request is never modified. No network access, nothing is stored, and no
-  message content is logged.
+  message content is logged. Open WebUI's Context Compaction settings are only read.
 """
 
 import json
@@ -131,6 +135,38 @@ def parse_model_overrides(text: str) -> dict[str, int]:
     return overrides
 
 
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+async def compaction_threshold(metadata: dict[str, Any] | None) -> int | None:
+    """Token threshold of Open WebUI's Context Compaction for this request, None if it is off.
+
+    Resolved like open_webui.utils.context_compaction (0.11.4): the model's compact_token_threshold
+    or the global threshold (default 80000), capped by the token cap."""
+    try:
+        from open_webui.models.config import Config
+
+        values = await Config.get_many(
+            "chat.context_compaction.enable",
+            "chat.context_compaction.token_threshold",
+            "chat.context_compaction.token_cap",
+        )
+    except Exception:
+        log.debug("Context Guard: Context Compaction settings not available", exc_info=True)
+        return None
+    if not values.get("chat.context_compaction.enable"):
+        return None
+    threshold = _positive_int(values.get("chat.context_compaction.token_threshold")) or 80000
+    cap = _positive_int(values.get("chat.context_compaction.token_cap")) or threshold
+    model_threshold = _positive_int(((metadata or {}).get("params") or {}).get("compact_token_threshold"))
+    return min(model_threshold or threshold, cap)
+
+
 class Filter:
     class Valves(BaseModel):
         priority: int = Field(
@@ -173,25 +209,52 @@ class Filter:
 
     def __init__(self) -> None:
         self.valves = self.Valves()
+        self._reported_thresholds: set[tuple[str, int, int]] = set()
 
     def _context_tokens(self, model_id: str | None) -> int:
         overrides = parse_model_overrides(self.valves.model_context_tokens)
         return overrides.get(model_id or "", self.valves.context_tokens)
 
+    def _report_threshold_too_high(self, model_id: str, threshold: int, usable: int) -> None:
+        if (model_id, threshold, usable) in self._reported_thresholds:
+            return
+        self._reported_thresholds.add((model_id, threshold, usable))
+        log.warning(
+            "Context Guard: the Context Compaction threshold for model %r (%d tokens) is not below its "
+            "usable context (%d tokens), so long chats are stopped before they are compacted. Set "
+            "CONTEXT_COMPACTION_TOKEN_THRESHOLD or the model's compact_token_threshold to about half the "
+            "context size.",
+            model_id,
+            threshold,
+            usable,
+        )
+
     async def request(
-        self, body: dict[str, Any], __event_emitter__: EventEmitter | None = None
+        self,
+        body: dict[str, Any],
+        __event_emitter__: EventEmitter | None = None,
+        __metadata__: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Check the final payload; warn via status event or abort with ContextLimitError."""
-        usable = self._context_tokens(body.get("model")) - self.valves.answer_reserve_tokens
+        model_id = body.get("model") or ""
+        usable = self._context_tokens(model_id) - self.valves.answer_reserve_tokens
         if usable <= 0:
             log.warning("Context Guard: answer_reserve_tokens >= context size, check is skipped")
             return body
         used = estimate_tokens(body, self.valves.chars_per_token, self.valves.tokens_per_image)
+        if used * 100 < self.valves.warn_percent * usable:
+            return body
+        threshold = await compaction_threshold(__metadata__)
+        if threshold is not None and threshold >= usable:
+            self._report_threshold_too_high(model_id, threshold, usable)
         percent = math.ceil(used * 100 / usable)
         texts = TRANSLATIONS[self.valves.language]
         if used > usable:
             raise ContextLimitError(texts["blocked"].format(percent=percent))
-        if used * 100 >= self.valves.warn_percent * usable and __event_emitter__ is not None:
+        # Normal chat growth: compaction summarizes the chat before it reaches the limit.
+        if threshold is not None and used < threshold < usable:
+            return body
+        if __event_emitter__ is not None:
             await __event_emitter__(
                 {
                     "type": "status",
