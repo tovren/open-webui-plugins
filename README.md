@@ -256,8 +256,8 @@ answer, where the user can preview and download it.
 
 | Tool function | What the model can use |
 |---|---|
-| `create_word_file` | Title and subtitle, table of contents (at the top or where the model places it), headings (3 levels), paragraphs, bullet and numbered lists (2 levels, numbering restarts for each list), tables with a shaded header row that repeats on every page and column widths fitted to the content, quotes, page breaks, text in the page header, "Page X of Y" footer, landscape pages |
-| `create_excel_file` | Several sheets with typed columns (`text`, `number`, `integer`, `currency`, `percent`, `date`), formulas per column, a total row (`sum`, `average`, `min`, `max`, `count`) and native Excel charts (column, bar, line, pie). Header row bold, shaded and frozen, with an auto filter and fitted column widths |
+| `create_word_file` | Title and subtitle, table of contents (at the top or where the model places it), headings (3 levels), paragraphs, bullet and numbered lists (2 levels, numbering restarts for each list), tables with a coloured header row that repeats on every page and column widths fitted to the content, quotes, page breaks, text in the page header, "Page X of Y" footer, landscape pages |
+| `create_excel_file` | Several sheets with typed columns (`text`, `number`, `integer`, `currency`, `percent`, `date`), formulas per column, a total row (`sum`, `average`, `min`, `max`, `count`) and native Excel charts (column, bar, line, pie). Header row coloured and frozen, with an auto filter and fitted column widths; printed on one page width |
 | `create_powerpoint_file` | 16:9 slides with the layouts `title`, `section`, `bullets`, `two_columns`, `table` and `chart` (native PowerPoint charts: column, bar, line, pie, optionally with the unit at the value axis), plus speaker notes |
 
 Inline `**bold**`, `*italic*` and `[links](https://…)` work in all text fields of Word and PowerPoint;
@@ -361,7 +361,8 @@ A short example for a slide deck (the model sees the full schema with descriptio
 | `language` | `en` | Language of the status messages and of texts inside the files: total row label, page footer, date format, table of contents heading (`en` or `de`); also the decimal mark for numbers sent as text in Excel |
 | `delivery` | `attach` | `attach`: store the file in Open WebUI and attach it to the answer (preview, stays in the chat). `download`: hand it straight to the browser as a download (nothing is stored, but it is gone after a reload). If attaching fails, the tool falls back to a download |
 | `currency` | `EUR` | Currency of `currency` columns in Excel (`EUR`, `USD`, `GBP`, `CHF`) |
-| `accent_color` | `1F4E79` | Colour of PowerPoint titles and accent lines, as a hex value without `#` |
+| `accent_color` | `1F4E79` | Accent colour of all three formats (titles, table header rows, charts, title slide), as a hex value without `#`. Lighter and darker tones are derived from it |
+| `font` | `Calibri` | Font of all three formats, e.g. a company font such as `Arial` or `Aptos`. It has to be installed where the files are opened; otherwise Office shows a similar one. Excel columns get a little more room for fonts wider than Calibri |
 | `page_numbers` | `true` | Add "Page X of Y" to the footer of Word documents |
 
 ### Security & privacy
@@ -384,21 +385,39 @@ A short example for a slide deck (the model sees the full schema with descriptio
   so crafted text (e.g. from a prompt injection in an uploaded document) cannot stall the server.
 - **Storage:** with `delivery = attach` the file is uploaded to Open WebUI's file storage under the
   user's account and linked to the chat, so only the user (and admins) can open it. It is not added
-  to any knowledge base. With `delivery = download` nothing is stored; like Response Export, this
-  needs a CSP that allows `'unsafe-eval'`. The download only counts as done when the browser confirms
-  it (at most 60 seconds); otherwise the model is told that the file could not be created.
+  to any knowledge base, and Open WebUI's own text extraction and embedding are skipped; instead the tool
+  stores a Markdown version of the file (headings, lists, tables, slide texts and chart data), which the
+  "Content" tab of Open WebUI's file view shows. With `delivery = download` nothing is stored; like
+  Response Export, this needs a CSP that allows `'unsafe-eval'`. The download only counts as done when
+  the browser confirms it (at most 60 seconds); otherwise the model is told that the file could not be
+  created.
 - Like every Open WebUI plugin, the tool runs inside the Open WebUI server process.
 
 ### Notes and limitations
 
-- **Formulas have no stored results.** Excel and LibreOffice calculate them when the file is opened,
-  but the preview in Open WebUI may show these cells empty.
+- **Previews in Open WebUI** use browser libraries that know only part of the formats. Word files are
+  written so that the preview shows their fonts, colours and bullets, too. The Excel preview shows formula
+  cells empty (formulas have no stored results; Excel and LibreOffice calculate them when the file is
+  opened) and dates as numbers, and the slide preview leaves out some formatting such as bullets and the
+  alignment of titles. In Excel, PowerPoint and LibreOffice the files look as intended.
 - **Table of contents:** Word fills it in when the document is opened and asks first whether to
   update the fields. LibreOffice needs **Tools → Update → Update All**.
-- **PowerPoint design:** the tool uses python-pptx's built-in theme (white, Calibri) with the accent
-  colour; company templates are not supported yet. Text is not shrunk to fit; the font size is chosen
-  from the amount of text (24 down to 12 pt), slides take at most 12 items, and if the text does not
-  fit even at 12 pt the model is asked to split the slide.
+- **Design:** one calm, modern look for all three formats, in shades of the `accent_color` valve and in the
+  font of the `font` valve (also for charts and for text the user adds later). Company templates are not
+  supported yet.
+  - **Word:** A4 with `language = de` (Letter otherwise), a title block with a line in the accent colour,
+    headings in the accent colour, tables with a coloured header row, light banding and lines between the
+    rows only, quotes with a coloured bar, the title and "Page X of Y" in the footer.
+  - **Excel:** a coloured header row with white text, light banding (a conditional format, so the stripes
+    stay in place when the table is sorted), thin row lines and no grid lines, text, numbers and dates
+    aligned with a small indent, a highlighted total row, charts in matching colours.
+    Printed on one page width (landscape for wide sheets and sheets with a chart) with the header row on
+    every page and the title in the page header.
+  - **PowerPoint:** a dark title slide, section slides in the accent colour, content slides with the
+    presentation title and slide number in the footer, coloured bullets, two columns as light cards, tables
+    like in Word, charts in matching colours with values at the bars when there are few. Text is not shrunk
+    to fit; the font size is chosen from the amount of text (24 down to 12 pt), slides take at most 12
+    items, and if the text does not fit even at 12 pt the model is asked to split the slide.
 - **The model makes the difference.** Five German test requests (minutes, budget, presentation, offer,
   concept) with Open WebUI's tool-call handling; the candidates ran 40 times each, and two files per model
   and request were reviewed blind (language, content and arithmetic, completeness, structure, usability;

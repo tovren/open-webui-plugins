@@ -490,6 +490,7 @@ def test_json_error_messages_point_to_the_slip() -> None:
         '[{"type": "bullets", "items": ["a", "b", "level": 1}]'
     )
     assert "a comma is missing before the mark" in message('[{"type": "paragraph" "text": "x"}]')
+    assert "a key is missing" in message('[{"type": "paragraph": "Der Arbeitsschutz prüft"}]')
     assert "a value is missing after the colon" in message('[{"type": "paragraph", "text": ]}]')
     assert "a backslash inside a text must be written as \\\\" in message('[{"type": "paragraph", "text": "C:\\x"}]')
     assert "a line break or tab inside a text" in message('[{"type": "paragraph", "text": "a\tb"}]')
@@ -750,6 +751,101 @@ def test_powerpoint_invalid_input() -> None:
     assert "slides[4] (chart): 'chart' is missing" in result
 
 
+def test_design_follows_the_accent_color() -> None:
+    """One accent colour drives all three formats; the shades are derived from it."""
+    accent, valves = "8B1E3F", {"accent_color": "#8b1e3f"}
+    design = od.Design(accent)
+    blocks = [{"type": "heading", "text": "Teil"}, {"type": "table", "rows": [["A", "B"], ["1", "2"], ["3", "4"]]}]
+    result, recorder = call("create_word_file", valves=valves, blocks=blocks, title="Bericht")
+    doc = Document(io.BytesIO(recorder.download()[0]))
+    assert doc.styles["Heading 1"].font.color.rgb == od.RGBColor.from_string(accent)
+    fills = [cell._tc.tcPr.find(od.qn("w:shd")) for cell in doc.tables[0].column_cells(0)]
+    assert [f.get(od.qn("w:fill")) if f is not None else None for f in fills] == [accent, None, design.band]
+    footer = doc.sections[0].footer.paragraphs[0]
+    assert footer.text.startswith("Bericht\t") and footer.paragraph_format.tab_stops[0].alignment == 2  # right
+    sheet = {"name": "S", "columns": [{"header": "Monat"}, {"header": "Wert", "type": "number", "total": "sum"}],
+             "rows": [["Jan", 1], ["Feb", 2]], "chart": {"type": "column", "category_column": "Monat", "value_columns": ["Wert"]}}  # fmt: skip
+    result, recorder = call("create_excel_file", valves=valves, sheets=[sheet])
+    ws = load_workbook(io.BytesIO(recorder.download()[0]))["S"]
+    assert ws["A1"].fill.fgColor.rgb.endswith(accent) and ws["A1"].font.color.rgb.endswith("FFFFFF")
+    (banding,) = ws.conditional_formatting  # a rule, so the stripes stay in place when the user sorts
+    assert str(banding.sqref) == "A2:B3" and banding.rules[0].formula == ["MOD(ROW(),2)=1"]
+    assert banding.rules[0].dxf.fill.bgColor.rgb.endswith(design.band) and ws["A3"].fill.fill_type is None
+    assert ws["A4"].value == "Total"
+    assert not ws.sheet_view.showGridLines and ws.page_setup.fitToWidth == 1 and ws.print_title_rows == "$1:$1"
+    workbook = zipfile.ZipFile(io.BytesIO(recorder.download()[0]))
+    chart_xml = workbook.read(next(n for n in workbook.namelist() if n.startswith("xl/charts/chart"))).decode()
+    assert f'srgbClr val="{accent}"' in chart_xml and chart_xml.count('<delete val="0"/>') == 2  # axes shown in Excel
+    prs, _ = powerpoint([{"layout": "title", "title": "Deck"}, {"layout": "bullets", "title": "B", "bullets": ["a"]}],
+                        valves=valves)  # fmt: skip
+    title_slide, content = prs.slides
+    assert title_slide.background.fill.fore_color.rgb == od.PptxRGBColor.from_string(design.dark)
+    assert content.shapes.title.text_frame.paragraphs[0].runs[0].font.color.rgb == od.PptxRGBColor.from_string(accent)
+    assert "2" in [shape.text_frame.text for shape in content.shapes if shape.has_text_frame]  # slide number
+
+
+def test_house_font_in_all_formats() -> None:
+    valves = {"font": "  Source   Sans 3 "}
+    _, recorder = call("create_word_file", valves=valves, blocks=[{"type": "paragraph", "text": "x"}], title="T")
+    doc = Document(io.BytesIO(recorder.download()[0]))
+    assert {doc.styles[name].font.name for name in ("Normal", "Title", "Heading 1", "Footer")} == {"Source Sans 3"}
+    sheet = {"name": "S", "columns": [{"header": "A"}], "rows": [["x"]]}
+    _, recorder = call("create_excel_file", valves=valves, sheets=[sheet])
+    data = recorder.download()[0]
+    assert load_workbook(io.BytesIO(data))["S"]["A1"].font.name == "Source Sans 3"
+    assert zipfile.ZipFile(io.BytesIO(data)).read("xl/theme/theme1.xml").decode().count('typeface="Source Sans 3"') == 2
+    _, recorder = call("create_powerpoint_file", valves=valves, slides=[{"layout": "title", "title": "Deck"}])
+    theme = zipfile.ZipFile(io.BytesIO(recorder.download()[0])).read("ppt/theme/theme1.xml").decode()
+    assert theme.count('<a:latin typeface="Source Sans 3"/>') == 2  # headings and body text, also in charts
+    _, recorder = call("create_word_file", valves={"font": 'Arial"/><w:x'}, blocks=[{"type": "paragraph", "text": "x"}])
+    assert Document(io.BytesIO(recorder.download()[0])).styles["Normal"].font.name == "Calibri"  # not a font name
+
+
+def test_markdown_text_of_the_files() -> None:
+    """The text Open WebUI shows in the "Content" tab of its file view."""
+    options = od.WordOptions(title="Bericht", subtitle="Q3")
+    blocks = od.parse_argument(od.WORD_BLOCKS, [
+        {"type": "heading", "text": "Teil", "level": 2}, {"type": "paragraph", "text": "Text **fett**"},
+        {"type": "numbered", "items": ["a", "- a1"]}, {"type": "table", "rows": [["A", "B"], ["1|2", "x"]]},
+        {"type": "quote", "text": "Zitat"}, {"type": "paragraph", "text": " "},
+    ], "blocks")  # fmt: skip
+    data, text = od.build_docx(options, blocks, od.TRANSLATIONS["de"])
+    assert text == ("# Bericht\n\n*Q3*\n\n### Teil\n\nText **fett**\n\n1. a\n   1. a1\n\n"
+                    "| A | B |\n| --- | --- |\n| 1\\|2 | x |\n\n> Zitat")  # fmt: skip
+    sheet = {"name": "Budget", "columns": [{"header": "Posten"}, {"header": "Betrag", "type": "currency", "total": "sum"},
+             {"header": "Anteil", "type": "percent"}, {"header": "Datum", "type": "date"}],
+             "rows": [["Miete", 1200.5, 45, "2026-01-01"]], "chart": {"type": "pie", "title": "Kosten",
+             "category_column": "Posten", "value_columns": ["Betrag"]}}  # fmt: skip
+    sheets = od.parse_argument(od.EXCEL_SHEETS, [sheet], "sheets")
+    data, text = od.build_xlsx(sheets, "EUR", od.TRANSLATIONS["de"], decimal_comma=True)
+    assert "| Miete | 1.200,50 € | 45 % | 01.01.2026 |" in text and "| Summe | =SUM(B2:B2) |" in text
+    assert text.startswith("## Budget") and text.endswith("*Diagramm: Kosten (pie)*")
+    slides = od.parse_argument(od.SLIDES, [
+        {"layout": "title", "title": "Deck", "subtitle": "Sub"},
+        {"layout": "chart", "title": "Umsatz", "notes": "Kurz\nhalten", "chart": {"categories": ["Q1", "Q2"],
+         "series": [{"name": "2026", "values": [1.5, 2]}], "unit": "T€"}},
+    ], "slides")  # fmt: skip
+    data, text = od.build_pptx("Deck", slides, texts=od.TRANSLATIONS["de"])
+    assert text == ("# Deck\n\n## 1. Deck\n\nSub\n\n## 2. Umsatz\n\n*Diagramm (column, T€)*\n\n"
+                    "|  | Q1 | Q2 |\n| --- | --- | --- |\n| 2026 | 1.5 | 2 |\n\n> Notizen: Kurz halten")  # fmt: skip
+
+
+def test_word_files_render_in_browser_previews() -> None:
+    """docx-preview (Open WebUI's preview) reads the document defaults, the theme, the linked character styles and
+    the bullets' own font, which Word itself does not use."""
+    _, recorder = call(
+        "create_word_file", valves={"accent_color": "8B1E3F"}, blocks=[{"type": "bullets", "items": ["a"]}]
+    )
+    package = zipfile.ZipFile(io.BytesIO(recorder.download()[0]))
+    styles, numbering = package.read("word/styles.xml").decode(), package.read("word/numbering.xml").decode()
+    defaults = re.search(r"<w:docDefaults>.*?</w:docDefaults>", styles, re.S)[0]
+    assert 'w:ascii="Calibri"' in defaults and "asciiTheme" not in defaults  # not the theme's Cambria
+    heading_char = re.search(r'w:styleId="Heading1Char".*?</w:style>', styles, re.S)[0]
+    assert '<w:color w:val="8B1E3F"/>' in heading_char and "themeColor" not in heading_char
+    assert "Symbol" not in numbering and 'w:lvlText w:val="\u2022"' in numbering  # a real bullet, not a Symbol glyph
+    assert 'typeface="Cambria"' not in package.read("word/theme/theme1.xml").decode()
+
+
 def test_bad_accent_color_falls_back() -> None:
     prs, _ = powerpoint(SLIDES[:3], valves={"accent_color": "red; drop"})
     assert prs.slides[2].shapes.title.text_frame.paragraphs[0].runs[0].font.color.rgb == od.PptxRGBColor.from_string(
@@ -776,6 +872,7 @@ class FakeOpenWebUI:
         self.uploads: list[dict[str, Any]] = []
         self.linked: list[dict[str, Any]] = []
         self.message_files: list[dict[str, Any]] = [{"type": "file", "id": "earlier"}]
+        self.file_data: dict[str, dict[str, Any]] = {}
         fake = self
 
         async def upload_file_handler(request: Any, file: Any, metadata: Any, process: bool, user: Any) -> Any:
@@ -801,11 +898,17 @@ class FakeOpenWebUI:
             def __init__(self, **data: Any) -> None:
                 self.id = data["id"]
 
+        class Files:
+            @staticmethod
+            async def update_file_data_by_id(id: str, data: dict) -> None:
+                fake.file_data.setdefault(id, {}).update(data)
+
         modules = {
             "open_webui": ModuleType("open_webui"),
             "open_webui.models": ModuleType("open_webui.models"),
             "open_webui.models.chats": SimpleNamespace(Chats=Chats),
             "open_webui.models.users": SimpleNamespace(UserModel=UserModel),
+            "open_webui.models.files": SimpleNamespace(Files=Files),
             "open_webui.routers": ModuleType("open_webui.routers"),
             "open_webui.routers.files": SimpleNamespace(upload_file_handler=upload_file_handler),
             "open_webui.utils": ModuleType("open_webui.utils"),
@@ -846,6 +949,7 @@ def test_attach_to_saved_chat(monkeypatch: pytest.MonkeyPatch) -> None:
     assert upload["user"] == "u1" and upload["metadata"] == {"chat_id": "chat-1", "message_id": "m1"}
     load_workbook(io.BytesIO(upload["data"]))
     assert fake.linked == [{"chat_id": "chat-1", "message_id": "m1", "file_ids": ["file-1"], "user_id": "u1"}]
+    assert fake.file_data["file-1"]["content"] == "## S\n\n| A |\n| --- |\n| x |"  # the "Content" tab
     (files_event,) = [e for e in recorder.events if e["type"] == "chat:message:files"]
     assert [f["id"] for f in files_event["data"]["files"]] == ["earlier", "file-1"]  # earlier files stay visible
     entry = files_event["data"]["files"][1]

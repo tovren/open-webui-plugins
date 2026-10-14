@@ -30,6 +30,7 @@ Security & privacy
 
 import asyncio
 import base64
+import copy
 import difflib
 import io
 import json
@@ -43,24 +44,34 @@ from typing import Any, ClassVar, Literal
 
 from docx import Document
 from docx.enum.section import WD_ORIENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.style import WD_STYLE_TYPE
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.opc.constants import RELATIONSHIP_TYPE
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor
+from docx.shared import Cm, Pt, RGBColor
 from docx.text.paragraph import Paragraph as DocxParagraph
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, PieChart, Reference, Series
+from openpyxl.chart.axis import ChartLines
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.series import DataPoint
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.drawing.line import LineProperties
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.page import PageMargins
+from openpyxl.writer.theme import theme_xml
 from openpyxl.worksheet.worksheet import Worksheet
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.chart.xlsx import CategoryWorkbookWriter
 from pptx.dml.color import RGBColor as PptxRGBColor
-from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION, XL_LEGEND_POSITION, XL_MARKER_STYLE, XL_TICK_MARK
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
+from pptx.opc.constants import RELATIONSHIP_TYPE as PPTX_RT
 from pptx.oxml.xmlchemy import OxmlElement as PptxOxmlElement
 from pptx.shapes.placeholder import SlidePlaceholder
 from pptx.text.text import TextFrame, _Paragraph as PptxParagraph
@@ -88,10 +99,8 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
 BODY_FONT = "Calibri"
-BODY_FONT_SIZE = Pt(11)
 CODE_FONT = "Consolas"
-HEADER_FILL = "DDE4EE"
-LINK_COLOR = "0563C1"
+DEFAULT_ACCENT = "1F4E79"
 MAX_FILENAME_CHARS = 60
 SAFE_LINK_PREFIXES = ("http://", "https://", "mailto:")
 SUB_ITEM_PREFIX = "- "  # list items starting with this are indented one level
@@ -139,6 +148,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "toc_placeholder": "Right-click and choose “Update field” to show the table of contents.",
         "sheet": "Sheet",
         "date_format": "YYYY-MM-DD",
+        "paper": "letter",
+        "chart": "Chart",
+        "notes": "Notes",
     },
     "de": {
         "status_word": "Word-Dokument wird erstellt …",
@@ -153,8 +165,68 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "toc_placeholder": "Rechtsklick → „Felder aktualisieren“ zeigt das Inhaltsverzeichnis an.",
         "sheet": "Tabelle",
         "date_format": "DD.MM.YYYY",
+        "paper": "a4",
+        "chart": "Diagramm",
+        "notes": "Notizen",
     },
 }
+
+# ----------------------------------------------------------------------------------------------- design --
+# One accent colour (the accent_color valve) gives the colours of all three formats: titles and header rows in the
+# accent, a dark shade for the title slide, light tints for banded rows, total rows and cards, neutral greys for
+# text and lines.
+
+WHITE, BLACK = "FFFFFF", "000000"
+TEXT_COLOR = "262626"
+MUTED_COLOR = "6B6B6B"  # subtitles, header and footer lines, axis labels
+RULE_COLOR = "D9D9D9"  # thin lines
+
+
+def mix(color: str, other: str, share: float) -> str:
+    """`color` with `share` (0 to 1) of `other` mixed in, as RRGGBB."""
+    return "".join(
+        f"{round(a + (b - a) * share):02X}" for a, b in zip(bytes.fromhex(color), bytes.fromhex(other), strict=True)
+    )
+
+
+@dataclass(frozen=True)
+class Design:
+    """Colours and font of the files: the accent colour (accent_color valve) gives all colours, the font (font
+    valve) is used for all text."""
+
+    accent: str = DEFAULT_ACCENT
+    font: str = BODY_FONT
+
+    @property
+    def dark(self) -> str:
+        return mix(self.accent, BLACK, 0.35)
+
+    @property
+    def light(self) -> str:  # bars and lines on the dark title slide
+        return mix(self.accent, WHITE, 0.6)
+
+    @property
+    def tint(self) -> str:  # total rows
+        return mix(self.accent, WHITE, 0.85)
+
+    @property
+    def band(self) -> str:  # every second table row, cards
+        return mix(self.accent, WHITE, 0.93)
+
+    def series(self, count: int) -> list[str]:
+        """Chart colours that stay apart in print. Two series (e.g. last year and this year): the second one,
+        usually the newer, in the accent."""
+        if count == 2:
+            return [mix(self.accent, WHITE, 0.55), self.accent]
+        colors = [self.accent, mix(self.accent, WHITE, 0.5), "8C8C8C", self.dark, mix(self.accent, WHITE, 0.75),
+                  "BFBFBF", mix(self.accent, BLACK, 0.6), "595959"]  # fmt: skip
+        return [colors[i % len(colors)] for i in range(count)]
+
+
+DEFAULT_DESIGN = Design()
+FONT_NAME_RE = re.compile(r"[^\W_][\w .-]{0,40}")  # 'Calibri', 'Segoe UI', 'Source Sans 3'
+THEME_FONTS_RE = r'(<a:(?:major|minor)Font>\s*<a:latin typeface=")[^"]*(")'  # headings and body text of a theme
+
 
 # Messages for the model (always English; the model answers the user in their language).
 RESULT_ATTACHED = (
@@ -497,6 +569,8 @@ def json_error_hint(text: str, pos: int, msg: str) -> str:
         return "a value is missing after the colon"
     if char == ":" and open_brackets(text, pos)[-1:] == "]":
         return "a key stands inside a list: the list before it is not closed, add ] before the key"
+    if char == ":":  # '{"type": "paragraph": "Text"}'
+        return 'a value is followed by ":", so a key is missing: write , "key": value (e.g. , "text": "...")'
     if char in ("]", "}"):
         expected = open_brackets(text, pos)[-1:]
         if expected != char:
@@ -991,6 +1065,7 @@ class WordOptions:
     table_of_contents: bool = False
     landscape: bool = False
     page_numbers: bool = True
+    design: Design = DEFAULT_DESIGN
 
 
 def word_title(title: str, blocks: list[WordBlock], fallback: str) -> tuple[str, list[WordBlock]]:
@@ -1080,6 +1155,64 @@ def _add_field(paragraph: DocxParagraph, instruction: str, placeholder: str = ""
         run._r.append(element)
 
 
+# Word wants the children of w:pPr and w:tblPr in a fixed order; new ones go before these.
+PPR_AFTER_BORDERS = (
+    "w:shd", "w:tabs", "w:suppressAutoHyphens", "w:kinsoku", "w:wordWrap", "w:overflowPunct", "w:topLinePunct",
+    "w:autoSpaceDE", "w:autoSpaceDN", "w:bidi", "w:adjustRightInd", "w:snapToGrid", "w:spacing", "w:ind",
+    "w:contextualSpacing", "w:mirrorIndents", "w:suppressOverlap", "w:jc", "w:textDirection", "w:textAlignment",
+    "w:textboxTightWrap", "w:outlineLvl", "w:divId", "w:cnfStyle", "w:rPr", "w:sectPr", "w:pPrChange",
+)  # fmt: skip
+TBLPR_AFTER_BORDERS = ("w:shd", "w:tblLayout", "w:tblCellMar", "w:tblLook", "w:tblCaption", "w:tblDescription")
+TBLPR_AFTER_CELL_MARGINS = ("w:tblLook", "w:tblCaption", "w:tblDescription")
+THEME_FONT_ATTRS = ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme")
+PAPER_SIZES = {"a4": (Cm(21), Cm(29.7)), "letter": (Cm(21.59), Cm(27.94))}
+
+
+def _set_borders(parent: Any, tag: str, successors: tuple[str, ...], sides: list[tuple[str, int, str]]) -> None:
+    """Replace the w:pBdr of a paragraph (or style) or the w:tblBorders of a table. Sides in schema order (top,
+    left, bottom, right, insideH, insideV), size in eighths of a point, 0 for no line."""
+    old = parent.find(qn(tag))
+    if old is not None:
+        parent.remove(old)
+    borders = OxmlElement(tag)
+    for side, size, color in sides:
+        edge = OxmlElement(f"w:{side}")
+        edge.set(qn("w:val"), "single" if size else "nil")
+        if size:
+            edge.set(qn("w:sz"), str(size))
+            edge.set(qn("w:space"), "4" if tag == "w:pBdr" else "0")
+            edge.set(qn("w:color"), color)
+        borders.append(edge)
+    parent.insert_element_before(borders, *successors)
+
+
+def _set_cell_margins(table: Any, top: int, bottom: int) -> None:
+    """Cell margins in twips; left and right stay at Word's 108 (CELL_PADDING)."""
+    margins = OxmlElement("w:tblCellMar")
+    for side, value in (("top", top), ("left", 108), ("bottom", bottom), ("right", 108)):
+        edge = OxmlElement(f"w:{side}")
+        edge.set(qn("w:w"), str(value))
+        edge.set(qn("w:type"), "dxa")
+        margins.append(edge)
+    table._tbl.tblPr.insert_element_before(margins, *TBLPR_AFTER_CELL_MARGINS)
+
+
+def _set_style(style: Any, size: float, color: str, bold: bool = False, italic: bool = False,
+               before: float | None = None, after: float | None = None, font: str = BODY_FONT) -> None:  # fmt: skip
+    """Font, colour and spacing of a built-in style; its theme font and theme colour are removed, they would win."""
+    style.font.name = font
+    for attr in THEME_FONT_ATTRS:
+        style.element.rPr.rFonts.attrib.pop(qn(attr), None)
+    style.font.size, style.font.bold, style.font.italic = Pt(size), bold, italic
+    style.font.color.rgb = RGBColor.from_string(color)
+    for attr in ("w:themeShade", "w:themeTint"):
+        style.element.rPr.color.attrib.pop(qn(attr), None)
+    if before is not None:
+        style.paragraph_format.space_before = Pt(before)
+    if after is not None:
+        style.paragraph_format.space_after = Pt(after)
+
+
 CHAR_WIDTH = Pt(5.8)  # average character of 11 pt Calibri, bold header text included
 CELL_PADDING = Pt(12)  # left and right cell margin
 MAX_WORD_CHARS = 20  # longer words may wrap
@@ -1120,19 +1253,88 @@ class DocxWriter:
     def __init__(self, options: WordOptions, texts: dict[str, str]) -> None:
         self.options = options
         self.texts = texts
+        self.design = options.design
         self.doc = Document()
-        normal_font = self.doc.styles["Normal"].font
-        normal_font.name = BODY_FONT
-        normal_font.size = BODY_FONT_SIZE
+        self._styles()
+
+    def _styles(self) -> None:
+        """A calm, modern look: dark grey body text with some air, headings in the accent colour, no theme fonts."""
+        styles, accent, font = self.doc.styles, self.design.accent, self.design.font
+        _set_style(styles["Normal"], 10.5, TEXT_COLOR, after=6, font=font)
+        styles["Normal"].paragraph_format.line_spacing = 1.15
+        _set_style(styles["Title"], 26, accent, bold=True, after=2, font=font)
+        title_borders = styles["Title"].element.pPr.find(qn("w:pBdr"))
+        if title_borders is not None:
+            styles["Title"].element.pPr.remove(title_borders)  # the title block draws its own line
+        _set_style(styles["Subtitle"], 13, MUTED_COLOR, after=2, font=font)
+        _set_style(styles["Heading 1"], 16, accent, bold=True, before=20, after=6, font=font)
+        _set_style(styles["Heading 2"], 13, TEXT_COLOR, bold=True, before=14, after=4, font=font)
+        _set_style(styles["Heading 3"], 11, accent, bold=True, before=10, after=2, font=font)
+        if "TOC Heading" in self._style_names():
+            _set_style(styles["TOC Heading"], 16, accent, bold=True, before=12, after=6, font=font)
+        for name in ("Header", "Footer"):  # small grey text; their tab stops are for Letter paper and would win
+            _set_style(styles[name], 8.5, MUTED_COLOR, after=0, font=font)
+            tabs = styles[name].element.pPr.find(qn("w:tabs")) if styles[name].element.pPr is not None else None
+            if tabs is not None:
+                styles[name].element.pPr.remove(tabs)
+        quote = styles["Quote"]
+        _set_style(quote, 10.5, MUTED_COLOR, italic=True, before=6, after=10, font=font)
+        quote.paragraph_format.left_indent = Cm(0.4)
+        _set_borders(quote.element.get_or_add_pPr(), "w:pBdr", PPR_AFTER_BORDERS, [("left", 18, accent)])
+        self._for_previews()
+
+    def _for_previews(self) -> None:
+        """Word takes fonts and colours from the paragraph styles. Browser previews (docx-preview in Open WebUI)
+        also read the document defaults, the theme fonts and the character styles linked to the paragraph
+        styles, and they have no Symbol font for Word's bullets (boxes instead of dots). All get the design."""
+        font, styles = self.design.font, self.doc.styles
+        for fonts in styles.element.xpath("w:docDefaults/w:rPrDefault/w:rPr/w:rFonts"):
+            for attr in THEME_FONT_ATTRS:
+                fonts.attrib.pop(qn(attr), None)
+            for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+                fonts.set(qn(attr), font)
+        for part in self.doc.part.package.iter_parts():
+            if str(part.partname).startswith("/word/theme/"):
+                part._blob = re.sub(THEME_FONTS_RE.encode(), lambda m: m[1] + font.encode() + m[2], part.blob)
+        for style in styles:
+            link = style.element.find(qn("w:link"))
+            if style.type != WD_STYLE_TYPE.PARAGRAPH or link is None or style.element.rPr is None:
+                continue
+            linked = styles.element.get_by_id(link.get(qn("w:val")))
+            if linked is not None:  # e.g. "Heading 1 Char": same look as its paragraph style
+                for old in linked.findall(qn("w:rPr")):
+                    linked.remove(old)
+                linked.append(copy.deepcopy(style.element.rPr))
+        for level in self.doc.part.numbering_part.element.iter(qn("w:lvl")):
+            kind = level.find(qn("w:numFmt"))
+            if kind is None or kind.get(qn("w:val")) != "bullet":
+                continue
+            indent = level.find(f"{qn('w:pPr')}/{qn('w:ind')}")
+            sub_item = indent is not None and int(indent.get(qn("w:left"), "0")) > 720
+            level.find(qn("w:lvlText")).set(qn("w:val"), "\u2013" if sub_item else "\u2022")
+            for old in level.findall(qn("w:rPr")):
+                level.remove(old)
+            props = OxmlElement("w:rPr")
+            fonts = OxmlElement("w:rFonts")
+            fonts.set(qn("w:ascii"), font)
+            fonts.set(qn("w:hAnsi"), font)
+            color = OxmlElement("w:color")
+            color.set(qn("w:val"), self.design.accent)
+            props.append(fonts)
+            props.append(color)
+            level.append(props)
 
     def render(self, blocks: list[WordBlock]) -> bytes:
         self.long_document = (
             sum(len(b.text) + sum(map(len, b.items)) for b in blocks) + 40 * len(blocks) > LONG_DOCUMENT_CHARS
         )
         self._page_setup()
-        self.doc.add_heading(to_plain(self.options.title), level=0)
+        last = self.doc.add_heading(to_plain(self.options.title), level=0)
         if self.options.subtitle.strip():
-            self._add_runs(self.doc.add_paragraph(style="Subtitle"), parse_inline(self.options.subtitle))
+            last = self.doc.add_paragraph(style="Subtitle")
+            self._add_runs(last, parse_inline(self.options.subtitle))
+        _set_borders(last._p.get_or_add_pPr(), "w:pBdr", PPR_AFTER_BORDERS, [("bottom", 12, self.design.accent)])
+        last.paragraph_format.space_after = Pt(18)
         if self.options.table_of_contents:
             self._table_of_contents()
         for block in blocks:
@@ -1157,6 +1359,10 @@ class DocxWriter:
 
     def _page_setup(self) -> None:
         section = self.doc.sections[0]
+        section.page_width, section.page_height = PAPER_SIZES[self.texts.get("paper", "letter")]
+        section.left_margin = section.right_margin = section.top_margin = Cm(2.5)
+        section.bottom_margin = Cm(2.2)
+        section.header_distance = section.footer_distance = Cm(1.25)
         if self.options.landscape:
             section.orientation = WD_ORIENT.LANDSCAPE
             section.page_width, section.page_height = section.page_height, section.page_width
@@ -1164,9 +1370,12 @@ class DocxWriter:
             header = section.header.paragraphs[0]
             header.text = clean_text(self.options.header_text.strip())
             header.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        if self.options.page_numbers:
+        if self.options.page_numbers:  # title on the left, "Page X of Y" on the right, a thin line above
             footer = section.footer.paragraphs[0]
-            footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            width = section.page_width - section.left_margin - section.right_margin
+            footer.paragraph_format.tab_stops.add_tab_stop(width, WD_TAB_ALIGNMENT.RIGHT)
+            _set_borders(footer._p.get_or_add_pPr(), "w:pBdr", PPR_AFTER_BORDERS, [("top", 4, RULE_COLOR)])
+            footer.add_run(clean_text(to_plain(self.options.title))[:90] + "\t")
             before, _, rest = self.texts["page_footer"].partition("{page}")
             between, _, after = rest.partition("{pages}")
             footer.add_run(before)
@@ -1241,10 +1450,14 @@ class DocxWriter:
         return num.numId
 
     def _table(self, rows: list[list[str]]) -> None:
+        """Header row in the accent colour, every second row lightly tinted, thin lines between the rows only."""
         columns = table_columns(rows)
         table = self.doc.add_table(rows=len(rows), cols=columns)
-        table.style = "Table Grid"
         table.autofit = False
+        lines = [("top", 0, ""), ("left", 0, ""), ("bottom", 8, self.design.accent), ("right", 0, ""),
+                 ("insideH", 4, RULE_COLOR), ("insideV", 0, "")]  # fmt: skip
+        _set_borders(table._tbl.tblPr, "w:tblBorders", TBLPR_AFTER_BORDERS, lines)
+        _set_cell_margins(table, top=50, bottom=50)
         section = self.doc.sections[-1]
         widths = column_widths(rows, columns, section.page_width - section.left_margin - section.right_margin)
         cells = table._cells  # once: row.cells and column.cells rebuild the whole grid on every call
@@ -1257,43 +1470,96 @@ class DocxWriter:
                 header_flag = OxmlElement("w:tblHeader")
                 header_flag.set(qn("w:val"), "true")
                 doc_row._tr.get_or_add_trPr().append(header_flag)
+            fill = self.design.accent if row_index == 0 else self.design.band if row_index % 2 == 0 else None
             for column, cell in enumerate(cells[row_index * columns : (row_index + 1) * columns]):
                 text = row[column] if column < len(row) else ""
-                self._add_runs(cell.paragraphs[0], parse_inline(text, Run("", bold=row_index == 0)))
-                if row_index == 0:
-                    _set_cell_shading(cell, HEADER_FILL)
-        self.doc.add_paragraph()
+                paragraph = cell.paragraphs[0]
+                paragraph.paragraph_format.space_after = Pt(0)
+                paragraph.paragraph_format.line_spacing = 1.0
+                self._add_runs(
+                    paragraph, parse_inline(text, Run("", bold=row_index == 0)), WHITE if row_index == 0 else None
+                )
+                if fill:
+                    _set_cell_shading(cell, fill)
+        self.doc.add_paragraph().paragraph_format.space_after = Pt(4)
 
-    def _add_runs(self, paragraph: DocxParagraph, runs: list[Run]) -> None:
+    def _add_runs(self, paragraph: DocxParagraph, runs: list[Run], color: str | None = None) -> None:
         for run in runs:
             docx_run = paragraph.add_run(run.text)
             docx_run.bold = run.bold or None
             docx_run.italic = run.italic or None
+            if color:
+                docx_run.font.color.rgb = RGBColor.from_string(color)
             if run.strike:
                 docx_run.font.strike = True
             if run.code:
                 docx_run.font.name = CODE_FONT
             if run.url:
-                self._make_link(paragraph, docx_run, run.url)
+                self._make_link(paragraph, docx_run, run.url, color or self.design.accent)
 
     @staticmethod
-    def _make_link(paragraph: DocxParagraph, docx_run: Any, url: str) -> None:
+    def _make_link(paragraph: DocxParagraph, docx_run: Any, url: str, color: str) -> None:
         docx_run.font.underline = True
-        docx_run.font.color.rgb = RGBColor.from_string(LINK_COLOR)
+        docx_run.font.color.rgb = RGBColor.from_string(color)
         link = OxmlElement("w:hyperlink")
         link.set(qn("r:id"), paragraph.part.relate_to(url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True))
         docx_run._r.addprevious(link)
         link.append(docx_run._r)
 
 
-def build_docx(options: WordOptions, blocks: list[WordBlock], texts: dict[str, str]) -> bytes:
+# The file as Markdown, for the "Content" tab of Open WebUI's file view (data.content, rendered as Markdown). The
+# upload skips Open WebUI's own text extraction (no processing, no embeddings), so the tool writes it itself.
+MAX_CONTENT_CHARS = 100_000
+
+
+def _markdown_cell(value: Any) -> str:
+    return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def markdown_table(rows: list[list[Any]]) -> str:
+    width = max((len(row) for row in rows), default=0)
+    lines = [
+        "| " + " | ".join(_markdown_cell(row[c]) if c < len(row) else "" for c in range(width)) + " |" for row in rows
+    ]
+    if lines:
+        lines.insert(1, "|" + " --- |" * width)
+    return "\n".join(lines)
+
+
+def markdown_items(items: list[str], ordered: bool = False) -> str:
+    lines = []
+    for item in items:
+        level, text = split_level(item)
+        if text:
+            lines.append("   " * level + ("1. " if ordered else "- ") + text)
+    return "\n".join(lines)
+
+
+def word_markdown(options: WordOptions, blocks: list[WordBlock]) -> str:
+    parts = [f"# {to_plain(options.title)}", f"*{options.subtitle.strip()}*" if options.subtitle.strip() else ""]
+    for block in blocks:
+        if block.type == "heading":
+            parts.append("#" * (min(max(block.level, 1), MAX_HEADING_LEVEL) + 1) + " " + to_plain(block.text))
+        elif block.type == "paragraph":
+            parts.append(block.text.strip())
+        elif block.type == "quote":
+            parts.append("\n".join("> " + line for line in block.text.strip().splitlines()))
+        elif block.type in ("bullets", "numbered"):
+            parts.append(markdown_items(block.items, ordered=block.type == "numbered"))
+        elif block.type == "table":
+            parts.append(markdown_table(block.rows))
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def build_docx(options: WordOptions, blocks: list[WordBlock], texts: dict[str, str]) -> tuple[bytes, str]:
+    """The file and its text as Markdown."""
     blocks = [block for block in blocks if not is_empty_block(block)]
     while blocks and blocks[-1].type == "page_break":  # would only add an empty page
         blocks = blocks[:-1]
     if any(block.type == "table_of_contents" for block in blocks):
         options = replace(options, table_of_contents=False)  # placed where the model put it instead
     check_word(options, blocks)
-    return DocxWriter(options, texts).render(blocks)
+    return DocxWriter(options, texts).render(blocks), word_markdown(options, blocks)
 
 
 # ----------------------------------------------------------------------------------------------- Excel --
@@ -1536,7 +1802,16 @@ def number_format(column: ExcelColumn, values: list[Any], currency: str, date_fo
     return None
 
 
-BOLD_FONT = Font(name=BODY_FONT, size=11, bold=True)
+ROW_LINE = Border(bottom=Side(style="thin", color=RULE_COLOR))
+# Excel cells have no padding: an indent keeps text and numbers of neighbouring columns apart.
+ALIGN = {
+    "text": Alignment(horizontal="left", vertical="center", indent=1),
+    "number": Alignment(horizontal="right", vertical="center", indent=1),
+    "date": Alignment(horizontal="center", vertical="center"),
+    "lines": Alignment(horizontal="left", vertical="top", wrap_text=True, indent=1),
+}
+WIDE_SHEET_COLUMNS = 6  # wider sheets, and sheets with a chart, are printed in landscape
+NARROW_FONTS = {"calibri", "carlito"}  # most other fonts are wider: columns get more room, header rows grow
 SHEET_NAME_INVALID_RE = re.compile(r"[\[\]:*?/\\]")
 TOTAL_FUNCTIONS = {"sum": "SUM", "average": "AVERAGE", "min": "MIN", "max": "MAX", "count": "COUNTA"}
 RESERVED_SHEET_NAMES = {"history"}  # reserved by Excel
@@ -1857,12 +2132,22 @@ def chart_layout(sheet: ExcelSheet, chart: ExcelChart) -> ChartLayout:
 
 
 class XlsxWriter:
-    def __init__(self, currency: str, texts: dict[str, str], decimal_comma: bool | None = None) -> None:
+    def __init__(self, currency: str, texts: dict[str, str], decimal_comma: bool | None = None,
+                 design: Design = DEFAULT_DESIGN, title: str = "") -> None:  # fmt: skip
         self.currency = currency
         self.texts = texts
         self.decimal_comma = decimal_comma
+        self.design = design
+        self.title = title
         self.workbook = Workbook()
         self.workbook.remove(self.workbook.active)
+        # Charts and cells the user adds later take the theme's fonts.
+        self.workbook.loaded_theme = re.sub(THEME_FONTS_RE, lambda m: m[1] + design.font + m[2], theme_xml)
+        self.body_font = Font(name=design.font, size=11, color=TEXT_COLOR)
+        self.bold_font = Font(name=design.font, size=11, bold=True, color=TEXT_COLOR)
+        self.header_font = Font(name=design.font, size=11, bold=True, color=WHITE)
+        self.chart_titles: dict[str, list[str]] = {}  # per sheet, for the text version
+        self.narrow_font = design.font.casefold() in NARROW_FONTS  # the column widths are measured for Calibri
 
     def render(self, sheets: list[ExcelSheet], formulas: dict[tuple[int, int], str]) -> bytes:
         for s, (sheet, name) in enumerate(zip(sheets, sheet_names(sheets, self.texts["sheet"]), strict=True)):
@@ -1874,7 +2159,9 @@ class XlsxWriter:
         return buffer.getvalue()
 
     def _sheet(self, ws: Worksheet, sheet: ExcelSheet, formulas: dict[int, str]) -> None:
-        header_fill = PatternFill("solid", fgColor=HEADER_FILL)
+        """Header row in the accent colour with white text, every second row lightly tinted, thin lines between the
+        rows, no grid lines; printed on one page width with the header row on every page."""
+        header_fill = PatternFill("solid", fgColor=self.design.accent)
         rows = align_rows(sheet)
         last_row = len(rows) + 1
         widths = [len(column.header.strip()) for column in sheet.columns]
@@ -1882,27 +2169,40 @@ class XlsxWriter:
             cell = ws.cell(row=1, column=c, value=excel_text(column.header.strip()) or None)
             cell.data_type = "s"
             cell.quotePrefix = str(cell.value or "").startswith(FORMULA_START)
-            cell.font = BOLD_FONT
+            cell.font = self.header_font
             cell.fill = header_fill
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            kind = (
+                "date"
+                if column.type == "date"
+                else "number"
+                if column.type in NUMBER_TYPES or column.formula
+                else "text"
+            )
+            cell.alignment = Alignment(
+                horizontal=ALIGN[kind].horizontal, vertical="center", wrap_text=True, indent=ALIGN[kind].indent
+            )
+        if self.narrow_font and all("\n" not in column.header for column in sheet.columns):
+            ws.row_dimensions[1].height = 22  # otherwise Excel fits the height to the wrapped header
         columns_values: list[list[Any]] = [[] for _ in sheet.columns]
         for r, row in enumerate(rows, start=2):
             for c, (column, raw) in enumerate(zip(sheet.columns, row, strict=True), start=1):
-                if (c - 1) in formulas:
-                    ws.cell(row=r, column=c, value=formulas[c - 1].replace("{row}", str(r)))
-                    widths[c - 1] = max(widths[c - 1], 12)
-                    continue
-                if formula := cell_formula(raw, column):  # checked against the whitelist
-                    ws.cell(row=r, column=c, value=formula.replace("{row}", str(r)))
+                cell = ws.cell(row=r, column=c)
+                cell.font, cell.border = self.body_font, ROW_LINE
+                if (c - 1) in formulas or (formula := cell_formula(raw, column)):  # checked against the whitelist
+                    cell.value = (formulas[c - 1] if (c - 1) in formulas else formula).replace("{row}", str(r))
+                    cell.alignment = ALIGN["date" if column.type == "date" else "number"]
                     widths[c - 1] = max(widths[c - 1], 12)
                     continue
                 value, typed = convert_value(raw, column.type, self.decimal_comma)
-                cell = ws.cell(row=r, column=c, value=value)
+                cell.value = value
+                cell.alignment = ALIGN[
+                    "date" if isinstance(value, date) else "number" if isinstance(value, int | float) else "text"
+                ]
                 if isinstance(value, str):
                     cell.data_type = "s"  # other text never becomes a live formula ("=HYPERLINK(...)" stays text)
                     cell.quotePrefix = value.startswith(FORMULA_START)  # ... not even when the user edits the cell
                     if "\n" in value:
-                        cell.alignment = Alignment(wrap_text=True, vertical="top")
+                        cell.alignment = ALIGN["lines"]
                     widths[c - 1] = max(widths[c - 1], *(len(line) for line in value.split("\n")))
                 elif value is not None:
                     columns_values[c - 1].append(value)
@@ -1916,20 +2216,71 @@ class XlsxWriter:
             if fmt:
                 for (cell,) in ws.iter_rows(min_row=2, max_row=format_rows, min_col=c, max_col=c):
                     cell.number_format = fmt
-            ws.column_dimensions[get_column_letter(c)].width = min(
-                max(widths[c - 1] + 2, MIN_COLUMN_WIDTH), MAX_COLUMN_WIDTH
-            )
+            width = (widths[c - 1] + 4) * (1 if self.narrow_font else 1.15)  # + 4: the indent on both sides
+            ws.column_dimensions[get_column_letter(c)].width = min(max(width, MIN_COLUMN_WIDTH), MAX_COLUMN_WIDTH)
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = f"A1:{get_column_letter(len(sheet.columns))}{last_row}"
+        ws.sheet_view.showGridLines = False
+        if len(rows) >= 2:  # every second row tinted by a rule, not by cell fills: it stays in place when sorted
+            band = PatternFill("solid", start_color=self.design.band, end_color=self.design.band)
+            ws.conditional_formatting.add(
+                f"A2:{get_column_letter(len(sheet.columns))}{last_row}",
+                FormulaRule(formula=["MOD(ROW(),2)=1"], fill=band),
+            )
         self._totals(ws, sheet, last_row)
         if sheet.chart:
             self._chart(ws, sheet, sheet.chart, last_row)
+        self._print_setup(ws, landscape=len(sheet.columns) > WIDE_SHEET_COLUMNS or sheet.chart is not None)
+
+    def markdown(self) -> str:
+        """The written sheets as Markdown tables, numbers shown like in the cells, formulas as formulas."""
+        parts = []
+        for ws in self.workbook.worksheets:
+            rows = [[self._cell_text(cell) for cell in row] for row in ws.iter_rows()]
+            parts += [f"## {ws.title}", markdown_table([row for row in rows if any(row)])]
+            parts += [f"*{self.texts['chart']}: {title}*" for title in self.chart_titles.get(ws.title, [])]
+        return "\n\n".join(part for part in parts if part)
+
+    def _cell_text(self, cell: Any) -> str:
+        """A cell's value as it is shown: decimals, %, currency and date from its number format."""
+        value, fmt = cell.value, str(cell.number_format)
+        if value is None or isinstance(value, str):
+            return value or ""
+        if isinstance(value, datetime | date):
+            return value.strftime("%d.%m.%Y" if self.texts["date_format"].startswith("DD") else "%Y-%m-%d")
+        percent = "%" in fmt
+        value = value * 100 if percent else value
+        decimals = re.search(r"\.(0+)", fmt)
+        if fmt == "General":
+            text = f"{value:,}"
+        else:
+            text = f"{value:,.{len(decimals[1]) if decimals else 0}f}"
+        if self.decimal_comma:
+            text = text.replace(",", "\0").replace(".", ",").replace("\0", ".")
+        symbol = next((s for s in ("€", "$", "£", "CHF") if s in fmt), "")
+        text += " %" if percent else ""
+        return symbol + text if symbol in ("$", "£") else f"{text} {symbol}".strip()
+
+    def _print_setup(self, ws: Worksheet, landscape: bool) -> None:
+        ws.page_setup.orientation = "landscape" if landscape else "portrait"
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4 if self.texts.get("paper") == "a4" else ws.PAPERSIZE_LETTER
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0  # one page wide, as many pages tall as needed
+        ws.print_title_rows = "1:1"
+        ws.page_margins = PageMargins(left=0.5, right=0.5, top=0.75, bottom=0.75)
+        for part, text in ((ws.oddHeader.left, self.title), (ws.oddHeader.right, ws.title)):
+            part.text, part.size, part.color = text.replace("&", "&&")[:100], 9, MUTED_COLOR
+            part.font = f"{self.design.font},Regular"
+        page = self.texts["page_footer"].replace("{page}", "&P").replace("{pages}", "&N")
+        footer = ws.oddFooter.right
+        footer.text, footer.size, footer.color, footer.font = page, 9, MUTED_COLOR, f"{self.design.font},Regular"
 
     def _totals(self, ws: Worksheet, sheet: ExcelSheet, last_row: int) -> None:
         if not has_totals(sheet):
             return
         row = last_row + 1
-        top = Border(top=Side(style="thin"))
+        lines = Border(top=Side(style="medium", color=self.design.accent), bottom=Side(style="thin", color=RULE_COLOR))
+        fill = PatternFill("solid", fgColor=self.design.tint)
         for c, column in enumerate(sheet.columns, start=1):
             cell = ws.cell(row=row, column=c)
             if column.total != "none":
@@ -1940,8 +2291,8 @@ class XlsxWriter:
             elif c == 1:  # no room for the label when the first column has a total itself
                 cell.value = self.texts["total"]
                 cell.data_type = "s"
-            cell.font = BOLD_FONT
-            cell.border = top
+            cell.font, cell.border, cell.fill = self.bold_font, lines, fill
+            cell.alignment = ALIGN["number" if column.total != "none" else "text"]
 
     def _chart(self, ws: Worksheet, sheet: ExcelSheet, chart: ExcelChart, last_row: int) -> None:
         layout = chart_layout(sheet, chart)
@@ -1965,16 +2316,70 @@ class XlsxWriter:
             excel_chart.title = excel_text(chart.title.strip())
         if len(series) == 1 and chart.type != "pie":
             excel_chart.legend = None  # a single series needs no legend
-        excel_chart.width, excel_chart.height = 18, 9
+        elif excel_chart.legend is not None:
+            excel_chart.legend.position = "b"
+        categories = (max_col - min_col + 1) if layout.by_rows else (max_row - min_row + 1)
+        self._chart_style(excel_chart, chart.type, categories)
+        excel_chart.width, excel_chart.height = 18, 10
         ws.add_chart(excel_chart, f"{get_column_letter(len(sheet.columns) + 2)}2")
+        names = ", ".join(title for title, _ in series)
+        self.chart_titles.setdefault(ws.title, []).append(f"{to_plain(chart.title.strip()) or names} ({chart.type})")
+
+    def _chart_style(self, excel_chart: Any, kind: str, categories: int) -> None:
+        """Colours of the design, light grid lines only on the value axis, values on the bars when there are few."""
+        if kind == "pie":
+            (series,) = excel_chart.series
+            for i, color in enumerate(self.design.series(categories)):
+                point = DataPoint(idx=i)
+                point.graphicalProperties.solidFill = color
+                point.graphicalProperties.line.solidFill = WHITE
+                series.dPt.append(point)
+            # outside the slices: dark text on the dark ones would not be readable
+            excel_chart.dataLabels = DataLabelList(
+                showPercent=True,
+                showVal=False,
+                showCatName=False,
+                showSerName=False,
+                showLegendKey=False,
+                dLblPos="outEnd",
+            )
+            return
+        for series, color in zip(excel_chart.series, self.design.series(len(excel_chart.series)), strict=True):
+            if kind == "line":
+                series.graphicalProperties.line.solidFill = color
+                series.graphicalProperties.line.width = 28575  # 2.25 pt
+                series.marker.symbol, series.marker.size = "circle", 6
+                series.marker.graphicalProperties = GraphicalProperties(
+                    solidFill=color, ln=LineProperties(solidFill=color)
+                )
+                series.smooth = False
+            else:
+                series.graphicalProperties.solidFill = color
+                series.graphicalProperties.line.solidFill = color
+        if kind != "line":
+            excel_chart.gapWidth = 60
+            if len(excel_chart.series) > 1:
+                excel_chart.overlap = -10
+        excel_chart.x_axis.delete = excel_chart.y_axis.delete = False  # openpyxl 3.1 leaves it open; Excel hides them
+        excel_chart.y_axis.majorGridlines = ChartLines(
+            spPr=GraphicalProperties(ln=LineProperties(solidFill=RULE_COLOR))
+        )
+        excel_chart.y_axis.spPr = GraphicalProperties(ln=LineProperties(noFill=True))
+        excel_chart.x_axis.spPr = GraphicalProperties(ln=LineProperties(solidFill=RULE_COLOR))
+        if len(excel_chart.series) == 1 and categories <= 8:
+            excel_chart.dataLabels = DataLabelList(showVal=True, showPercent=False, showCatName=False,
+                                                   showSerName=False, showLegendKey=False)  # fmt: skip
 
 
 def build_xlsx(
-    sheets: list[ExcelSheet], currency: str, texts: dict[str, str], decimal_comma: bool | None = None
-) -> bytes:
+    sheets: list[ExcelSheet], currency: str, texts: dict[str, str], decimal_comma: bool | None = None,
+    design: Design = DEFAULT_DESIGN, title: str = "",
+) -> tuple[bytes, str]:  # fmt: skip
+    """The file and its text as Markdown."""
     sheets = [blank_null_texts(infer_column_types(sheet, decimal_comma)) for sheet in sheets]
     formulas = check_excel(sheets, decimal_comma)
-    return XlsxWriter(currency, texts, decimal_comma).render(sheets, formulas)
+    writer = XlsxWriter(currency, texts, decimal_comma, design, title)
+    return writer.render(sheets, formulas), writer.markdown()
 
 
 # ------------------------------------------------------------------------------------------ PowerPoint --
@@ -1988,7 +2393,11 @@ BAR_TOP = Inches(1.5)
 BODY_TOP = Inches(1.8)
 BODY_HEIGHT = SLIDE_HEIGHT - BODY_TOP - Inches(0.6)
 COLUMN_GAP = Inches(0.5)
-TEXT_GRAY = "595959"
+CARD_PADDING = Inches(0.25)  # two_columns: the columns are light cards with the text inside
+COLUMN_TEXT_WIDTH = (CONTENT_WIDTH - COLUMN_GAP) // 2 - 2 * CARD_PADDING
+COLUMN_TEXT_HEIGHT = BODY_HEIGHT - 2 * CARD_PADDING
+FOOTER_TOP = SLIDE_HEIGHT - Inches(0.45)
+SLIDE_TEXT_COLOR = "3A3A3A"
 # Layout indices of python-pptx's default template.
 LAYOUT_TITLE, LAYOUT_CONTENT, LAYOUT_SECTION, LAYOUT_TWO_CONTENT, LAYOUT_TITLE_ONLY = 0, 1, 2, 3, 5
 CHART_TYPES = {
@@ -2038,11 +2447,13 @@ def check_slides(title: str, slides: list[Slide]) -> None:
             if check.require(
                 any(b.strip() for b in slide.left + slide.right), f"{where}: 'left' and 'right' are empty"
             ):
-                width = (CONTENT_WIDTH - COLUMN_GAP) // 2
                 lines = 1 if slide.left_heading.strip() or slide.right_heading.strip() else 0
                 check.require(
                     max(len(slide.left), len(slide.right)) > MAX_SLIDE_ITEMS
-                    or all(body_font_size(items, 22, width, lines) is not None for items in (slide.left, slide.right)),
+                    or all(
+                        body_font_size(items, 22, COLUMN_TEXT_WIDTH, lines, COLUMN_TEXT_HEIGHT) is not None
+                        for items in (slide.left, slide.right)
+                    ),
                     too_much,
                 )
         elif slide.layout == "table":
@@ -2115,7 +2526,9 @@ class TextLabelChartData(CategoryChartData):
         return TextLabelWorkbookWriter(self)
 
 
-def body_font_size(items: list[str], base: int = 24, width: int = CONTENT_WIDTH, extra_lines: int = 0) -> int | None:
+def body_font_size(
+    items: list[str], base: int = 24, width: int = CONTENT_WIDTH, extra_lines: int = 0, height: int = BODY_HEIGHT
+) -> int | None:
     """Largest font size (from `base` down) at which the items fit the text box, or None if they do not fit
     even at the smallest size; python-pptx cannot shrink text to fit. Estimates half an em per character,
     1.3 line height and 6 pt before each item; sub items are set smaller (see sub_item_size)."""
@@ -2126,7 +2539,7 @@ def body_font_size(items: list[str], base: int = 24, width: int = CONTENT_WIDTH,
             item_size = sub_item_size(size) if level else size
             chars_per_line = max(int(width / EMU_PER_POINT / (item_size * 0.5)), 1)
             lines += max(1, -(-len(to_plain(text)) // chars_per_line)) * item_size / size
-        if lines * size * 1.3 + len(items) * 6 <= BODY_HEIGHT / EMU_PER_POINT:
+        if lines * size * 1.3 + len(items) * 6 <= height / EMU_PER_POINT:
             return size
     return None
 
@@ -2163,14 +2576,23 @@ def _no_bullet(paragraph: PptxParagraph) -> None:
 
 
 class PptxWriter:
-    def __init__(self, title: str, accent: str) -> None:
+    """Title and section slides on a dark or accent background, content slides white with the title in the accent
+    colour, a thin footer line with the presentation title and the slide number."""
+
+    def __init__(self, title: str, design: Design = DEFAULT_DESIGN) -> None:
         self.title = title
-        self.accent = PptxRGBColor.from_string(accent)
+        self.design = design
+        self.accent = PptxRGBColor.from_string(design.accent)
         self.prs = Presentation()
         self.prs.slide_width, self.prs.slide_height = SLIDE_WIDTH, SLIDE_HEIGHT
+        # All text uses the theme's fonts, also the charts and the slides the user adds later.
+        master = self.prs.slide_masters[0].part
+        theme = next(rel.target_part for rel in master.rels.values() if rel.reltype == PPTX_RT.THEME)
+        theme._blob = re.sub(THEME_FONTS_RE.encode(), lambda m: m[1] + design.font.encode() + m[2], theme.blob)
+        self.number = 0
 
     def render(self, slides: list[Slide]) -> bytes:
-        for slide in slides:
+        for self.number, slide in enumerate(slides, start=1):
             getattr(self, f"_slide_{slide.layout}")(slide)
         buffer = io.BytesIO()
         self.prs.save(buffer)
@@ -2180,39 +2602,27 @@ class PptxWriter:
 
     def _slide_title(self, data: Slide) -> None:
         slide = self.prs.slides.add_slide(self.prs.slide_layouts[LAYOUT_TITLE])
+        self._background(slide, self.design.dark)
         title, subtitle = slide.placeholders[0], slide.placeholders[1]
-        self._place(title, MARGIN, Inches(2.0), CONTENT_WIDTH, Inches(1.8))
-        self._text(
-            title,
-            [data.title.strip() or self.title],
-            size=40,
-            bold=True,
-            color=self.accent,
-            anchor=MSO_ANCHOR.BOTTOM,
-            align=PP_ALIGN.CENTER,
-        )
-        self._bar(slide, Inches(3.95), MARGIN + CONTENT_WIDTH // 2 - Inches(0.8), Inches(1.6))
-        self._place(subtitle, MARGIN, Inches(4.2), CONTENT_WIDTH, Inches(1.4))
-        self._text(
-            subtitle,
-            [data.subtitle] if data.subtitle.strip() else [],
-            size=22,
-            color=TEXT_GRAY,
-            anchor=MSO_ANCHOR.TOP,
-            align=PP_ALIGN.CENTER,
-        )
+        text = data.title.strip() or self.title
+        self._place(title, MARGIN, Inches(1.5), CONTENT_WIDTH, Inches(2.6))
+        self._text(title, [text], size=40 if len(text) <= 50 else 32, bold=True, color=WHITE, anchor=MSO_ANCHOR.BOTTOM)
+        self._bar(slide, Inches(4.3), MARGIN, Inches(1.4), self.design.light)
+        self._place(subtitle, MARGIN, Inches(4.55), CONTENT_WIDTH, Inches(1.5))
+        lines = [data.subtitle] if data.subtitle.strip() else []
+        self._text(subtitle, lines, size=20, color=mix(self.design.accent, WHITE, 0.8), anchor=MSO_ANCHOR.TOP)
         self._finish(slide, data)
 
     def _slide_section(self, data: Slide) -> None:
         slide = self.prs.slides.add_slide(self.prs.slide_layouts[LAYOUT_SECTION])
+        self._background(slide, self.design.accent)
         title, subtitle = slide.placeholders[0], slide.placeholders[1]
-        self._place(title, MARGIN, Inches(2.4), CONTENT_WIDTH, Inches(1.5))
-        self._text(title, [data.title], size=36, bold=True, color=self.accent, anchor=MSO_ANCHOR.BOTTOM)
-        self._bar(slide, Inches(4.05), MARGIN, Inches(1.6))
+        self._place(title, MARGIN, Inches(2.2), CONTENT_WIDTH, Inches(1.7))
+        self._text(title, [data.title], size=36, bold=True, color=WHITE, anchor=MSO_ANCHOR.BOTTOM)
+        self._bar(slide, Inches(4.05), MARGIN, Inches(1.4), mix(self.design.accent, WHITE, 0.7))
         self._place(subtitle, MARGIN, Inches(4.3), CONTENT_WIDTH, Inches(1.2))
-        self._text(
-            subtitle, [data.subtitle] if data.subtitle.strip() else [], size=20, color=TEXT_GRAY, anchor=MSO_ANCHOR.TOP
-        )
+        lines = [data.subtitle] if data.subtitle.strip() else []
+        self._text(subtitle, lines, size=20, color=mix(self.design.accent, WHITE, 0.85), anchor=MSO_ANCHOR.TOP)
         self._finish(slide, data)
 
     def _slide_bullets(self, data: Slide) -> None:
@@ -2227,14 +2637,18 @@ class PptxWriter:
         width = (CONTENT_WIDTH - COLUMN_GAP) // 2
         heading_lines = 1 if data.left_heading.strip() or data.right_heading.strip() else 0
         size = min(
-            body_font_size(items, base=22, width=width, extra_lines=heading_lines) or MIN_BODY_FONT_SIZE
+            body_font_size(items, 22, COLUMN_TEXT_WIDTH, heading_lines, COLUMN_TEXT_HEIGHT) or MIN_BODY_FONT_SIZE
             for items in (data.left, data.right)
         )
         for placeholder, left, heading, items in (
             (slide.placeholders[1], MARGIN, data.left_heading, data.left),
             (slide.placeholders[2], MARGIN + width + COLUMN_GAP, data.right_heading, data.right),
         ):
-            self._place(placeholder, left, BODY_TOP, width, BODY_HEIGHT)
+            if heading.strip() or any(item.strip() for item in items):
+                self._card(slide, left, BODY_TOP, width, BODY_HEIGHT)
+            self._place(
+                placeholder, left + CARD_PADDING, BODY_TOP + CARD_PADDING, COLUMN_TEXT_WIDTH, COLUMN_TEXT_HEIGHT
+            )
             self._items(placeholder.text_frame, items, size, heading=heading)
         self._finish(slide, data)
 
@@ -2247,12 +2661,18 @@ class PptxWriter:
         for column, width in zip(shape.table.columns, widths, strict=True):
             column.width = Emu(width)  # by content, so long words are not broken
         for r, row in enumerate(data.table):
+            fill = self.design.accent if r == 0 else self.design.band if r % 2 == 0 else WHITE
             for c in range(columns):
                 cell = shape.table.cell(r, c)
                 cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = PptxRGBColor.from_string(fill)
                 frame = cell.text_frame
                 frame.word_wrap = True
-                self._runs(frame.paragraphs[0], parse_inline(row[c] if c < len(row) else ""), size, bold=r == 0 or None)
+                runs = parse_inline(row[c] if c < len(row) else "")
+                self._runs(
+                    frame.paragraphs[0], runs, size, bold=r == 0 or None, color=WHITE if r == 0 else SLIDE_TEXT_COLOR
+                )
         self._finish(slide, data)
 
     def _slide_chart(self, data: Slide) -> None:
@@ -2269,6 +2689,7 @@ class PptxWriter:
         chart = frame.chart
         chart.has_title = False  # the slide title says it
         chart.font.size = PptxPt(14)
+        chart.font.color.rgb = PptxRGBColor.from_string(SLIDE_TEXT_COLOR)
         if data.chart.unit.strip() and data.chart.type != "pie":
             axis = chart.value_axis
             axis.has_title = True
@@ -2284,7 +2705,51 @@ class PptxWriter:
             plot.data_labels.show_value = False
             plot.data_labels.number_format = "0%"
             plot.data_labels.number_format_is_linked = False
+        self._chart_style(chart, data.chart.type, len(series_list), len(data.chart.categories))
         self._finish(slide, data)
+
+    def _chart_style(self, chart: Any, kind: str, series_count: int, categories: int) -> None:
+        """Colours of the design, light grid lines on the value axis only, values at the bars when there are few."""
+        plot = chart.plots[0]
+        if kind == "pie":
+            for point, color in zip(plot.series[0].points, self.design.series(categories), strict=False):
+                point.format.fill.solid()
+                point.format.fill.fore_color.rgb = PptxRGBColor.from_string(color)
+                point.format.line.color.rgb = PptxRGBColor.from_string(WHITE)
+            plot.data_labels.position = XL_LABEL_POSITION.OUTSIDE_END  # dark text on the dark slices: not readable
+            return
+        for series, color in zip(plot.series, self.design.series(series_count), strict=False):
+            rgb = PptxRGBColor.from_string(color)
+            if kind == "line":
+                series.smooth = False
+                series.format.line.color.rgb = rgb
+                series.format.line.width = PptxPt(2.75)
+                series.marker.style, series.marker.size = XL_MARKER_STYLE.CIRCLE, 8
+                series.marker.format.fill.solid()
+                series.marker.format.fill.fore_color.rgb = rgb
+                series.marker.format.line.color.rgb = rgb
+            else:
+                series.format.fill.solid()
+                series.format.fill.fore_color.rgb = rgb
+                series.format.line.fill.background()
+        if kind != "line":
+            plot.gap_width = 60
+            if series_count > 1:
+                plot.overlap = -10
+        value_axis, category_axis = chart.value_axis, chart.category_axis
+        value_axis.has_major_gridlines = True
+        value_axis.major_gridlines.format.line.color.rgb = PptxRGBColor.from_string(RULE_COLOR)
+        value_axis.format.line.fill.background()
+        value_axis.major_tick_mark = category_axis.major_tick_mark = XL_TICK_MARK.NONE
+        value_axis.tick_labels.font.size = PptxPt(12)
+        value_axis.tick_labels.font.color.rgb = PptxRGBColor.from_string(MUTED_COLOR)
+        category_axis.format.line.color.rgb = PptxRGBColor.from_string(RULE_COLOR)
+        if series_count == 1 and categories <= 8:
+            plot.has_data_labels = True
+            labels = plot.data_labels
+            labels.font.size = PptxPt(12)
+            labels.number_format_is_linked = True
+            labels.position = XL_LABEL_POSITION.ABOVE if kind == "line" else XL_LABEL_POSITION.OUTSIDE_END
 
     # -- helpers --
 
@@ -2295,13 +2760,33 @@ class PptxWriter:
         self._text(
             title,
             [data.title],
-            size=30 if len(data.title) <= 60 else 24,
+            size=28 if len(data.title) <= 60 else 22,
             bold=True,
             color=self.accent,
             anchor=MSO_ANCHOR.BOTTOM,
         )
-        self._bar(slide, BAR_TOP, MARGIN, Inches(1.2))
+        self._bar(slide, BAR_TOP, MARGIN, Inches(0.9))
+        self._footer(slide)
         return slide
+
+    def _footer(self, slide: Any) -> None:
+        line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, MARGIN, FOOTER_TOP - Inches(0.06), CONTENT_WIDTH, Emu(9525))
+        line.fill.solid()
+        line.fill.fore_color.rgb = PptxRGBColor.from_string(RULE_COLOR)
+        line.line.fill.background()
+        number_width = Inches(1.0)
+        for text, left, width, align in (
+            (clean_text(to_plain(self.title))[:120], MARGIN, CONTENT_WIDTH - number_width, PP_ALIGN.LEFT),
+            (str(self.number), MARGIN + CONTENT_WIDTH - number_width, number_width, PP_ALIGN.RIGHT),
+        ):
+            if not text.strip():
+                continue
+            box = slide.shapes.add_textbox(left, FOOTER_TOP, width, Inches(0.3))
+            frame = box.text_frame
+            frame.margin_left = frame.margin_right = frame.margin_top = frame.margin_bottom = 0
+            frame.word_wrap = True
+            frame.paragraphs[0].alignment = align
+            self._runs(frame.paragraphs[0], [Run(text)], 10, color=MUTED_COLOR)
 
     def _finish(self, slide: Any, data: Slide) -> None:
         for placeholder in list(slide.placeholders):  # remove placeholders left empty ("Click to add text")
@@ -2314,11 +2799,28 @@ class PptxWriter:
     def _place(shape: SlidePlaceholder, left: int, top: int, width: int, height: int) -> None:
         shape.left, shape.top, shape.width, shape.height = Emu(left), Emu(top), Emu(width), Emu(height)
 
-    def _bar(self, slide: Any, top: int, left: int, width: int) -> None:
+    @staticmethod
+    def _background(slide: Any, color: str) -> None:
+        slide.background.fill.solid()
+        slide.background.fill.fore_color.rgb = PptxRGBColor.from_string(color)
+
+    def _bar(self, slide: Any, top: int, left: int, width: int, color: str | None = None) -> None:
         bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, Inches(0.06))
         bar.fill.solid()
-        bar.fill.fore_color.rgb = self.accent
+        bar.fill.fore_color.rgb = PptxRGBColor.from_string(color) if color else self.accent
         bar.line.fill.background()
+
+    def _card(self, slide: Any, left: int, top: int, width: int, height: int) -> None:
+        """A light rounded box behind the text, moved to the back so the text stays on top."""
+        card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, left, top, width, height)
+        card.adjustments[0] = 0.04
+        card.fill.solid()
+        card.fill.fore_color.rgb = PptxRGBColor.from_string(self.design.band)
+        card.line.fill.background()
+        card.shadow.inherit = False
+        tree = slide.shapes._spTree
+        tree.remove(card._element)
+        tree.insert(2, card._element)  # after the group's own properties
 
     def _text(self, shape: SlidePlaceholder, lines: list[str], size: int, bold: bool | None = None,
               color: Any = None, anchor: Any = None, align: Any = PP_ALIGN.LEFT) -> None:  # fmt: skip
@@ -2348,8 +2850,19 @@ class PptxWriter:
             paragraph = frame.paragraphs[0] if first else frame.add_paragraph()
             first = False
             paragraph.level = level
-            self._runs(paragraph, parse_inline(text), sub_item_size(size) if level else size)
+            self._runs(paragraph, parse_inline(text), sub_item_size(size) if level else size, color=SLIDE_TEXT_COLOR)
             paragraph.space_before = PptxPt(6 if level == 0 else 2)
+            self._bullet_color(paragraph)
+
+    def _bullet_color(self, paragraph: PptxParagraph) -> None:
+        color = PptxOxmlElement("a:buClr")
+        rgb = PptxOxmlElement("a:srgbClr")
+        rgb.set("val", self.design.accent)
+        color.append(rgb)
+        paragraph._p.get_or_add_pPr().insert_element_before(
+            color, "a:buSzTx", "a:buSzPct", "a:buSzPts", "a:buFontTx", "a:buFont", "a:buNone", "a:buAutoNum",
+            "a:buChar", "a:buBlip", "a:tabLst", "a:defRPr", "a:extLst",
+        )  # fmt: skip
 
     @staticmethod
     def _runs(
@@ -2371,9 +2884,31 @@ class PptxWriter:
                 pptx_run.hyperlink.address = run.url
 
 
-def build_pptx(title: str, slides: list[Slide], accent: str) -> bytes:
+def slides_markdown(title: str, slides: list[Slide], texts: dict[str, str]) -> str:
+    parts = [f"# {to_plain(title)}"] if title.strip() else []
+    for number, slide in enumerate(slides, start=1):
+        parts += [f"## {number}. {to_plain(slide.title.strip() or title)}", slide.subtitle.strip()]
+        parts.append(markdown_items(slide.bullets))
+        for heading, items in ((slide.left_heading, slide.left), (slide.right_heading, slide.right)):
+            parts += [f"**{heading.strip()}**" if heading.strip() else "", markdown_items(items)]
+        parts.append(markdown_table(slide.table))
+        if slide.chart is not None:
+            chart = slide.chart
+            unit = f", {chart.unit.strip()}" if chart.unit.strip() else ""
+            series = chart.series[:1] if chart.type == "pie" else chart.series
+            rows = [["", *chart.categories], *([s.name, *(f"{v:g}" for v in s.values)] for s in series)]
+            parts += [f"*{texts['chart']} ({chart.type}{unit})*", markdown_table(rows)]
+        if slide.notes.strip():
+            parts.append(f"> {texts['notes']}: " + " ".join(slide.notes.split()))
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def build_pptx(
+    title: str, slides: list[Slide], design: Design = DEFAULT_DESIGN, texts: dict[str, str] | None = None
+) -> tuple[bytes, str]:
+    """The file and its text as Markdown."""
     check_slides(title, slides)
-    return PptxWriter(title, accent).render(slides)
+    return PptxWriter(title, design).render(slides), slides_markdown(title, slides, texts or TRANSLATIONS["en"])
 
 
 # ------------------------------------------------------------------------------------------- delivery --
@@ -2411,12 +2946,13 @@ class Context:
             await self.emitter({"type": "status", "data": {"description": description, "done": done}})
 
 
-async def attach_file(data: bytes, filename: str, mime: str, ctx: Context) -> None:
+async def attach_file(data: bytes, filename: str, mime: str, ctx: Context, text: str = "") -> None:
     """Store the file in Open WebUI's file storage for the user and attach it to the current answer.
 
     Uses the same internal functions as Open WebUI's built-in image generation (0.11.4).
     """
     from open_webui.models.chats import Chats
+    from open_webui.models.files import Files
     from open_webui.models.users import UserModel
     from open_webui.routers.files import upload_file_handler
     from open_webui.utils.chat_id import is_saved_chat_id
@@ -2434,6 +2970,11 @@ async def attach_file(data: bytes, filename: str, mime: str, ctx: Context) -> No
         user=user,
     )
     file_id = file_item.id
+    if text.strip():  # shown in the "Content" tab of the file view
+        try:
+            await Files.update_file_data_by_id(file_id, {"content": text[:MAX_CONTENT_CHARS]})
+        except Exception:
+            log.exception("Storing the text of %s failed", filename)
     try:
         url = ctx.request.app.url_path_for("get_file_content_by_id", id=file_id)
     except Exception:
@@ -2485,7 +3026,14 @@ class Tools:
             default="EUR", description="Currency of Excel columns of type 'currency'."
         )
         accent_color: str = Field(
-            default="1F4E79", description="Accent colour of PowerPoint titles as a hex value without '#', e.g. 1F4E79."
+            default=DEFAULT_ACCENT,
+            description="Accent colour of all files (titles, header rows, charts, title slide) as a hex value without "
+            "'#', e.g. 1F4E79. Lighter and darker tones are derived from it.",
+        )
+        font: str = Field(
+            default=BODY_FONT,
+            description="Font of all files, e.g. Calibri, Arial or Aptos. It has to be installed where the files are "
+            "opened; otherwise Office shows a similar one.",
         )
         page_numbers: bool = Field(default=True, description="Add page numbers to the footer of Word documents.")
 
@@ -2521,7 +3069,7 @@ class Tools:
         ctx = Context(__user__, __request__, __chat_id__, __message_id__, __event_emitter__, __event_call__)
         texts = TRANSLATIONS[self.valves.language]
 
-        def build() -> tuple[str, bytes]:
+        def build() -> tuple[str, bytes, str]:
             extras: dict[str, Any] = {}  # parameters the model wrote into the blocks text
             parsed = parse_argument(WORD_BLOCKS, blocks, "blocks", extras)
             parsed = [block for block in parsed if not is_empty_block(block)]
@@ -2535,8 +3083,9 @@ class Tools:
                 table_of_contents=bool(table_of_contents or extras.get("table_of_contents") is True),
                 landscape=bool(landscape or extras.get("landscape") is True),
                 page_numbers=self.valves.page_numbers,
+                design=self._design(),
             )
-            return display_title, build_docx(options, parsed, texts)
+            return display_title, *build_docx(options, parsed, texts)
 
         return await self._create("create_word_file", "docx", DOCX_MIME, build, texts["status_word"], ctx)
 
@@ -2562,13 +3111,14 @@ class Tools:
         ctx = Context(__user__, __request__, __chat_id__, __message_id__, __event_emitter__, __event_call__)
         texts = TRANSLATIONS[self.valves.language]
 
-        def build() -> tuple[str, bytes]:
+        def build() -> tuple[str, bytes, str]:
             extras: dict[str, Any] = {}
             parsed = parse_argument(EXCEL_SHEETS, sheets, "sheets", extras)
             given = str(title or extras.get("title") or "")
             display_title = tidy_title(given) or (tidy_title(parsed[0].name) if parsed else "")
             decimal_comma = self.valves.language == "de"
-            return display_title, build_xlsx(parsed, self.valves.currency, texts, decimal_comma)
+            design = self._design()
+            return display_title, *build_xlsx(parsed, self.valves.currency, texts, decimal_comma, design, display_title)
 
         return await self._create("create_excel_file", "xlsx", XLSX_MIME, build, texts["status_excel"], ctx)
 
@@ -2593,27 +3143,39 @@ class Tools:
         """
         ctx = Context(__user__, __request__, __chat_id__, __message_id__, __event_emitter__, __event_call__)
         texts = TRANSLATIONS[self.valves.language]
-        accent = self.valves.accent_color.strip().lstrip("#")
-        if not re.fullmatch(r"[0-9A-Fa-f]{6}", accent):
-            accent = Tools.Valves().accent_color
+        design = self._design()
 
-        def build() -> tuple[str, bytes]:
+        def build() -> tuple[str, bytes, str]:
             extras: dict[str, Any] = {}
             parsed = parse_argument(SLIDES, slides, "slides", extras)
             display_title = tidy_title(str(title or extras.get("title") or "")) or next(
                 (tidy_title(s.title) for s in parsed if s.title.strip()), ""
             )
-            return display_title, build_pptx(display_title, parsed, accent)
+            return display_title, *build_pptx(display_title, parsed, design, texts)
 
         return await self._create("create_powerpoint_file", "pptx", PPTX_MIME, build, texts["status_powerpoint"], ctx)
 
+    def _design(self) -> Design:
+        accent = self.valves.accent_color.strip().lstrip("#")
+        font = " ".join(self.valves.font.split())
+        return Design(
+            accent.upper() if re.fullmatch(r"[0-9A-Fa-f]{6}", accent) else DEFAULT_ACCENT,
+            font if FONT_NAME_RE.fullmatch(font) else BODY_FONT,
+        )
+
     async def _create(
-        self, tool: str, extension: str, mime: str, build: Callable[[], tuple[str, bytes]], status: str, ctx: Context
+        self,
+        tool: str,
+        extension: str,
+        mime: str,
+        build: Callable[[], tuple[str, bytes, str]],
+        status: str,
+        ctx: Context,
     ) -> str:
         texts = TRANSLATIONS[self.valves.language]
         await ctx.status(status)
         try:
-            title, data = await asyncio.to_thread(build)
+            title, data, text = await asyncio.to_thread(build)
         except RecursionError:
             await ctx.status(texts["status_failed"], done=True)
             return RESULT_INVALID.format(errors="- the arguments are nested too deeply", tool=tool)
@@ -2626,15 +3188,15 @@ class Tools:
             await ctx.status(texts["status_failed"], done=True)
             return RESULT_FAILED
         filename = f"{safe_filename(title, texts['default_title'])}.{extension}"
-        result = await self._deliver(data, filename, mime, ctx)
+        result = await self._deliver(data, filename, mime, ctx, text)
         await ctx.status(texts["status_done"].format(name=filename) if result else texts["status_failed"], done=True)
         return result.format(name=filename) if result else RESULT_FAILED
 
-    async def _deliver(self, data: bytes, filename: str, mime: str, ctx: Context) -> str:
+    async def _deliver(self, data: bytes, filename: str, mime: str, ctx: Context, text: str = "") -> str:
         """Attach or download the file; returns the result template, or '' if both ways failed."""
         if self.valves.delivery == "attach":
             try:
-                await attach_file(data, filename, mime, ctx)
+                await attach_file(data, filename, mime, ctx, text)
                 return RESULT_ATTACHED
             except Exception:
                 log.exception("Attaching %s failed, falling back to a browser download", filename)
