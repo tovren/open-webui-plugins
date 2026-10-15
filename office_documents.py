@@ -9,7 +9,8 @@ description: Lets the model create Word (.docx), Excel (.xlsx) and PowerPoint (.
 
 Tools
 - create_word_file: title page, optional table of contents, headings, paragraphs, bullet and
-  numbered lists (two levels), tables, quotes, page breaks, header text and page numbers.
+  numbered lists (two levels), tables, quotes, page breaks, header text and page numbers; optionally
+  with the header, footer and margins of a company template (word_template valve).
 - create_excel_file: several sheets with typed columns (text, number, integer, currency, percent,
   date), row formulas from a checked whitelist, total rows and native Excel charts.
 - create_powerpoint_file: 16:9 slides with the layouts title, section, bullets, two columns,
@@ -20,7 +21,8 @@ Security & privacy
 - The model never writes code: it fills in a fixed JSON schema, the plugin validates it and builds
   the file. No shell, no network access, nothing is loaded from URLs.
 - Every formula, whether a column's `formula` field or a formula written into a cell, is checked against a
-  whitelist (SUM, IF, ROUND ...): no external references, no other sheets, no DDE, no WEBSERVICE/HYPERLINK.
+  whitelist (SUM, IF, ROUND ...): only cells of the same workbook, no external references, no DDE, no
+  WEBSERVICE/HYPERLINK.
   Anything else (e.g. "=HYPERLINK(...)") is written as text, also in the data sheets of PowerPoint charts.
 - Links are only created for http, https and mailto. Limits on slides, rows, columns and text
   length keep a runaway model from blocking the server.
@@ -37,18 +39,22 @@ import json
 import logging
 import re
 import unicodedata
+import zipfile
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, replace
 from datetime import date, datetime
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, NamedTuple
 
 from docx import Document
 from docx.enum.section import WD_ORIENT
 from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
+from docx.opc.constants import CONTENT_TYPE as DOCX_CT
 from docx.opc.constants import RELATIONSHIP_TYPE
 from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
+from docx.oxml.ns import nsdecls, qn
+from docx.oxml.parser import parse_xml
+from docx.parts.numbering import NumberingPart
 from docx.shared import Cm, Pt, RGBColor
 from docx.text.paragraph import Paragraph as DocxParagraph
 from openpyxl import Workbook
@@ -341,7 +347,8 @@ class ExcelColumn(Schema):
         default="",
         description="Optional formula filled into every data row, e.g. '=B{row}*C{row}' ({row} is the current "
         "row; data starts in row 2). English function names (SUM, AVERAGE, MIN, MAX, COUNT, IF, ROUND, "
-        "IFERROR ...), commas between arguments, only cells of this sheet. Put null in the rows for this column.",
+        "IFERROR ...), commas between arguments. Cells of another sheet: 'Rates'!$B$3 (one fixed cell) or "
+        "'Rates'!B{row}. Put null in the rows for this column.",
     )
     total: Literal["none", "sum", "average", "min", "max", "count"] = Field(
         default="none", description="Adds a total row below the data with this function for the column."
@@ -1055,6 +1062,45 @@ SETTINGS_AFTER_UPDATE_FIELDS = {
         "readModeInkLockDown", "smartTagType", "shapeDefaults", "doNotEmbedSmartTags", "decimalSymbol", "listSeparator",
     )),
 }  # fmt: skip
+MAX_TEMPLATE_BYTES = 20_000_000
+# With a template, its styles for these are replaced: they get the design. The content uses Body Text, not the
+# template's Normal style, which its header and footer build on.
+TEMPLATE_STYLES = ("Body Text", "Title", "Subtitle", "Heading 1", "Heading 2", "Heading 3", "Quote", "TOC Heading",
+                   "List Bullet", "List Bullet 2", "List Number", "List Number 2")  # fmt: skip
+# Settings of a template that would follow every document: a mail merge (Word asks to run its SQL command), write
+# protection, and the path of the template it was made from (Word looks for it, e.g. on a network share).
+TEMPLATE_SETTINGS_REMOVED = ("w:attachedTemplate", "w:mailMerge", "w:documentProtection", "w:writeProtection")
+DOTX_MAIN = b"application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml"
+
+
+def read_word_template(path: str) -> bytes | None:
+    """The Word file of the word_template valve, a .dotx turned into a .docx; None if there is none or it cannot be
+    read (logged: the documents are made without it)."""
+    path = path.strip()
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as file:
+            data = file.read(MAX_TEMPLATE_BYTES + 1)
+        if len(data) > MAX_TEMPLATE_BYTES:
+            raise ValueError(f"the file is larger than {MAX_TEMPLATE_BYTES // 1_000_000} MB")
+        with zipfile.ZipFile(io.BytesIO(data)) as package:
+            if sum(item.file_size for item in package.infolist()) > 5 * MAX_TEMPLATE_BYTES:
+                raise ValueError("the file is too large unpacked")
+            types = package.read("[Content_Types].xml")
+            if DOTX_MAIN not in types:
+                return data
+            buffer = io.BytesIO()  # python-docx opens documents only
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as document:
+                for item in package.infolist():
+                    content = package.read(item)
+                    if item.filename == "[Content_Types].xml":
+                        content = content.replace(DOTX_MAIN, DOCX_CT.WML_DOCUMENT_MAIN.encode())
+                    document.writestr(item, content)
+            return buffer.getvalue()
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as e:
+        log.warning("The Word template %r cannot be used, documents are made without it: %s", path, e)
+        return None
 
 
 @dataclass
@@ -1066,6 +1112,7 @@ class WordOptions:
     landscape: bool = False
     page_numbers: bool = True
     design: Design = DEFAULT_DESIGN
+    template: bytes | None = None  # see read_word_template
 
 
 def word_title(title: str, blocks: list[WordBlock], fallback: str) -> tuple[str, list[WordBlock]]:
@@ -1254,16 +1301,116 @@ class DocxWriter:
         self.options = options
         self.texts = texts
         self.design = options.design
+        self.template = False
+        self.restyled = {"Header", "Footer"}  # with a template only if it has none: its own stay as they are
+        if options.template:
+            try:
+                self.doc, self.template = Document(io.BytesIO(options.template)), True
+                self._take_template()
+                self._styles()
+                return
+            except Exception:
+                log.warning("The Word template cannot be used, the document is made without it", exc_info=True)
+                self.template, self.restyled = False, {"Header", "Footer"}
         self.doc = Document()
         self._styles()
+
+    @property
+    def body_style(self) -> str | None:
+        return "Body Text" if self.template else None  # None: Normal
+
+    def _take_template(self) -> None:
+        """Keep the template's header, footer, page size and margins; remove its content and give the content
+        styles the design (TEMPLATE_STYLES)."""
+        body = self.doc.element.body
+        last = body.get_or_add_sectPr()  # the last section's settings, with its header and footer
+        for tag in ("w:headerReference", "w:footerReference"):  # a section without its own takes the previous one's
+            for earlier in reversed(body.xpath("./w:p/w:pPr/w:sectPr")):
+                for reference in earlier.findall(qn(tag)):
+                    if not any(own.get(qn("w:type")) == reference.get(qn("w:type")) for own in last.findall(qn(tag))):
+                        last.insert(0, copy.deepcopy(reference))
+        for child in list(body):
+            if child is not last:
+                body.remove(child)
+        default = Document()
+        styles = self.doc.styles.element
+        own = {(style.name_val or "").casefold() for style in styles.findall(qn("w:style"))}
+        self.restyled = {name for name in ("Header", "Footer") if name.casefold() not in own}
+        # The template's default character style, which Word names after its language
+        default_font = next(
+            (style.styleId for style in styles.findall(qn("w:style"))
+             if style.get(qn("w:type")) == "character" and style.get(qn("w:default")) in ("1", "true")),
+            None,
+        )  # fmt: skip
+        renamed = {"Normal": "BodyText", "DefaultParagraphFont": default_font}
+        for name in (*TEMPLATE_STYLES, *sorted(self.restyled)):
+            style = default.styles[name].element
+            link = style.find(qn("w:link"))
+            linked = default.styles.element.get_by_id(link.get(qn("w:val"))) if link is not None else None
+            for new in (style, linked) if linked is not None else (style,):
+                for old in styles.findall(qn("w:style")):
+                    if (old.name_val or "").casefold() == new.name_val.casefold() or old.styleId == new.styleId:
+                        old_link = old.find(qn("w:link"))  # e.g. "Überschrift 1 Zchn" of "Überschrift 1"
+                        old_linked = styles.get_by_id(old_link.get(qn("w:val"))) if old_link is not None else None
+                        if old_linked is not None:
+                            styles.remove(old_linked)
+                        if old.getparent() is not None:
+                            styles.remove(old)
+                new = copy.deepcopy(new)
+                for tag in ("w:basedOn", "w:next"):
+                    reference = new.find(qn(tag))
+                    if reference is None or reference.get(qn("w:val")) not in renamed:
+                        continue
+                    if new.styleId == "BodyText" or not renamed[reference.get(qn("w:val"))]:
+                        new.remove(reference)  # nothing of the template's Normal
+                    else:
+                        reference.set(qn("w:val"), renamed[reference.get(qn("w:val"))])
+                styles.append(new)
+        self._take_numbering(default)
+        try:
+            settings_part = self.doc.part.part_related_by(RELATIONSHIP_TYPE.SETTINGS)
+        except KeyError:
+            settings_part = None  # a file without settings
+        for tag in TEMPLATE_SETTINGS_REMOVED if settings_part is not None else ():
+            for element in settings_part.element.findall(qn(tag)):
+                settings_part.element.remove(element)
+                for node in element.iter():
+                    if node.get(qn("r:id")):
+                        settings_part.drop_rel(node.get(qn("r:id")))
+        core = self.doc.core_properties  # the template's author, title ... are not the document's
+        core.author = core.last_modified_by = core.subject = core.keywords = core.comments = core.category = ""
+        core.title = to_plain(self.options.title)
+
+    def _take_numbering(self, default: Any) -> None:
+        """The list styles now point to the default template's numbering: copy it in, with new numbers."""
+        source = default.part.numbering_part.element
+        try:
+            numbering = self.doc.part.part_related_by(RELATIONSHIP_TYPE.NUMBERING).element
+        except KeyError:
+            package, numbering = self.doc.part.package, parse_xml(f"<w:numbering {nsdecls('w')}/>")
+            partname = package.next_partname("/word/numbering%d.xml")
+            self.doc.part.relate_to(
+                NumberingPart(partname, DOCX_CT.WML_NUMBERING, numbering, package), RELATIONSHIP_TYPE.NUMBERING
+            )
+        abstract_ids = [int(a.get(qn("w:abstractNumId"))) for a in numbering.findall(qn("w:abstractNum"))]
+        for abstract_id, name in enumerate(TEMPLATE_STYLES[-4:], start=max(abstract_ids, default=-1) + 1):
+            num_id = self.doc.styles[name].element.pPr.numPr.numId
+            used = source.num_having_numId(num_id.val).abstractNumId.val
+            abstract = copy.deepcopy(source.xpath(f"w:abstractNum[@w:abstractNumId='{used}']")[0])
+            abstract.set(qn("w:abstractNumId"), str(abstract_id))
+            for nsid in abstract.findall(qn("w:nsid")):  # Word's list identity; the template may use the same
+                abstract.remove(nsid)
+            numbering.insert_element_before(abstract, "w:num", "w:numIdMacAtCleanup")
+            num_id.val = numbering.add_num(abstract_id).numId
 
     def _styles(self) -> None:
         """A calm, modern look: dark grey body text with some air, headings in the accent colour, no theme fonts."""
         styles, accent, font = self.doc.styles, self.design.accent, self.design.font
-        _set_style(styles["Normal"], 10.5, TEXT_COLOR, after=6, font=font)
-        styles["Normal"].paragraph_format.line_spacing = 1.15
+        body = styles[self.body_style or "Normal"]
+        _set_style(body, 10.5, TEXT_COLOR, after=6, font=font)
+        body.paragraph_format.line_spacing = 1.15
         _set_style(styles["Title"], 26, accent, bold=True, after=2, font=font)
-        title_borders = styles["Title"].element.pPr.find(qn("w:pBdr"))
+        title_borders = styles["Title"].element.get_or_add_pPr().find(qn("w:pBdr"))
         if title_borders is not None:
             styles["Title"].element.pPr.remove(title_borders)  # the title block draws its own line
         _set_style(styles["Subtitle"], 13, MUTED_COLOR, after=2, font=font)
@@ -1272,7 +1419,7 @@ class DocxWriter:
         _set_style(styles["Heading 3"], 11, accent, bold=True, before=10, after=2, font=font)
         if "TOC Heading" in self._style_names():
             _set_style(styles["TOC Heading"], 16, accent, bold=True, before=12, after=6, font=font)
-        for name in ("Header", "Footer"):  # small grey text; their tab stops are for Letter paper and would win
+        for name in sorted(self.restyled):  # small grey text; their tab stops are for Letter paper and would win
             _set_style(styles[name], 8.5, MUTED_COLOR, after=0, font=font)
             tabs = styles[name].element.pPr.find(qn("w:tabs")) if styles[name].element.pPr is not None else None
             if tabs is not None:
@@ -1288,13 +1435,13 @@ class DocxWriter:
         also read the document defaults, the theme fonts and the character styles linked to the paragraph
         styles, and they have no Symbol font for Word's bullets (boxes instead of dots). All get the design."""
         font, styles = self.design.font, self.doc.styles
-        for fonts in styles.element.xpath("w:docDefaults/w:rPrDefault/w:rPr/w:rFonts"):
+        for fonts in styles.element.xpath("w:docDefaults/w:rPrDefault/w:rPr/w:rFonts") if not self.template else ():
             for attr in THEME_FONT_ATTRS:
                 fonts.attrib.pop(qn(attr), None)
             for attr in ("w:ascii", "w:hAnsi", "w:cs"):
                 fonts.set(qn(attr), font)
-        for part in self.doc.part.package.iter_parts():
-            if str(part.partname).startswith("/word/theme/"):
+        for part in self.doc.part.package.iter_parts() if not self.template else ():  # the template's header and
+            if str(part.partname).startswith("/word/theme/"):  # footer may use its theme fonts
                 part._blob = re.sub(THEME_FONTS_RE.encode(), lambda m: m[1] + font.encode() + m[2], part.blob)
         for style in styles:
             link = style.element.find(qn("w:link"))
@@ -1358,20 +1505,30 @@ class DocxWriter:
         return buffer.getvalue()
 
     def _page_setup(self) -> None:
+        """Paper, margins, header and footer; a template's own stay, its header and footer are not added to."""
         section = self.doc.sections[0]
-        section.page_width, section.page_height = PAPER_SIZES[self.texts.get("paper", "letter")]
-        section.left_margin = section.right_margin = section.top_margin = Cm(2.5)
-        section.bottom_margin = Cm(2.2)
-        section.header_distance = section.footer_distance = Cm(1.25)
-        if self.options.landscape:
+        width, height = PAPER_SIZES[self.texts.get("paper", "letter")]
+        page = {"page_width": width, "page_height": height, "left_margin": Cm(2.5), "right_margin": Cm(2.5),
+                "top_margin": Cm(2.5), "bottom_margin": Cm(2.2), "header_distance": Cm(1.25),
+                "footer_distance": Cm(1.25)}  # fmt: skip
+        for name, value in page.items():
+            if not self.template or getattr(section, name) is None:  # what a template lacks
+                setattr(section, name, value)
+        if self.options.landscape and section.page_width < section.page_height:
             section.orientation = WD_ORIENT.LANDSCAPE
             section.page_width, section.page_height = section.page_height, section.page_width
-        if self.options.header_text.strip():
+        if self.options.header_text.strip() and section.header.is_linked_to_previous:
             header = section.header.paragraphs[0]
             header.text = clean_text(self.options.header_text.strip())
             header.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        if self.options.page_numbers:  # title on the left, "Page X of Y" on the right, a thin line above
+        if self.options.page_numbers and section.footer.is_linked_to_previous:
+            # title on the left, "Page X of Y" on the right, a thin line above
             footer = section.footer.paragraphs[0]
+            style = footer.style
+            while style is not None:  # a template's Footer style may have tab stops of its own (centre ...)
+                for tab in style.paragraph_format.tab_stops:
+                    footer.paragraph_format.tab_stops.add_tab_stop(tab.position, WD_TAB_ALIGNMENT.CLEAR)
+                style = style.base_style
             width = section.page_width - section.left_margin - section.right_margin
             footer.paragraph_format.tab_stops.add_tab_stop(width, WD_TAB_ALIGNMENT.RIGHT)
             _set_borders(footer._p.get_or_add_pPr(), "w:pBdr", PPR_AFTER_BORDERS, [("top", 4, RULE_COLOR)])
@@ -1388,7 +1545,9 @@ class DocxWriter:
         self.doc.add_paragraph(
             self.texts["toc_title"], style="TOC Heading" if "TOC Heading" in self._style_names() else None
         )
-        _add_field(self.doc.add_paragraph(), 'TOC \\o "1-3" \\h \\z \\u', self.texts["toc_placeholder"])
+        _add_field(
+            self.doc.add_paragraph(style=self.body_style), 'TOC \\o "1-3" \\h \\z \\u', self.texts["toc_placeholder"]
+        )
         # Ask Word to update the fields when the file is opened, so the table of contents gets filled in.
         # The settings elements have a fixed order; updateFields comes before compat, rsids etc.
         settings = self.doc.settings.element
@@ -1415,7 +1574,7 @@ class DocxWriter:
         """Paragraphs separated by blank lines; Markdown list lines inside the text become real lists."""
         for kind, lines in split_paragraph(text):
             if kind == "text":
-                self._add_runs(self.doc.add_paragraph(), parse_inline("\n".join(lines)))
+                self._add_runs(self.doc.add_paragraph(style=self.body_style), parse_inline("\n".join(lines)))
             elif kind == "table":
                 self._table(markdown_table_rows(lines)[:MAX_WORD_TABLE_ROWS])
             else:
@@ -1474,6 +1633,8 @@ class DocxWriter:
             for column, cell in enumerate(cells[row_index * columns : (row_index + 1) * columns]):
                 text = row[column] if column < len(row) else ""
                 paragraph = cell.paragraphs[0]
+                if self.template:
+                    paragraph.style = self.body_style
                 paragraph.paragraph_format.space_after = Pt(0)
                 paragraph.paragraph_format.line_spacing = 1.0
                 self._add_runs(
@@ -1481,7 +1642,7 @@ class DocxWriter:
                 )
                 if fill:
                     _set_cell_shading(cell, fill)
-        self.doc.add_paragraph().paragraph_format.space_after = Pt(4)
+        self.doc.add_paragraph(style=self.body_style).paragraph_format.space_after = Pt(4)
 
     def _add_runs(self, paragraph: DocxParagraph, runs: list[Run], color: str | None = None) -> None:
         for run in runs:
@@ -1596,6 +1757,7 @@ FORMULA_CONSTANTS = {"TRUE": "TRUE", "FALSE": "FALSE", "WAHR": "TRUE", "FALSCH":
 FORMULA_TOKEN_RE = re.compile(  # [0-9], not \d: \d also matches digits of other scripts
     r"(?P<space>\s+)"
     r'|(?P<string>"[^"]*")'
+    r"|(?P<sheet>(?:'(?P<quoted>(?:[^']|'')+)'|(?P<bare>[^\W\d][\w.]*))!)"  # 'Rates 2026'!, Rates!
     r"|(?P<function>[A-Za-zÄÖÜäöü][A-Za-z0-9ÄÖÜäöü.]*)\s*\("
     r"|(?P<cell>\$?(?P<column>[A-Za-z]{1,3})(?P<row_absolute>\$?)(?P<row>[1-9][0-9]{0,6}|\{row\}))(?![A-Za-z0-9_])"
     r"|(?P<name>[A-Za-z]+)(?![A-Za-z0-9_(])"
@@ -1615,24 +1777,37 @@ def _column_number(letters: str) -> int:
     return number
 
 
-def normalize_formula(formula: str, infer_row: bool = True) -> str:
+def sheet_lookup(sheets: list[ExcelSheet], names: list[str]) -> dict[str, str]:
+    """The written sheet names by the names a formula may use for them: the written one and the one the model sent
+    (before invalid characters were removed), both without case, like Excel (and sheet_names)."""
+    lookup = {name.lower(): name for name in names}
+    for sheet, name in zip(sheets, names, strict=True):
+        lookup.setdefault(" ".join(to_plain(sheet.name).split()).lower(), name)
+    return lookup
+
+
+def normalize_formula(formula: str, infer_row: bool = True, sheets: dict[str, str] | None = None) -> str:
     """Check a formula against the whitelist and return it in Excel's file syntax (English names, commas).
 
-    Only cell references of the same sheet, numbers, quoted text, operators and whitelisted functions are
-    allowed. Sheet references (!), external workbooks ([...]), DDE (|) and every other function are rejected.
-    With ';' as separator (German Excel), commas in numbers are decimal commas; outside of functions a comma
-    between digits is always one. A formula without {row} whose cells all point to the first data row
-    ('=B2*C2') gets {row} there, so every row computes its own values. Raises ValueError with a message for
-    the model.
+    Only cell references of this workbook (other sheets by the names in `sheets`, see sheet_lookup), numbers,
+    quoted text, operators and whitelisted functions are allowed. External workbooks ([...]), DDE (|) and every
+    other function are rejected. With ';' as separator (German Excel), commas in numbers are decimal commas;
+    outside of functions a comma between digits is always one. A column formula (infer_row) without {row} whose
+    cells of its own sheet all point to the first data row ('=B2*C2') gets {row} there, so every row computes its
+    own values; a cell of another sheet has to say which: 'Rates'!$B$3 or 'Rates'!B{row}. Raises ValueError with
+    a message for the model.
     """
     text = XML_ILLEGAL_RE.sub("", formula).strip()
     if not text.startswith("="):
         text = "=" + text  # models sometimes leave out the "="
     if len(text) > MAX_FORMULA_CHARS:
         raise ValueError(f"a formula may have at most {MAX_FORMULA_CHARS} characters")
-    german = ";" in re.sub(r'"[^"]*"', "", text)
+    german = ";" in re.sub(r'"[^"]*"|\'(?:[^\']|\'\')*\'', "", text)  # outside of texts and sheet names
+    hint = " (cells of another sheet: 'Sheet name'!B3)" if "!" in text else ""
     parts: list[str] = []
-    cells: list[tuple[int, re.Match[str]]] = []  # (index in parts, match) of every cell reference
+    cells: list[tuple[int, re.Match[str], str]] = []  # (index in parts, match, sheet or "") of every cell reference
+    sheet = ""  # the sheet of the next cell; a range's second cell is on the first one's sheet
+    last = before_last = ("", "")  # (kind, token) of the last two tokens that are not spaces
     depth = 0
     position = 1
     previous = ""  # kind of the previous token, "space" included
@@ -1640,18 +1815,30 @@ def normalize_formula(formula: str, infer_row: bool = True) -> str:
     while position < len(text):
         match = FORMULA_TOKEN_RE.match(text, position)
         if not match:
-            raise ValueError(f"'{text[position : position + 10]}' is not allowed in a formula")
+            raise ValueError(f"'{text[position : position + 10]}' is not allowed in a formula{hint}")
         kind, token = match.lastgroup, match.group()
         end = match.end()
         if (
             kind != "space"
             and previous == "space"
             and (before_space in OPERAND_KINDS or before_space == ")")
-            and (kind in (*OPERAND_KINDS, "function") or token == "(")
+            and (kind in (*OPERAND_KINDS, "function", "sheet") or token == "(")
         ):
             near = text[position : position + 10]
             raise ValueError(f"a space between two values is not allowed near '{near}'; use an operator")
-        if kind == "function":
+        if kind == "sheet":
+            name = match["quoted"].replace("''", "'") if match["quoted"] is not None else match["bare"]
+            sheet = (sheets or {}).get(" ".join(name.split()).lower(), "")
+            if not sheet:
+                known = ", ".join(f"'{known_name}'" for known_name in dict.fromkeys((sheets or {}).values()))
+                raise ValueError(
+                    f"there is no sheet '{name}' in this workbook" + (f" (sheets: {known})" if known else "")
+                )
+            following = FORMULA_TOKEN_RE.match(text, end)
+            if last[1] == ":" or not following or following.lastgroup != "cell":
+                raise ValueError(f"write a cell of another sheet as '{sheet}'!B3 and a range as '{sheet}'!B2:B9")
+            token = "'" + sheet.replace("'", "''") + "'!"
+        elif kind == "function":
             name = match["function"].upper()
             name = GERMAN_FUNCTIONS.get(name, name)
             if name not in FORMULA_FUNCTIONS:
@@ -1666,10 +1853,13 @@ def normalize_formula(formula: str, infer_row: bool = True) -> str:
             ):
                 raise ValueError(f"'{token}' is outside of the sheet")
             token = token.upper().replace("{ROW}", "{row}")
-            cells.append((len(parts), match))
+            if not sheet and last[1] == ":" and before_last[0] == "cell":
+                sheet = cells[-1][2]  # the end of a range: 'Rates'!B2:B9
+            cells.append((len(parts), match, sheet))
+            sheet = ""
         elif kind == "name":
             if token.upper() not in FORMULA_CONSTANTS:
-                raise ValueError(f"'{token}' is not allowed in a formula (only cells like B{{row}} or B2)")
+                raise ValueError(f"'{token}' is not allowed in a formula (only cells like B{{row}} or B2){hint}")
             token = FORMULA_CONSTANTS[token.upper()]
         elif kind == "number":
             fraction = DECIMAL_COMMA_RE.match(text, end) if "." not in token and (german or depth == 0) else None
@@ -1689,14 +1879,23 @@ def normalize_formula(formula: str, infer_row: bool = True) -> str:
             token = ""
         parts.append(token)
         previous = kind if kind != "operator" or token != ")" else ")"
+        if kind != "space":
+            last, before_last = (kind, token), last
         position = end
     if depth != 0:
         raise ValueError("the parentheses in the formula do not match")
-    relative_rows = {match["row"] for _, match in cells if not match["row_absolute"]}
+    relative_rows = {match["row"] for _, match, sheet in cells if not match["row_absolute"] and not sheet}
     if infer_row and "{row}" not in relative_rows and relative_rows == {FIRST_DATA_ROW}:
-        for index, match in cells:
-            if not match["row_absolute"]:
+        for index, match, sheet in cells:
+            if not match["row_absolute"] and not sheet:
                 parts[index] = parts[index][: -len(FIRST_DATA_ROW)] + "{row}"
+    for _, match, sheet in cells if infer_row else ():
+        if sheet and not match["row_absolute"] and match["row"] != "{row}":
+            column, row = match["column"].upper(), match["row"]
+            raise ValueError(
+                f"'{sheet}'!{column}{row} in a column formula: write '{sheet}'!${column}${row} for this one cell in "
+                f"every row (ranges too: $B$2:$B$9), or '{sheet}'!{column}{{row}} for the cell in the same row"
+            )
     return "=" + "".join(parts)
 
 
@@ -1848,10 +2047,15 @@ def align_rows(sheet: ExcelSheet) -> list[list[str | float | None]]:
     return aligned
 
 
-def check_excel(sheets: list[ExcelSheet], decimal_comma: bool | None = None) -> dict[tuple[int, int], str]:
-    """Validate the workbook and return the normalized formulas by (sheet, column)."""
+def check_excel(
+    sheets: list[ExcelSheet], decimal_comma: bool | None = None, names: list[str] | None = None
+) -> dict[tuple[int, int], str]:
+    """Validate the workbook and return the normalized formulas by (sheet, column). `names` are the written sheet
+    names (see sheet_names), which formulas use for cells of other sheets."""
     check = Checker()
     formulas: dict[tuple[int, int], str] = {}
+    names = names or sheet_names(sheets)
+    lookup = sheet_lookup(sheets, names)
     check.require(bool(sheets), "sheets: the workbook has no sheets")
     check.require(len(sheets) <= MAX_SHEETS, f"sheets: at most {MAX_SHEETS} sheets")
     cells = sum(len(sheet.rows) * len(sheet.columns) for sheet in sheets)
@@ -1866,7 +2070,7 @@ def check_excel(sheets: list[ExcelSheet], decimal_comma: bool | None = None) -> 
         for c, column in enumerate(sheet.columns):
             if column.formula.strip():
                 try:
-                    formulas[(s, c)] = normalize_formula(column.formula)
+                    formulas[(s, c)] = normalize_formula(column.formula, sheets=lookup)
                 except ValueError as e:
                     check.require(False, f"{where}.columns[{c}].formula: {e}")
         for r, row in enumerate(sheet.rows):
@@ -1885,7 +2089,9 @@ def check_excel(sheets: list[ExcelSheet], decimal_comma: bool | None = None) -> 
             break
         if sheet.rows and all(len(row) <= len(sheet.columns) for row in sheet.rows):
             check.errors.extend(
-                _column_problems(sheet, where, {c: f for (i, c), f in formulas.items() if i == s}, decimal_comma)
+                _column_problems(
+                    sheet, where, {c: f for (i, c), f in formulas.items() if i == s}, decimal_comma, lookup, names[s]
+                )
             )
         if sheet.chart:
             if check.require(bool(sheet.rows), f"{where}.chart: the sheet has no rows to plot"):
@@ -1893,15 +2099,46 @@ def check_excel(sheets: list[ExcelSheet], decimal_comma: bool | None = None) -> 
                     chart_layout(sheet, sheet.chart)
                 except ValueError as e:
                     check.errors.extend(f"{where}.chart.{error}" for error in e.args[0])
+    if not check.errors:  # all sheets are complete: cells of other sheets can be looked up
+        check.errors.extend(_reference_problems(sheets, names, formulas, lookup))
     check.raise_if_failed()
     return formulas
 
 
 PLACEHOLDERS = {"-", "\u2013", "\u2014", "/", "n/a", "na", "k.a.", "k. a.", "tbd", "offen", "?"}  # in number columns
-FORMULA_CELL_RE = re.compile(r"\$?([A-Z]{1,3})\$?(?:[0-9]+|\{row\})")
 
 
-def _column_problems(sheet: ExcelSheet, where: str, formulas: dict[int, str], decimal_comma: bool | None) -> list[str]:
+class CellReference(NamedTuple):
+    sheet: str  # "" for the formula's own sheet
+    column: str
+    row: str  # a number or "{row}"
+    in_range: bool  # one end of a range such as B2:B9
+
+
+def formula_references(formula: str, own: str = "") -> list[CellReference]:
+    """The cells a checked formula (see normalize_formula) uses; cells of the sheet named `own` count as cells of the
+    formula's own sheet."""
+    tokens = [match for match in FORMULA_TOKEN_RE.finditer(formula, 1) if match.lastgroup != "space"]
+    references: list[CellReference] = []
+    for i, match in enumerate(tokens):
+        if match.lastgroup != "cell":
+            continue
+        before = tokens[i - 1] if i else None
+        range_end = i >= 2 and before.group() == ":" and tokens[i - 2].lastgroup == "cell"
+        if before is not None and before.lastgroup == "sheet":
+            sheet = before["quoted"].replace("''", "'") if before["quoted"] is not None else before["bare"]
+        else:
+            sheet = references[-1].sheet if range_end else ""
+        range_start = i + 2 < len(tokens) and tokens[i + 1].group() == ":" and tokens[i + 2].lastgroup == "cell"
+        sheet = "" if sheet == own else sheet
+        references.append(CellReference(sheet, match["column"].upper(), match["row"], range_start or range_end))
+    return references
+
+
+def _column_problems(
+    sheet: ExcelSheet, where: str, formulas: dict[int, str], decimal_comma: bool | None,
+    lookup: dict[str, str] | None = None, own: str = "",
+) -> list[str]:  # fmt: skip
     """Columns whose content cannot be what the model meant; these usually come from rows whose values are
     shifted against the columns, or from values the model forgot."""
     rows = align_rows(sheet)
@@ -1921,12 +2158,12 @@ def _column_problems(sheet: ExcelSheet, where: str, formulas: dict[int, str], de
             texts = [
                 v for v in values
                 if str(v).strip().lower() not in PLACEHOLDERS and not convert_value(v, column.type, decimal_comma)[1]
-                and not cell_formula(v, column)
+                and not cell_formula(v, column, lookup)
             ]  # fmt: skip
             bad_formula = next((str(v).strip() for v in texts if str(v).strip().startswith("=")), None)
             if bad_formula is not None:
                 try:
-                    normalize_formula(bad_formula, infer_row=False)
+                    normalize_formula(bad_formula, infer_row=False, sheets=lookup)
                 except ValueError as e:
                     problems.append(f"{name}: the formula '{bad_formula[:60]}' is not allowed: {e}")
             elif len(texts) >= 2 and len(texts) * 2 > len(values):
@@ -1935,13 +2172,14 @@ def _column_problems(sheet: ExcelSheet, where: str, formulas: dict[int, str], de
                     f"one value per column, in column order - is a column missing? Or give the column type 'text'."
                 )
     for c, formula in formulas.items():
-        if get_column_letter(c + 1) in FORMULA_CELL_RE.findall(re.sub(r'"[^"]*"', "", formula)):
+        own_sheet = [reference.column for reference in formula_references(formula, own) if not reference.sheet]
+        if get_column_letter(c + 1) in own_sheet:
             problems.append(
                 f"{where}.columns[{c}] ('{sheet.columns[c].header.strip()}'): the formula uses its own column "
                 f"{get_column_letter(c + 1)}; it may only use the other columns (e.g. quantity * price)"
             )
             continue
-        for letters in dict.fromkeys(FORMULA_CELL_RE.findall(re.sub(r'"[^"]*"', "", formula))):
+        for letters in dict.fromkeys(own_sheet):
             used = _column_number(letters) - 1
             if used < len(sheet.columns) and used not in formulas and not filled[used] and used != c:
                 problems.append(
@@ -1950,6 +2188,63 @@ def _column_problems(sheet: ExcelSheet, where: str, formulas: dict[int, str], de
                 )
     if problem := _total_row_problem(sheet, rows, where, formulas):
         problems.append(problem)
+    return problems
+
+
+def _reference_problems(
+    sheets: list[ExcelSheet], names: list[str], formulas: dict[tuple[int, int], str], lookup: dict[str, str]
+) -> list[str]:
+    """Single cells of other sheets that are empty: models count the rows there wrong (row 1 is the header), and
+    an empty cell silently counts as 0. Ranges may reach beyond the data, e.g. in SUMIF."""
+    aligned = [align_rows(sheet) for sheet in sheets]
+
+    def filled(t: int, row: int, column: int) -> bool:
+        target = sheets[t]
+        if not 1 <= column <= len(target.columns):
+            return False
+        if row == 1:
+            return bool(target.columns[column - 1].header.strip())
+        if row == len(target.rows) + 2 and has_totals(target):  # the total row, with its label in column A
+            return target.columns[column - 1].total != "none" or column == 1
+        if not 2 <= row <= len(target.rows) + 1:
+            return False
+        value = aligned[t][row - 2][column - 1]
+        return (t, column - 1) in formulas or (value is not None and str(value).strip() != "")
+
+    problems: list[str] = []
+    for s, sheet in enumerate(sheets):
+        where = f"sheets[{sheet._index if sheet._index >= 0 else s}]"
+        used = [(f"{where}.columns[{c}].formula", f) for (i, c), f in formulas.items() if i == s]
+        used += [
+            (f"{where}.rows[{r}]", formula)
+            for r, row in enumerate(aligned[s])
+            for column, value in zip(sheet.columns, row, strict=True)
+            if (formula := cell_formula(value, column, lookup))
+        ]
+        for place, formula in used:
+            for reference in formula_references(formula, names[s]):
+                if not reference.sheet or reference.in_range:
+                    continue
+                t, column = names.index(reference.sheet), _column_number(reference.column)
+                target, cell = sheets[t], f"'{reference.sheet}'!{reference.column}{reference.row}"
+                if reference.row == "{row}":
+                    if not any(filled(t, row, column) for row in range(2, len(target.rows) + 2)):
+                        problems.append(
+                            f"{place}: {cell} is empty: '{reference.sheet}' has no values in column "
+                            f"{reference.column} (it has the columns A to {get_column_letter(len(target.columns))})"
+                        )
+                    elif len(target.rows) < len(sheet.rows):
+                        problems.append(
+                            f"{place}: {cell} is empty in the last rows: '{reference.sheet}' has {len(target.rows)} "
+                            f"data rows, this sheet {len(sheet.rows)}"
+                        )
+                elif not filled(t, int(reference.row), column):
+                    total = f", total row {len(target.rows) + 2}" if has_totals(target) else ""
+                    problems.append(
+                        f"{place}: {cell} is an empty cell. On '{reference.sheet}', row 1 is the header and the data "
+                        f"is in rows 2 to {len(target.rows) + 1}{total}, columns A to "
+                        f"{get_column_letter(len(target.columns))}"
+                    )
     return problems
 
 
@@ -1980,7 +2275,7 @@ def _total_row_problem(sheet: ExcelSheet, rows: list[list[Any]], where: str, for
     )
 
 
-def cell_formula(value: Any, column: ExcelColumn) -> str | None:
+def cell_formula(value: Any, column: ExcelColumn, sheets: dict[str, str] | None = None) -> str | None:
     """A formula written into a single cell ('=B2-B3'), checked against the same whitelist as column formulas;
     None if the value is no allowed formula (then it is written as text). Columns the model marked as 'text'
     keep such values as text."""
@@ -1989,7 +2284,7 @@ def cell_formula(value: Any, column: ExcelColumn) -> str | None:
     if column.type == "text" and "type" in column.model_fields_set:
         return None
     try:
-        return normalize_formula(value, infer_row=False)
+        return normalize_formula(value, infer_row=False, sheets=sheets)
     except ValueError:
         return None
 
@@ -2149,8 +2444,9 @@ class XlsxWriter:
         self.chart_titles: dict[str, list[str]] = {}  # per sheet, for the text version
         self.narrow_font = design.font.casefold() in NARROW_FONTS  # the column widths are measured for Calibri
 
-    def render(self, sheets: list[ExcelSheet], formulas: dict[tuple[int, int], str]) -> bytes:
-        for s, (sheet, name) in enumerate(zip(sheets, sheet_names(sheets, self.texts["sheet"]), strict=True)):
+    def render(self, sheets: list[ExcelSheet], formulas: dict[tuple[int, int], str], names: list[str]) -> bytes:
+        self.lookup = sheet_lookup(sheets, names)
+        for s, (sheet, name) in enumerate(zip(sheets, names, strict=True)):
             self._sheet(
                 self.workbook.create_sheet(title=name), sheet, {c: f for (i, c), f in formulas.items() if i == s}
             )
@@ -2188,7 +2484,7 @@ class XlsxWriter:
             for c, (column, raw) in enumerate(zip(sheet.columns, row, strict=True), start=1):
                 cell = ws.cell(row=r, column=c)
                 cell.font, cell.border = self.body_font, ROW_LINE
-                if (c - 1) in formulas or (formula := cell_formula(raw, column)):  # checked against the whitelist
+                if (c - 1) in formulas or (formula := cell_formula(raw, column, self.lookup)):  # whitelist checked
                     cell.value = (formulas[c - 1] if (c - 1) in formulas else formula).replace("{row}", str(r))
                     cell.alignment = ALIGN["date" if column.type == "date" else "number"]
                     widths[c - 1] = max(widths[c - 1], 12)
@@ -2377,9 +2673,10 @@ def build_xlsx(
 ) -> tuple[bytes, str]:  # fmt: skip
     """The file and its text as Markdown."""
     sheets = [blank_null_texts(infer_column_types(sheet, decimal_comma)) for sheet in sheets]
-    formulas = check_excel(sheets, decimal_comma)
+    names = sheet_names(sheets, texts["sheet"])
+    formulas = check_excel(sheets, decimal_comma, names)
     writer = XlsxWriter(currency, texts, decimal_comma, design, title)
-    return writer.render(sheets, formulas), writer.markdown()
+    return writer.render(sheets, formulas, names), writer.markdown()
 
 
 # ------------------------------------------------------------------------------------------ PowerPoint --
@@ -3036,6 +3333,11 @@ class Tools:
             "opened; otherwise Office shows a similar one.",
         )
         page_numbers: bool = Field(default=True, description="Add page numbers to the footer of Word documents.")
+        word_template: str = Field(
+            default="",
+            description="Optional Word file (.docx or .dotx) on the Open WebUI server, e.g. a letterhead: Word documents "
+            "get its header, footer, page size and margins, e.g. /app/backend/data/templates/letterhead.dotx.",
+        )
 
     def __init__(self) -> None:
         self.valves = self.Valves()
@@ -3084,6 +3386,7 @@ class Tools:
                 landscape=bool(landscape or extras.get("landscape") is True),
                 page_numbers=self.valves.page_numbers,
                 design=self._design(),
+                template=read_word_template(self.valves.word_template),
             )
             return display_title, *build_docx(options, parsed, texts)
 

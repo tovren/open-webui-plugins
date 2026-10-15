@@ -331,7 +331,7 @@ A short example for a slide deck (the model sees the full schema with descriptio
   with leading zeros (postal codes, article numbers) stay text.
 - **Excel formulas** belong to a column and are filled into every data row, e.g. `=B{row}*C{row}`
   (`{row}` is the current row). A formula written for the first data row (`=B2*C2`) gets `{row}`
-  automatically. Allowed are cell references of the same sheet, numbers, quoted text,
+  automatically. Allowed are cell references of the same workbook, numbers, quoted text,
   operators and these functions: `SUM`, `AVERAGE`, `MIN`, `MAX`, `MEDIAN`, `COUNT`, `COUNTA`,
   `COUNTIF`, `SUMIF`, `AVERAGEIF`, `IF`, `IFERROR`, `AND`, `OR`, `NOT`, `ROUND`, `ROUNDUP`,
   `ROUNDDOWN`, `ABS`, `PRODUCT`, `POWER`, `SQRT`, `MOD`, `INT`. German names (`SUMME`, `WENN`,
@@ -339,6 +339,12 @@ A short example for a slide deck (the model sees the full schema with descriptio
   total row's `count` counts all filled cells (`COUNTA`). Formulas may also be written into single cells,
   e.g. a balance row `=B2-B3`, `=C2-C3` … when the months are columns; they are checked against the same
   whitelist. In columns the model marks as `text`, values that start with `=` stay text.
+- **Cells of other sheets** are written as `'Rates'!$B$3` (also `Rates!B3`, without regard to case). In a
+  column formula the model has to say which cell it means: `$B$3` for one cell in every row (e.g. an
+  hourly rate) or `B{row}` for the same row; `B3` alone is sent back. A single cell of another sheet that
+  is empty, usually because the rows there were counted wrong (row 1 is the header), is sent back with the
+  rows and columns that sheet has, as it would silently count as 0. Ranges such as `'Times'!$A$2:$A$50`
+  may reach beyond the data.
 - **Excel charts** plot columns (`category_column` plus `value_columns`) or, for tables with e.g. the
   months as columns, rows (`series_rows`: the labels in the first column of the rows to plot). A chart
   with only a type and title plots the number columns against the first column.
@@ -393,6 +399,27 @@ A short example for a slide deck (the model sees the full schema with descriptio
 | `accent_color` | `1F4E79` | Accent colour of all three formats (titles, table header rows, charts, title slide), as a hex value without `#`. Lighter and darker tones are derived from it |
 | `font` | `Calibri` | Font of all three formats, e.g. a company font such as `Arial` or `Aptos`. It has to be installed where the files are opened; otherwise Office shows a similar one. Excel columns get a little more room for fonts wider than Calibri |
 | `page_numbers` | `true` | Add "Page X of Y" to the footer of Word documents |
+| `word_template` | _(empty)_ | Path of a Word file (`.docx` or `.dotx`) on the Open WebUI server, e.g. a letterhead: Word documents get its header, footer, page size and margins (see [Word template](#word-template)) |
+
+### Word template
+
+With the `word_template` valve, Word documents are built on a company file, e.g. a letterhead. Copy the
+`.docx` or `.dotx` to the server where Open WebUI runs, e.g. into its data volume (Docker:
+`/app/backend/data/templates/letterhead.dotx`), and enter the path.
+
+- **Taken from the template:** header and footer with their logos, fields and fonts (also a different
+  first page, e.g. a large letterhead on page 1 and a small one after it), page size and margins.
+- **Not taken:** the template's text is removed, also what is not in its header or footer (e.g. an address
+  window or a logo placed in the body). The content keeps the tool's design (`accent_color`, `font`): it
+  uses the styles *Body Text*, *Title*, *Heading 1–3*, *Quote* and the list styles, which are replaced in
+  the document. The template's *Normal* style stays as it is, since its header and footer build on it, so
+  set `font` to the company font if the two should match.
+- If the template has a header, the model's `header_text` is not added to it; if it has a footer, the
+  "Page X of Y" footer is not added either. Without them, both are added as usual.
+- Removed from the template: its author and title, a mail merge (Word would ask to run its SQL command),
+  write protection, and the path of the template it was made from.
+- If the file cannot be read (missing, not a Word file, larger than 20 MB), the documents are made without
+  it and Open WebUI's log says why.
 
 ### Security & privacy
 
@@ -400,8 +427,8 @@ A short example for a slide deck (the model sees the full schema with descriptio
   fixed code builds the file. There is no shell and no network access, and nothing is loaded from
   URLs (images are not supported for that reason).
 - **Excel:** every formula, in a column's `formula` field or in a cell, is checked against the whitelist
-  above: references to other sheets (`!`) and other workbooks (`[…]`), DDE (`|`) and every other
-  function, e.g. `WEBSERVICE`, `HYPERLINK` or `INDIRECT`, are rejected. A cell value that does not pass,
+  above: references to other workbooks (`[…]`, or a sheet name that is not in the file), DDE (`|`) and every
+  other function, e.g. `WEBSERVICE`, `HYPERLINK` or `INDIRECT`, are rejected. A cell value that does not pass,
   such as `=HYPERLINK(...)`, is written as text with Excel's quote prefix, so it stays text when the user
   edits it (in a number column the model is told instead). The data sheet behind PowerPoint charts
   ("Edit Data") gets labels and series names as text only, never as formulas or links.
@@ -432,8 +459,9 @@ A short example for a slide deck (the model sees the full schema with descriptio
 - **Table of contents:** Word fills it in when the document is opened and asks first whether to
   update the fields. LibreOffice needs **Tools → Update → Update All**.
 - **Design:** one calm, modern look for all three formats, in shades of the `accent_color` valve and in the
-  font of the `font` valve (also for charts and for text the user adds later). Company templates are not
-  supported yet.
+  font of the `font` valve (also for charts and for text the user adds later). Word documents can take the
+  header and footer of a company template ([Word template](#word-template)); Excel and PowerPoint
+  templates are not supported.
   - **Word:** A4 with `language = de` (Letter otherwise), a title block with a line in the accent colour,
     headings in the accent colour, tables with a coloured header row, light banding and lines between the
     rows only, quotes with a coloured bar, the title and "Page X of Y" in the footer.

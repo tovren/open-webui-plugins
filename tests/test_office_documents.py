@@ -657,6 +657,93 @@ def test_formula_whitelist_rejects(formula: str) -> None:
         od.normalize_formula(formula)
 
 
+SHEETS = {"stundensätze": "Stundensätze", "plan 2026": "Plan 2026", "it's": "It's"}
+
+
+@pytest.mark.parametrize(
+    ("formula", "expected"),
+    [
+        ("=B2*Stundensätze!$B$3", "=B{row}*'Stundensätze'!$B$3"),  # quoted, written name; own cells get {row}
+        ("=B{row}*'STUNDENSÄTZE'!B$2", "=B{row}*'Stundensätze'!B$2"),  # names without case, like Excel
+        ("='Plan 2026'!B{row}-B{row}", "='Plan 2026'!B{row}-B{row}"),
+        (
+            "=SUMIF('Plan 2026'!$A$2:$A$9;A2;'Plan 2026'!$C$2:$C$9)",
+            "=SUMIF('Plan 2026'!$A$2:$A$9,A{row},'Plan 2026'!$C$2:$C$9)",
+        ),
+        ("='It''s'!$A$1+1", "='It''s'!$A$1+1"),
+    ],
+)
+def test_formula_cells_of_other_sheets(formula: str, expected: str) -> None:
+    assert od.normalize_formula(formula, sheets=SHEETS) == expected
+
+
+@pytest.mark.parametrize(
+    ("formula", "message"),
+    [
+        ("=B2*'Stundensätze'!B3", "write 'Stundensätze'!$B$3 for this one cell in every row"),  # which one is meant?
+        ("=SUM('Plan 2026'!B2:B9)", "'Plan 2026'!$B$2"),
+        ("='Nope'!A1", "there is no sheet 'Nope' in this workbook (sheets: 'Stundensätze', 'Plan 2026', 'It's')"),
+        ("='C:\\x\\[evil.xlsx]Sheet1'!A1", "there is no sheet"),  # another workbook
+        ("=Plan 2026!B{row}", "(cells of another sheet: 'Sheet name'!B3)"),
+        ("=B{row}:'Plan 2026'!B3", "a range as 'Plan 2026'!B2:B9"),
+        ("='Plan 2026'!SUM(A1)", "a range as 'Plan 2026'!B2:B9"),
+        ("=B{row} 'Plan 2026'!$B$3", "a space between two values"),
+    ],
+)
+def test_formula_cells_of_other_sheets_rejected(formula: str, message: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        od.normalize_formula(formula, sheets=SHEETS)
+
+
+def test_excel_cells_of_other_sheets() -> None:
+    rates = {"name": "Stundensätze", "columns": [{"header": "Rolle"}, {"header": "Satz", "type": "currency"}],
+             "rows": [["Senior", 120], ["Junior", 80]]}  # fmt: skip
+    offer = {
+        "name": "Angebot",
+        "columns": [{"header": "Position"}, {"header": "Stunden", "type": "number"},
+                    {"header": "Betrag", "type": "currency", "formula": "=B2*Stundensätze!$B$2", "total": "sum"}],
+        "rows": [["Analyse", 10], ["Umsetzung", 20]],
+    }  # fmt: skip
+    summary = {"name": "Übersicht", "columns": [{"header": "Posten"}, {"header": "Wert", "type": "currency"}],
+               "rows": [["Angebot", "=Angebot!C4"], ["Junior", "='stundensätze'!B3"]]}  # fmt: skip
+    wb, _ = excel([offer, rates, summary])
+    assert [wb["Angebot"][f"C{r}"].value for r in (2, 3, 4)] == [
+        "=B2*'Stundensätze'!$B$2", "=B3*'Stundensätze'!$B$2", "=SUM(C2:C3)"
+    ]  # fmt: skip
+    assert (wb["Übersicht"]["B2"].value, wb["Übersicht"]["B3"].value) == ("='Angebot'!C4", "='Stundensätze'!B3")
+
+    def with_formula(formula: str, rows: int = 2) -> dict[str, Any]:
+        amount = {**offer["columns"][2], "formula": formula}
+        return {**offer, "columns": [*offer["columns"][:2], amount], "rows": [["x", 1]] * rows}
+
+    # A row counted wrong: an empty cell would silently count as 0
+    result = invalid("create_excel_file", sheets=[with_formula("=B2*'Stundensätze'!$B$4"), rates])
+    assert "sheets[0].columns[2].formula: 'Stundensätze'!B4 is an empty cell" in result
+    assert "row 1 is the header and the data is in rows 2 to 3, columns A to B" in result
+    result = invalid("create_excel_file", sheets=[offer, rates, {**summary, "rows": [["Angebot", "=Angebot!C5"]]}])
+    assert "sheets[2].rows[0]: 'Angebot'!C5 is an empty cell" in result
+    result = invalid("create_excel_file", sheets=[with_formula("=B{row}*'Stundensätze'!B{row}", rows=3), rates])
+    assert "'Stundensätze'!B{row} is empty in the last rows: 'Stundensätze' has 2 data rows, this sheet 3" in result
+    result = invalid("create_excel_file", sheets=[{**summary, "rows": [["Angebot", "='Kosten'!B2"]]}])
+    assert "there is no sheet 'Kosten' in this workbook (sheets: 'Übersicht')" in result
+    result = invalid("create_excel_file", sheets=[with_formula("=B{row}*'Stundensätze'!Z{row}"), rates])
+    assert "'Stundensätze'!Z{row} is empty: 'Stundensätze' has no values in column Z" in result
+    result = invalid("create_excel_file", sheets=[with_formula("=Angebot!C{row}*2"), rates])  # its own sheet by name
+    assert "the formula uses its own column C" in result
+
+
+def test_excel_sheet_names_in_formulas() -> None:
+    sheets = [
+        {"name": "Maße", "columns": [{"header": "A"}, {"header": "B"}], "rows": [["x", 80]]},
+        {"name": "Masse", "columns": [{"header": "A"}, {"header": "B"}], "rows": [["x", 90]]},  # not the same in Excel
+        {"name": "a;b", "columns": [{"header": "A"}, {"header": "B"}], "rows": [["x", 10]]},
+        {"name": "S", "columns": [{"header": "A"}, {"header": "B"}],
+         "rows": [["Maße", "='Maße'!B2"], ["Sum", "=SUM('a;b'!B2,1,5)"]]},
+    ]  # fmt: skip
+    ws = excel(sheets)[0]["S"]
+    assert (ws["B2"].value, ws["B3"].value) == ("='Maße'!B2", "=SUM('a;b'!B2,1,5)")  # ';' in a name: not German
+
+
 def test_excel_invalid_input() -> None:
     sheet = {
         "name": "S",
@@ -844,6 +931,137 @@ def test_word_files_render_in_browser_previews() -> None:
     assert '<w:color w:val="8B1E3F"/>' in heading_char and "themeColor" not in heading_char
     assert "Symbol" not in numbering and 'w:lvlText w:val="\u2022"' in numbering  # a real bullet, not a Symbol glyph
     assert 'typeface="Cambria"' not in package.read("word/theme/theme1.xml").decode()
+
+
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+)
+
+
+def rewrite_package(data: bytes, drop: str = "", types: tuple[str, str] = ("", "")) -> bytes:
+    """Remove a part (and its relationship and content type) or change a content type of a Word package."""
+    source, buffer = zipfile.ZipFile(io.BytesIO(data)), io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as target:
+        for item in source.infolist():
+            content = source.read(item)
+            if drop and item.filename == drop:
+                continue
+            if item.filename in ("[Content_Types].xml", "word/_rels/document.xml.rels") and drop:
+                content = re.sub(rf"<(Override|Relationship)[^>]*{Path(drop).name}\"[^>]*/>".encode(), b"", content)
+            if item.filename == "[Content_Types].xml" and types[0]:
+                content = content.replace(types[0].encode(), types[1].encode())
+            target.writestr(item, content)
+    return buffer.getvalue()
+
+
+def letterhead(path: Path, header: bool = True, numbering: bool = True) -> str:
+    """A company template: its own Normal font, a header with a logo, a footer, wide margins, sample text, a mail
+    merge and an author; saved as .dotx."""
+    template = Document()
+    section = template.sections[0]
+    section.top_margin = od.Cm(4.5)
+    template.styles["Normal"].font.name = "Georgia"
+    if header:
+        section.header.paragraphs[0].text = "ACME GmbH "
+        section.header.paragraphs[0].add_run().add_picture(io.BytesIO(PNG_1X1))
+        section.footer.paragraphs[0].text = "Industriestr. 1, Stuttgart"
+    template.add_paragraph("MUSTERTEXT", style="List Bullet")
+    merge = od.OxmlElement("w:mailMerge")
+    merge.append(od.OxmlElement("w:mainDocumentType"))
+    template.settings.element.append(merge)
+    template.core_properties.author = "Max Mustermann"
+    buffer = io.BytesIO()
+    template.save(buffer)
+    data = rewrite_package(buffer.getvalue(), types=("document.main+xml", "template.main+xml"))
+    if not numbering:
+        data = rewrite_package(data, drop="word/numbering.xml")
+    path.write_bytes(data)
+    return str(path)
+
+
+def test_word_template(tmp_path: Path) -> None:
+    blocks = [{"type": "numbered", "items": ["a", "b"]}, {"type": "table", "rows": [["A", "B"], ["1", "2"]]},
+              {"type": "bullets", "items": ["x", "- y"]}, {"type": "paragraph", "text": "Text"}]  # fmt: skip
+    _, recorder = call(
+        "create_word_file", valves={"word_template": letterhead(tmp_path / "letterhead.dotx")},
+        blocks=blocks, title="Angebot", header_text="Vertraulich",
+    )  # fmt: skip
+    data = recorder.download()[0]
+    doc = Document(io.BytesIO(data))
+    section = doc.sections[0]
+    assert round(section.top_margin.cm, 2) == 4.5  # the template's page
+    assert section.header.paragraphs[0].text == "ACME GmbH "  # not added to: no "Vertraulich", no page numbers
+    assert section.footer.paragraphs[0].text == "Industriestr. 1, Stuttgart"
+    assert any("image" in rel.reltype for rel in section.header.part.rels.values())  # the logo
+    texts = [p.text for p in doc.paragraphs]
+    assert "MUSTERTEXT" not in texts and texts[0] == "Angebot" and "Text" in texts
+    assert doc.styles["Normal"].font.name == "Georgia"  # the header and footer build on it
+    assert {p.style.name for p in doc.paragraphs if p.text in ("Text", "")} == {"Body Text"}
+    assert doc.styles["Body Text"].font.name == "Calibri" and doc.styles["Body Text"].base_style is None
+    assert doc.tables[0].rows[1].cells[0].paragraphs[0].style.name == "Body Text"
+    numbering = doc.part.numbering_part.element
+    for paragraph in doc.paragraphs:
+        if paragraph.style.name.startswith("List"):  # every list points to an existing numbering
+            num_id = paragraph._p.pPr.numPr.numId.val if paragraph._p.pPr.numPr is not None else None
+            num_id = num_id or paragraph.style.element.pPr.numPr.numId.val
+            assert numbering.num_having_numId(num_id) is not None
+    package = zipfile.ZipFile(io.BytesIO(data))
+    assert "mailMerge" not in package.read("word/settings.xml").decode()
+    assert doc.core_properties.author == "" and doc.core_properties.title == "Angebot"
+
+
+def test_word_template_without_header_or_numbering(tmp_path: Path) -> None:
+    path = letterhead(tmp_path / "plain.dotx", header=False, numbering=False)
+    doc, _, _ = word(valves={"word_template": path}, blocks=[{"type": "numbered", "items": ["a"]}], header_text="H")
+    assert round(doc.sections[0].top_margin.cm, 2) == 4.5
+    assert doc.sections[0].header.paragraphs[0].text == "H"  # the template has none: added as usual
+    assert doc.sections[0].footer.paragraphs[0].text.endswith("Page 1 of 1")  # and the page numbers
+    style_num_id = doc.styles["List Number"].element.pPr.numPr.numId.val
+    assert doc.part.numbering_part.element.num_having_numId(style_num_id) is not None
+
+
+def test_word_template_shapes(tmp_path: Path) -> None:
+    sections = Document()  # the letterhead is in the first section; the last one takes it over (Word's default)
+    sections.sections[0].header.paragraphs[0].text = "LETTERHEAD"
+    sections.add_section()
+    sections.save(tmp_path / "sections.docx")
+    doc, _, _ = word(valves={"word_template": str(tmp_path / "sections.docx")}, blocks=[{"type": "paragraph", "text": "x"}],
+                     header_text="H")  # fmt: skip
+    assert [p.text for p in doc.sections[0].header.paragraphs] == ["LETTERHEAD"] and len(doc.sections) == 1
+
+    plain = Path(letterhead(tmp_path / "plain.dotx", header=False))  # has a Footer style with tab stops, no footer
+    doc, _, _ = word(valves={"word_template": str(plain)}, blocks=[{"type": "paragraph", "text": "x"}])
+    tabs = doc.sections[0].footer.paragraphs[0].paragraph_format.tab_stops
+    assert [tab.alignment for tab in tabs].count(od.WD_TAB_ALIGNMENT.RIGHT) == 1  # the page number on the right
+    assert od.WD_TAB_ALIGNMENT.CLEAR in [tab.alignment for tab in tabs]  # not at the style's centre tab
+
+    no_settings = tmp_path / "no-settings.dotx"  # settings.xml is optional
+    no_settings.write_bytes(rewrite_package(plain.read_bytes(), drop="word/settings.xml"))
+    doc, _, _ = word(valves={"word_template": str(no_settings)}, blocks=[{"type": "paragraph", "text": "x"}])
+    assert round(doc.sections[0].top_margin.cm, 2) == 4.5
+
+    no_page = Document()  # no page size and margins: the usual ones
+    for element in no_page.sections[0]._sectPr.findall(od.qn("w:pgMar")) + no_page.sections[0]._sectPr.findall(
+        od.qn("w:pgSz")
+    ):
+        no_page.sections[0]._sectPr.remove(element)
+    no_page.sections[0].header.paragraphs[0].text = "ACME"
+    no_page.save(tmp_path / "no-page.docx")
+    doc, _, _ = word(
+        valves={"word_template": str(tmp_path / "no-page.docx")}, blocks=[{"type": "paragraph", "text": "x"}]
+    )
+    assert doc.sections[0].header.paragraphs[0].text == "ACME" and round(doc.sections[0].left_margin.cm, 2) == 2.5
+
+
+@pytest.mark.parametrize("content", [None, b"not a zip", b"PK\x03\x04broken"])
+def test_word_template_that_cannot_be_used(tmp_path: Path, caplog: pytest.LogCaptureFixture, content: bytes) -> None:
+    path = tmp_path / "template.docx"
+    if content is not None:
+        path.write_bytes(content)
+    with caplog.at_level("WARNING"):
+        doc, _, _ = word(valves={"word_template": str(path)}, blocks=[{"type": "paragraph", "text": "x"}])
+    assert round(doc.sections[0].top_margin.cm, 2) == 2.5  # made without it
+    assert "documents are made without it" in caplog.text
 
 
 def test_bad_accent_color_falls_back() -> None:
