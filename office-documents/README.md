@@ -212,7 +212,6 @@ With the `word_template` valve, Word documents are built on a company file, e.g.
     a garbled tool call, llama-server rejects the next request (HTTP 500), so the chat ends with an error.
   - **Claude Sonnet 5.5 as a reference 4.5:** the tool is not the bottleneck; the remaining mistakes come from
     the models. Its reviewers were Claude models themselves, so this number may be a little flattering.
-  - Tasks, raw data and the blind reviews: [office-documents-benchmark](https://github.com/tovren/office-documents-benchmark).
   - In an earlier, smaller round (one file per request): Nemotron 3 Super 3.6, Mistral Small 4 3.5,
     Nemotron 3.5 Lightning 3.2, Ministral 3 14B 2.8, gpt-oss-20b 2.2, GLM-4.7-Flash 2.0.
   - Common to all: wrong weekdays and calendar weeks, placeholders such as "System X", miscalculated
