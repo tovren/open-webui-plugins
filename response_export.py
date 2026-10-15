@@ -1,7 +1,7 @@
 """
 title: Response Export
-author: <AUTHOR NAME>
-author_url: <URL>
+author: tovren
+author_url: https://github.com/tovren/open-webui-plugins
 version: 1.0.0
 license: MIT
 required_open_webui_version: 0.11.4

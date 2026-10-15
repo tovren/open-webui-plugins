@@ -558,4 +558,4 @@ Optional checks run when the tools are installed:
 
 ## License
 
-[MIT](LICENSE) © \<AUTHOR NAME\>
+[MIT](LICENSE) © tovren
