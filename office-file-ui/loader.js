@@ -29,8 +29,9 @@
 	// The chip fits its name. The limit (24rem, or the row's width on small screens) sits on the chip's box in
 	// the row of files: a limit with a percentage on the chip itself is ignored when the box is sized, so the
 	// box would keep the full width of the name and leave a gap. In light mode Open WebUI draws the chip white
-	// on white, so it gets the grey of the user's message bubble. The size is smaller than the name: centred, it floats above the name's baseline,
-	// so both share the baseline, and the line moves down 1px to centre the name between the two icons.
+	// on white, so it gets the grey of the user's message bubble. The size is smaller than the name: centred,
+	// it floats above the name's baseline, so both share the baseline, and the line moves down 1px to centre
+	// the name between the two icons.
 	// Office colours for the document icon (the chip's first child), lighter in dark mode.
 	const STYLE = `
 		button[${MARK}="chip"] { width: auto !important; max-width: 100%; transition: background-color 0.15s; }
