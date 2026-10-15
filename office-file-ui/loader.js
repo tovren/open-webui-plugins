@@ -26,12 +26,15 @@
 		'<path d="M3.5 12.75a.75.75 0 0 0-1.5 0v2.5A2.75 2.75 0 0 0 4.75 18h10.5A2.75 2.75 0 0 0 18 15.25v-2.5a.75.75 0 0 0-1.5 0v2.5c0 .69-.56 1.25-1.25 1.25H4.75c-.69 0-1.25-.56-1.25-1.25v-2.5Z"/>' +
 		'</svg>';
 
-	// The chip fits its name; in light mode Open WebUI draws it white on white, so it gets the grey of the
-	// user's message bubble. The size is smaller than the name: centred, it floats above the name's baseline,
+	// The chip fits its name. The limit (24rem, or the row's width on small screens) sits on the chip's box in
+	// the row of files: a limit with a percentage on the chip itself is ignored when the box is sized, so the
+	// box would keep the full width of the name and leave a gap. In light mode Open WebUI draws the chip white
+	// on white, so it gets the grey of the user's message bubble. The size is smaller than the name: centred, it floats above the name's baseline,
 	// so both share the baseline, and the line moves down 1px to centre the name between the two icons.
 	// Office colours for the document icon (the chip's first child), lighter in dark mode.
 	const STYLE = `
-		button[${MARK}="chip"] { width: auto !important; max-width: min(24rem, 100%); transition: background-color 0.15s; }
+		button[${MARK}="chip"] { width: auto !important; max-width: 100%; transition: background-color 0.15s; }
+		[${MARK}="chip-box"] { max-width: min(24rem, 100%); min-width: 0; }
 		html:not(.dark) button[${MARK}="chip"] { background-color: var(--color-gray-50, #f9f9f9); border-color: var(--color-gray-100, #ececec); }
 		html:not(.dark) button[${MARK}="chip"]:hover { background-color: var(--color-gray-100, #ececec); }
 		.dark button[${MARK}="chip"]:hover { background-color: var(--color-gray-800, #333); }
@@ -164,6 +167,8 @@
 
 	const decorateChip = (chip, name) => {
 		if (chip.getAttribute(MARK) !== 'chip') chip.setAttribute(MARK, 'chip');
+		const box = chip.parentElement;
+		if (box?.children.length === 1 && box.getAttribute(MARK) !== 'chip-box') box.setAttribute(MARK, 'chip-box');
 		const type = name.match(PREVIEW_ONLY)?.[1]?.toLowerCase();
 		if (type && chip.getAttribute(`${MARK}-type`) !== type) chip.setAttribute(`${MARK}-type`, type);
 	};
