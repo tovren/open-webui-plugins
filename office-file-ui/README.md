@@ -14,6 +14,10 @@ For files attached to an answer of the assistant (e.g. by the Office Documents t
 Files the user uploads and file views elsewhere (workspace, knowledge, chat controls) stay unchanged,
 so the "Content" tab still shows what the model received from an upload.
 
+![Files attached to an answer, shown as chips with a coloured icon and a download icon](images/chips.png)
+
+![A Word file opened straight in the preview, with a download button in the header](images/preview.png)
+
 Tested with Open WebUI 0.11.4. It depends on Open WebUI's markup, so check it after every update.
 If the markup changes, the icons and the tab switch just stop appearing; nothing else breaks.
 
