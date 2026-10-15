@@ -34,7 +34,7 @@ import pytest
 from docx import Document
 from openpyxl import load_workbook
 
-PLUGIN_DIR = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent
 STUB_JS = Path(__file__).resolve().parent / "browser_stub.js"
 PLUGIN_FILES = ("response_export.py", "context_guard.py", "company_context.py", "reasoning_toggle.py")
 ALLOWED_THIRD_PARTY = {"docx", "openpyxl", "pydantic"}
@@ -50,8 +50,13 @@ FRONTMATTER_KEYS = {
 }
 
 
+def plugin_path(file_name: str) -> Path:
+    """Each plugin lives in its own folder, e.g. response-export/response_export.py."""
+    return REPO / Path(file_name).stem.replace("_", "-") / file_name
+
+
 def load_plugin(file_name: str) -> ModuleType:
-    spec = importlib.util.spec_from_file_location(f"plugin_{Path(file_name).stem}", PLUGIN_DIR / file_name)
+    spec = importlib.util.spec_from_file_location(f"plugin_{Path(file_name).stem}", plugin_path(file_name))
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -176,7 +181,7 @@ def downloaded(recorder: Recorder) -> tuple[bytes, str, str]:
 @pytest.mark.parametrize("file_name", PLUGIN_FILES)
 def test_frontmatter(file_name: str) -> None:
     """Replicates Open WebUI's frontmatter parser: no stray 'key:' lines in the docstring."""
-    lines = (PLUGIN_DIR / file_name).read_text(encoding="utf-8").splitlines()
+    lines = (plugin_path(file_name)).read_text(encoding="utf-8").splitlines()
     assert lines[0] == '"""'
     pattern = re.compile(r"^\s*([a-z_]+):\s*(.*)\s*$", re.IGNORECASE)
     meta = {}
@@ -194,7 +199,7 @@ def test_frontmatter(file_name: str) -> None:
 
 @pytest.mark.parametrize("file_name", PLUGIN_FILES)
 def test_only_bundled_libraries(file_name: str) -> None:
-    tree = ast.parse((PLUGIN_DIR / file_name).read_text(encoding="utf-8"))
+    tree = ast.parse((plugin_path(file_name)).read_text(encoding="utf-8"))
     modules = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
     modules |= {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
     top_level = {name.split(".")[0] for name in modules}

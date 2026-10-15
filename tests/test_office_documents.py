@@ -1,4 +1,4 @@
-"""Tests for the Office Documents tool (office_documents.py in the parent folder).
+"""Tests for the Office Documents tool (office-documents/office_documents.py).
 
 Run from anywhere (Python 3.11+):
     pip install python-docx openpyxl python-pptx pydantic pytest
@@ -32,7 +32,7 @@ from docx import Document
 from openpyxl import load_workbook
 from pptx import Presentation
 
-PLUGIN_DIR = Path(__file__).resolve().parent.parent
+PLUGIN = Path(__file__).resolve().parent.parent / "office-documents" / "office_documents.py"
 ALLOWED_THIRD_PARTY = {"docx", "openpyxl", "pptx", "pydantic"}
 LAZY_IMPORTS = {"open_webui", "starlette"}  # only imported inside attach_file, when running in Open WebUI
 FRONTMATTER_KEYS = {"title", "author", "author_url", "version", "license", "required_open_webui_version", "description"}
@@ -40,7 +40,7 @@ W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
 def load_plugin() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("plugin_office_documents", PLUGIN_DIR / "office_documents.py")
+    spec = importlib.util.spec_from_file_location("plugin_office_documents", PLUGIN)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -129,7 +129,7 @@ def invalid(method: str, **kwargs: Any) -> str:
 
 
 def test_frontmatter_and_bundled_libraries() -> None:
-    source = (PLUGIN_DIR / "office_documents.py").read_text(encoding="utf-8")
+    source = (PLUGIN).read_text(encoding="utf-8")
     docstring = ast.get_docstring(ast.parse(source)) or ""
     meta = dict(line.split(": ", 1) for line in docstring.split("\n\n")[0].splitlines())
     assert set(meta) == FRONTMATTER_KEYS

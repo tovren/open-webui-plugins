@@ -19,6 +19,8 @@ If the markup changes, the icons and the tab switch just stop appearing; nothing
 
 ## Install
 
+File: [`loader.js`](loader.js).
+
 Open WebUI loads `/static/loader.js` on every page. At startup it empties its static directory and copies
 the file again from the frontend build, so put the script **into the frontend build**:
 
