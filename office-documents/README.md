@@ -58,7 +58,7 @@ A short example for a slide deck (the model sees the full schema with descriptio
 - **Percent cells hold the fraction**, as in Excel: `12.5` is stored as 0.125 and shown as 12.5 %, so a
   formula uses the cell as it is (`=B{row}*(1-C{row})` for a discount in C). The tool sends back three
   slips that models make with this (35 of 660 Excel calls in the v0.1 runs of
-  [office-bench-de](https://github.com/tovren/office-bench-de) runs): fractions sent into a percent
+  [office-bench-de](https://github.com/tovren/office-bench-de)): fractions sent into a percent
   column (`0.05` for 5 %, which would show as 0.05 %; a value below 1 % can be sent as `"0.5 %"`), a
   percent cell divided by 100 in a formula, and `*100` in the formula of a percent column (25 % would
   show as 2500 %).
