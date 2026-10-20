@@ -1362,6 +1362,46 @@ def test_excel_formulas_written_into_cells() -> None:
     assert ws["A5"].value == '=HYPERLINK("http://x")' and ws["A5"].data_type == "s"  # not allowed: stays text
 
 
+def test_percent_cells_hold_the_fraction() -> None:
+    """Percent numbers go in (5 means 5 %), the cell holds 0.05: fractions sent in, '/100' on a percent cell and
+    '*100' in a percent column are rejected with a hint."""
+    offer = {
+        "name": "Angebot",
+        "columns": [{"header": "Artikel"}, {"header": "Menge", "type": "integer"},
+                    {"header": "Preis", "type": "currency"}, {"header": "Rabatt", "type": "percent"},
+                    {"header": "Netto", "type": "currency", "formula": "=B{row}*C{row}*(1-D{row})"}],
+        "rows": [["Stuhl", 6, 240, 5], ["Tisch", 2, 890, "7,5 %"], ["Lampe", 3, 45, 0.5]],
+    }  # fmt: skip
+    ws = excel([offer])[0]["Angebot"]
+    assert (ws["D2"].value, ws["D3"].value, ws["D4"].value) == (0.05, 0.075, 0.005)
+
+    def errors(**changes: Any) -> str:
+        return invalid("create_excel_file", sheets=[{**offer, **changes}])
+
+    message = errors(rows=[["Stuhl", 6, 240, 0.05], ["Tisch", 2, 890, "0,1"], ["Montage", 1, 80, 0]])
+    assert "('Rabatt'): all values are below 1 (e.g. 0.05)" in message and "'0.5 %'" in message
+    assert excel([{**offer, "rows": [["Stuhl", 6, 240, "0,5 %"], ["Tisch", 2, 890, "0.25 %"]]}])[0]["Angebot"]
+    divided = [*offer["columns"][:4], {**offer["columns"][4], "formula": "=B{row}*C{row}*(1-D{row}/100)"}]
+    assert "D{row} is a percent cell ('Rabatt'), which already holds the fraction (5 % is 0.05): write D{row} " \
+           "instead of D{row}/100" in errors(columns=divided)
+    conditions = {"name": "Konditionen", "columns": [{"header": "Angabe"}, {"header": "Wert", "type": "percent"}],
+                  "rows": [["Rabatt", 5], ["MwSt", 19]]}  # fmt: skip
+    total = {"name": "Summe", "columns": [{"header": "Posten"}, {"header": "Betrag", "type": "currency"}],
+             "rows": [["Netto", 1000], ["Rabatt", "=-B2*Konditionen!B2/100"]]}  # fmt: skip
+    message = invalid("create_excel_file", sheets=[total, conditions])
+    assert "sheets[0].rows[1]: 'Konditionen'!B2 is a percent cell ('Wert')" in message
+    shares = {"name": "Umlage", "columns": [{"header": "Abteilung"}, {"header": "Fläche", "type": "number"},
+              {"header": "Anteil", "type": "percent", "formula": "=B{row}/SUM($B$2:$B$3)*100"}],
+              "rows": [["Vertrieb", 120], ["Lager", 380]]}  # fmt: skip
+    message = invalid("create_excel_file", sheets=[shares])
+    assert "'Anteil' is a percent column" in message and "drop the *100" in message
+    shares["columns"][2]["formula"] = "=B{row}/SUM($B$2:$B$3)"
+    assert excel([shares])[0]["Umlage"]["C2"].value == "=B2/SUM($B$2:$B$3)"
+    per_hundred = {**shares, "columns": [*shares["columns"][:2], {"header": "Je 100 m²", "type": "number",
+                   "formula": "=B{row}/100"}]}  # fmt: skip
+    assert excel([per_hundred])[0]["Umlage"]["C2"].value == "=B2/100"  # /100 of a number column is fine
+
+
 def test_html_breaks_and_header_only_tables() -> None:
     doc, _, _ = word(blocks=[{"type": "table", "rows": [["A", "B"], ["x<br>y", "z"]]}], title="T")
     assert doc.tables[0].rows[1].cells[0].text == "x\ny"

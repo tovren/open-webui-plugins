@@ -2,7 +2,7 @@
 title: Office Documents
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 0.1.0
+version: 0.2.0
 license: MIT
 required_open_webui_version: 0.11.4
 description: Lets the model create Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files. The model only supplies the content as structured JSON; fixed code builds the file, so no model-written code is ever run. The file is attached to the answer, where it can be previewed and downloaded.
@@ -341,7 +341,9 @@ class ExcelColumn(Schema):
     header: str = Field(description="Column header.")
     type: Literal["text", "number", "integer", "currency", "percent", "date"] = Field(
         default="text",
-        description="Value type. percent: 12.5 means 12.5 %. date: YYYY-MM-DD.",
+        description="Value type. percent: send 12.5 for 12.5 % (not 0.125); the cell then holds 0.125, as in "
+        "Excel, so formulas use it as it is: =B{row}*(1-C{row}), without /100, and a percent formula column computes "
+        "the fraction (=B{row}/C{row}, without *100). date: YYYY-MM-DD.",
     )
     formula: str = Field(
         default="",
@@ -2101,6 +2103,7 @@ def check_excel(
                     check.errors.extend(f"{where}.chart.{error}" for error in e.args[0])
     if not check.errors:  # all sheets are complete: cells of other sheets can be looked up
         check.errors.extend(_reference_problems(sheets, names, formulas, lookup))
+        check.errors.extend(_percent_problems(sheets, names, formulas, lookup))
     check.raise_if_failed()
     return formulas
 
@@ -2171,6 +2174,12 @@ def _column_problems(
                     f"{name}: {len(texts)} of {len(values)} values are not numbers (e.g. '{texts[0]}'). Each row needs "
                     f"one value per column, in column order - is a column missing? Or give the column type 'text'."
                 )
+            elif column.type == "percent" and (fraction := _fractions_only(values, decimal_comma)) is not None:
+                problems.append(
+                    f"{name}: all values are below 1 (e.g. {fraction}), but a percent column takes percent numbers: "
+                    f"5 means 5 %, so {fraction} would show as {fraction} %. Send 5 for 5 % (or '5 %'); a value that "
+                    f"really is below 1 % needs the sign, e.g. '0.5 %'."
+                )
     for c, formula in formulas.items():
         own_sheet = [reference.column for reference in formula_references(formula, own) if not reference.sheet]
         if get_column_letter(c + 1) in own_sheet:
@@ -2188,6 +2197,84 @@ def _column_problems(
                 )
     if problem := _total_row_problem(sheet, rows, where, formulas):
         problems.append(problem)
+    return problems
+
+
+def _fractions_only(values: list[Any], decimal_comma: bool | None) -> float | None:
+    """The first value if every value of a percent column but 0 is a plain number between -1 and 1: the model sent
+    fractions (0.05 for 5 %), which the column would show as 0.05 %. None if any value has a '%' or is 1 or more."""
+    numbers = []
+    for value in values:
+        if isinstance(value, bool) or str(value).strip().lower() in PLACEHOLDERS:
+            continue
+        if isinstance(value, (int, float)):
+            numbers.append(value)
+        elif isinstance(value, str) and (parsed := parse_number_text(value, decimal_comma)) and not parsed[1]:
+            numbers.append(parsed[0])
+        else:
+            return None
+    numbers = [n for n in numbers if n != 0]
+    return numbers[0] if numbers and all(abs(n) < 1 for n in numbers) else None
+
+
+def _sheet_formulas(
+    sheets: list[ExcelSheet], aligned: list[list[list[Any]]], formulas: dict[tuple[int, int], str],
+    lookup: dict[str, str],
+) -> list[tuple[int, int, str, str]]:  # fmt: skip
+    """Every formula of the workbook as (sheet, column, place for messages, formula): column formulas and formulas
+    written into single cells."""
+    used = []
+    for s, sheet in enumerate(sheets):
+        where = f"sheets[{sheet._index if sheet._index >= 0 else s}]"
+        used += [(s, c, f"{where}.columns[{c}].formula", f) for (i, c), f in formulas.items() if i == s]
+        used += [
+            (s, c, f"{where}.rows[{r}]", formula)
+            for r, row in enumerate(aligned[s])
+            for c, (column, value) in enumerate(zip(sheet.columns, row, strict=True))
+            if (formula := cell_formula(value, column, lookup))
+        ]
+    return used
+
+
+def _percent_problems(
+    sheets: list[ExcelSheet], names: list[str], formulas: dict[tuple[int, int], str], lookup: dict[str, str]
+) -> list[str]:
+    """Formulas that treat a percent cell as a percent number: a percent cell holds the fraction (5 % is 0.05), so
+    '/100' on it divides a second time, and '*100' in a percent column shows 100 times the share (2500 %)."""
+    problems: list[str] = []
+    aligned = [align_rows(sheet) for sheet in sheets]
+    for s, c, place, formula in _sheet_formulas(sheets, aligned, formulas, lookup):
+        tokens = [match for match in FORMULA_TOKEN_RE.finditer(formula, 1) if match.lastgroup != "space"]
+
+        def hundred(i: int) -> bool:
+            return 0 <= i < len(tokens) and tokens[i].lastgroup == "number" and float(tokens[i].group()) == 100
+
+        if sheets[s].columns[c].type == "percent" and any(
+            token.group() == "*" and (hundred(i - 1) or hundred(i + 1)) for i, token in enumerate(tokens)
+        ):
+            problems.append(
+                f"{place}: '{sheets[s].columns[c].header.strip()}' is a percent column, whose cells hold the fraction "
+                f"(0.25 shows as 25 %): drop the *100, or 25 % shows as 2500 %"
+            )
+        for i, token in enumerate(tokens):
+            divided = i + 2 < len(tokens) and tokens[i + 1].group() == "/" and hundred(i + 2)
+            if token.lastgroup != "cell" or not divided:
+                continue
+            before = tokens[i - 1] if i else None
+            sheet = s
+            if before is not None and before.lastgroup == "sheet":
+                written = before["quoted"].replace("''", "'") if before["quoted"] is not None else before["bare"]
+                sheet = names.index(written) if written in names else -1
+            column = _column_number(token["column"]) - 1
+            if sheet < 0 or not 0 <= column < len(sheets[sheet].columns):
+                continue
+            target = sheets[sheet].columns[column]
+            if target.type == "percent":
+                cell = token.group() if sheet == s else f"'{names[sheet]}'!{token.group()}"
+                problems.append(
+                    f"{place}: {cell} is a percent cell ('{target.header.strip()}'), which already holds the "
+                    f"fraction (5 % is 0.05): write {cell} instead of {cell}/100"
+                )
     return problems
 
 
@@ -2212,39 +2299,31 @@ def _reference_problems(
         return (t, column - 1) in formulas or (value is not None and str(value).strip() != "")
 
     problems: list[str] = []
-    for s, sheet in enumerate(sheets):
-        where = f"sheets[{sheet._index if sheet._index >= 0 else s}]"
-        used = [(f"{where}.columns[{c}].formula", f) for (i, c), f in formulas.items() if i == s]
-        used += [
-            (f"{where}.rows[{r}]", formula)
-            for r, row in enumerate(aligned[s])
-            for column, value in zip(sheet.columns, row, strict=True)
-            if (formula := cell_formula(value, column, lookup))
-        ]
-        for place, formula in used:
-            for reference in formula_references(formula, names[s]):
-                if not reference.sheet or reference.in_range:
-                    continue
-                t, column = names.index(reference.sheet), _column_number(reference.column)
-                target, cell = sheets[t], f"'{reference.sheet}'!{reference.column}{reference.row}"
-                if reference.row == "{row}":
-                    if not any(filled(t, row, column) for row in range(2, len(target.rows) + 2)):
-                        problems.append(
-                            f"{place}: {cell} is empty: '{reference.sheet}' has no values in column "
-                            f"{reference.column} (it has the columns A to {get_column_letter(len(target.columns))})"
-                        )
-                    elif len(target.rows) < len(sheet.rows):
-                        problems.append(
-                            f"{place}: {cell} is empty in the last rows: '{reference.sheet}' has {len(target.rows)} "
-                            f"data rows, this sheet {len(sheet.rows)}"
-                        )
-                elif not filled(t, int(reference.row), column):
-                    total = f", total row {len(target.rows) + 2}" if has_totals(target) else ""
+    for s, _, place, formula in _sheet_formulas(sheets, aligned, formulas, lookup):
+        sheet = sheets[s]
+        for reference in formula_references(formula, names[s]):
+            if not reference.sheet or reference.in_range:
+                continue
+            t, column = names.index(reference.sheet), _column_number(reference.column)
+            target, cell = sheets[t], f"'{reference.sheet}'!{reference.column}{reference.row}"
+            if reference.row == "{row}":
+                if not any(filled(t, row, column) for row in range(2, len(target.rows) + 2)):
                     problems.append(
-                        f"{place}: {cell} is an empty cell. On '{reference.sheet}', row 1 is the header and the data "
-                        f"is in rows 2 to {len(target.rows) + 1}{total}, columns A to "
-                        f"{get_column_letter(len(target.columns))}"
+                        f"{place}: {cell} is empty: '{reference.sheet}' has no values in column "
+                        f"{reference.column} (it has the columns A to {get_column_letter(len(target.columns))})"
                     )
+                elif len(target.rows) < len(sheet.rows):
+                    problems.append(
+                        f"{place}: {cell} is empty in the last rows: '{reference.sheet}' has {len(target.rows)} "
+                        f"data rows, this sheet {len(sheet.rows)}"
+                    )
+            elif not filled(t, int(reference.row), column):
+                total = f", total row {len(target.rows) + 2}" if has_totals(target) else ""
+                problems.append(
+                    f"{place}: {cell} is an empty cell. On '{reference.sheet}', row 1 is the header and the data "
+                    f"is in rows 2 to {len(target.rows) + 1}{total}, columns A to "
+                    f"{get_column_letter(len(target.columns))}"
+                )
     return problems
 
 

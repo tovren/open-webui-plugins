@@ -55,6 +55,13 @@ A short example for a slide deck (the model sees the full schema with descriptio
   `language` valve when it appears only once (`de`: `1,799` is 1.799; `en`: `1.500` is 1.5). Columns sent
   without a type whose values are all numbers become number columns, so sums and charts work; values
   with leading zeros (postal codes, article numbers) stay text.
+- **Percent cells hold the fraction**, as in Excel: `12.5` is stored as 0.125 and shown as 12.5 %, so a
+  formula uses the cell as it is (`=B{row}*(1-C{row})` for a discount in C). The tool sends back three
+  slips that models make with this (35 of 660 Excel calls in the v0.1 runs of
+  [office-bench-de](https://github.com/tovren/office-bench-de) runs): fractions sent into a percent
+  column (`0.05` for 5 %, which would show as 0.05 %; a value below 1 % can be sent as `"0.5 %"`), a
+  percent cell divided by 100 in a formula, and `*100` in the formula of a percent column (25 % would
+  show as 2500 %).
 - **Excel formulas** belong to a column and are filled into every data row, e.g. `=B{row}*C{row}`
   (`{row}` is the current row). A formula written for the first data row (`=B2*C2`) gets `{row}`
   automatically. Allowed are cell references of the same workbook, numbers, quoted text,
