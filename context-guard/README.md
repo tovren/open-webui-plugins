@@ -54,6 +54,28 @@ enable it globally or per model, see [Installation](../README.md#installation). 
 If `answer_reserve_tokens` is not smaller than the context size, the check is skipped and a
 warning is logged, so a misconfiguration never blocks every chat.
 
+## Built-in tools of Open WebUI 0.12
+
+From 0.12 on, Open WebUI sends the definitions of its built-in tools (knowledge, memories, notes,
+chats, skills, automations, calendar …) with every chat that is started in the browser: 39 tools
+with about 27,000 characters of JSON in 0.12.0. How many tokens that is depends on the model and its
+chat template. Measured with the same request:
+
+| Model | Tokens of the built-in tools | Guard's estimate (`chars_per_token` 3.5) |
+|---|---|---|
+| Qwen3.8 27B | 7,109 | 7,793 (+10 %) |
+| Gemma 4 26B-A4B | 6,216 | 7,793 (+25 %) |
+| gpt-oss-20b | 4,207 | 7,793 (+85 %) |
+
+So about 4,000 to 7,000 tokens of the context are taken before the user has typed anything, and a
+model with an 8k context hardly has room for a chat. The guard counts these tokens on purpose: they
+take up the model's context like any other text. Its estimate is close for Qwen and on the cautious
+side for models whose tokenizer or chat template is more compact.
+
+If a model does not need the built-in tools, switch them off in **Workspace → Models → (model) →
+Capabilities → Builtin Tools**, or set the model's function calling to `legacy`. The individual
+groups (knowledge, memory, notes …) can also be switched off there.
+
 ## With Context Compaction
 
 Open WebUI's built-in [Context Compaction](https://docs.openwebui.com/troubleshooting/context-window/)

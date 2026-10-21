@@ -5,7 +5,7 @@ An Open WebUI **action** that adds four buttons below every assistant message:
 | Button | Result |
 |---|---|
 | **Word (.docx)** | Word document with headings, bullet and numbered lists (one nesting level, numbering restarts for each list), tables with a header row in the accent colour, bold/italic/strikethrough/inline code, clickable links, code blocks, quotes and horizontal rules. Same design as the Word files of Office Documents (`accent_color`, `font`), optionally on a company template such as a letterhead (`word_template`) |
-| **Excel (.xlsx)** | One worksheet per Markdown table. The header row is bold, shaded and frozen, with an auto filter and fitted column widths. Numbers become real numbers, including German and Swiss formats (`1.234,56`, `12,5 %`, `1.234,56 €`, `CHF 1'234.50`), `$`/`£` amounts and the codes `EUR`, `USD`, `GBP` and `CHF`. Phone numbers such as `+49 711 123456` stay text |
+| **Excel (.xlsx)** | One worksheet per Markdown table. The header row is bold, shaded and frozen, with an auto filter and fitted column widths. Numbers become real numbers, including German and Swiss formats (`1.234,56`, `12,5 %`, `1.234,56 €`, `CHF 1'234.50`), `$`/`£` amounts and the codes `EUR`, `USD`, `GBP` and `CHF`. Phone numbers such as `+49 711 123456` stay text. Numbers written with thousands separators keep them in Excel; years and postcodes without separators stay as they are. All cells use the `font` valve |
 | **PDF** | PDF file with the content and design of the Word file (`accent_color`): headings, lists, quotes, code blocks, tables whose header row is repeated on every page (number columns right-aligned), clickable links, page numbers and an optional small note in the footer. A4 for German, Letter for English. It is downloaded like the Word file; to print, open it and print it from the PDF viewer |
 | **E-Mail** | Opens the default mail program through a `mailto:` link. A `Subject:`/`Betreff:` line becomes the subject, and any preamble before it ("Here is a draft:") is dropped. If the answer is too long for a `mailto:` link, an `.eml` draft with plain-text and HTML parts is downloaded instead. Outlook opens it as a new, editable message |
 
@@ -35,7 +35,7 @@ enable it globally or per model, see [Installation](../README.md#installation).
 | `always_eml` | `false` | Always download a formatted `.eml` draft instead of a plain-text `mailto:` link |
 | `print_footer` | `true` | Add the note "Created with the AI assistant on …" to the footer of PDF pages. The page number is always there |
 | `accent_color` | `1F4E79` | Accent colour of Word and PDF files (headings, table header rows, links), as a hex value without `#` |
-| `font` | `Calibri` | Font of Word documents, e.g. a company font such as `Arial` or `Aptos`. It has to be installed where the files are opened; otherwise Office shows a similar one. PDF files always use Helvetica and Courier |
+| `font` | `Calibri` | Font of Word documents and Excel sheets, e.g. a company font such as `Arial` or `Aptos`. It has to be installed where the files are opened; otherwise Office shows a similar one. PDF files always use Helvetica and Courier |
 | `word_template` | _(empty)_ | Path of a Word file (`.docx` or `.dotx`) on the Open WebUI server, e.g. a letterhead: Word documents get its header, footer, page size and margins. Not used for PDF files |
 
 `accent_color`, `font` and `word_template` have the same names and meaning as in

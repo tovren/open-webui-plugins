@@ -292,17 +292,19 @@ def test_docx_list_starting_number_is_kept() -> None:
     ("text", "value", "number_format"),
     [
         ("42", 42, None),
+        ("2026", 2026, None),  # a year or postcode keeps its digits as written
+        ("70173", 70173, None),
         ("-17", -17, None),
         ("1,5", 1.5, None),
         ("0,5", 0.5, None),
         ("3.14159", 3.14159, None),
-        ("2.000", 2000, None),
-        ("1.234.567", 1234567, None),
-        ("1.234,56", 1234.56, None),
-        ("1,234.56", 1234.56, None),
-        ("1 234,5", 1234.5, None),
-        ("1 000", 1000, None),
-        ("1'000'000", 1000000, None),
+        ("2.000", 2000, "#,##0"),
+        ("1.234.567", 1234567, "#,##0"),
+        ("1.234,56", 1234.56, "#,##0.00"),
+        ("1,234.56", 1234.56, "#,##0.00"),
+        ("1 234,5", 1234.5, "#,##0.0"),
+        ("1 000", 1000, "#,##0"),
+        ("1'000'000", 1000000, "#,##0"),
         ("−5", -5, None),
         ("12%", 0.12, "0%"),
         ("-3,2 %", -0.032, "0.0#%"),
@@ -322,9 +324,9 @@ def test_docx_list_starting_number_is_kept() -> None:
         ("+1 234", "+1 234", None),
         ("+41\u00a079 123 456", "+41\u00a079 123 456", None),
         ("+5", 5, None),
-        ("+1.234,56", 1234.56, None),
+        ("+1.234,56", 1234.56, "#,##0.00"),
         ("+1 000 €", 1000.0, '#,##0.00 "€"'),
-        ("1 234", 1234, None),
+        ("1 234", 1234, "#,##0"),
         ("CHF 1'234.50", 1234.5, '"CHF" #,##0.00'),
         ("1’234.50 CHF", 1234.5, '"CHF" #,##0.00'),  # Swiss thousands separator U+2019
         ("CHF -12", -12.0, '"CHF" #,##0.00'),
@@ -353,6 +355,7 @@ def test_xlsx_values_and_formats() -> None:
     sheet = workbook["Table 1"]
     assert [c.value for c in sheet[1]] == ["Item", "Amount", "Share"]
     assert all(c.font.bold and c.fill.fgColor.rgb.endswith("DDE4EE") for c in sheet[1])
+    assert {c.font.name for row in sheet.iter_rows() for c in row} == {"Calibri"}
     assert sheet.freeze_panes == "A2"
     assert sheet.auto_filter.ref == "A1:C4"
     assert sheet["A2"].value == "A | B"

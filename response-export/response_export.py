@@ -2,7 +2,7 @@
 title: Response Export
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.2.0
+version: 1.2.1
 license: MIT
 required_open_webui_version: 0.11.4
 description: Adds four buttons below every assistant message - export as Word (.docx), export its tables as Excel (.xlsx), download as PDF, and open as an e-mail draft. Files are built in memory and handed straight to the browser; nothing is stored on the server.
@@ -1058,14 +1058,17 @@ def parse_number(text: str) -> tuple[str | int | float, str | None]:
         return number / 100, "0%" if float(number).is_integer() else "0.0#%"
     if unit:
         return float(number), CURRENCY_FORMATS[unit]
+    if match["group"]:  # written with thousands separators: Excel shows them too (but not in years or postcodes)
+        return number, "#,##0" + ("." + "0" * len(fraction) if fraction else "")
     return number, None
 
 
-def tables_to_xlsx(tables: list[Table], sheet_name: str) -> bytes:
+def tables_to_xlsx(tables: list[Table], sheet_name: str, font: str = BODY_FONT) -> bytes:
     """One worksheet per table; `sheet_name` is a format string with an {n} placeholder."""
     workbook = Workbook()
     workbook.remove(workbook.active)
     header_fill = PatternFill("solid", fgColor=HEADER_FILL)
+    body_font, header_font = Font(name=font), Font(name=font, bold=True)  # a font without a name looks different
     for n, table in enumerate(tables, start=1):
         sheet = workbook.create_sheet(title=sheet_name.format(n=n))
         widths = [0] * len(table.aligns)
@@ -1080,8 +1083,8 @@ def tables_to_xlsx(tables: list[Table], sheet_name: str) -> bytes:
                     cell.number_format = number_format
                 if "\n" in text:
                     cell.alignment = Alignment(wrap_text=True, vertical="top")
+                cell.font = header_font if row_index == 1 else body_font
                 if row_index == 1:
-                    cell.font = Font(bold=True)
                     cell.fill = header_fill
                 widths[column - 1] = max(widths[column - 1], *(len(line) for line in text.split("\n")))
         for column, width in enumerate(widths, start=1):
@@ -2025,9 +2028,9 @@ class Action:
         )
         font: str = Field(
             default=BODY_FONT,
-            description="Font of Word documents, e.g. Calibri, Arial or Aptos. It has to be installed where "
-            "the files are opened; otherwise Office shows a similar one. PDF files always use the standard "
-            "PDF fonts Helvetica and Courier.",
+            description="Font of Word documents and Excel sheets, e.g. Calibri, Arial or Aptos. It has to be "
+            "installed where the files are opened; otherwise Office shows a similar one. PDF files always use "
+            "the standard PDF fonts Helvetica and Courier.",
         )
         word_template: str = Field(
             default="",
@@ -2111,7 +2114,7 @@ class Action:
         if not tables:
             await export.browser.notify("warning", export.texts["no_tables"])
             return
-        data = await asyncio.to_thread(tables_to_xlsx, tables, export.texts["sheet_name"])
+        data = await asyncio.to_thread(tables_to_xlsx, tables, export.texts["sheet_name"], self.valves.font)
         await export.browser.download(data, f"{self._file_stem(blocks, export)}.xlsx", XLSX_MIME)
 
     async def _export_pdf(self, content: str, export: Export) -> None:

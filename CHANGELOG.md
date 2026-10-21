@@ -4,7 +4,7 @@ Each plugin has its own version (in the header of its file). Earlier changes are
 
 ## Unreleased
 
-Context Guard 1.3.0. The other plugins are unchanged.
+Context Guard 1.3.0 · Response Export 1.2.1. The other plugins are unchanged.
 
 ### Context Guard 1.3.0
 
@@ -20,6 +20,15 @@ Context Guard 1.3.0. The other plugins are unchanged.
   messages short, and logs a warning once per chat.
 - New integration tests with a real Open WebUI (`tests/integration/`), checked with 0.11.4, 0.12.0
   and 0.12.1.
+- README: Open WebUI 0.12 sends its built-in tools with every chat, about 4,000 to 7,000 tokens
+  depending on the model (measured for Qwen3.8, Gemma 4 and gpt-oss), and how to switch them off.
+
+### Response Export 1.2.1
+
+- Excel: all cells use the `font` valve. The header row had no font name, so LibreOffice showed it in
+  a different font.
+- Excel: numbers written with thousands separators (`1,240,000`, `1.234,56`) are shown with
+  separators. Numbers without them, such as years and postcodes, stay as they are.
 
 ## 2026-10-21, second update
 
