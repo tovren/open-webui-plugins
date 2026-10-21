@@ -2,7 +2,7 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
-## Unreleased
+## 2026-10-21, third update
 
 Context Guard 1.3.0 · Response Export 1.2.1 · Office File UI. The other plugins are unchanged.
 
