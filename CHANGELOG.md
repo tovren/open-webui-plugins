@@ -34,7 +34,10 @@ Context Guard 1.3.0 · Response Export 1.2.1 · Office File UI. The other plugin
 
 - PowerPoint preview: titles and subtitles that the file aligns left are shown on the left. Open WebUI
   centres them even when the file says left ([open-webui#32873](https://github.com/open-webui/open-webui/issues/32873)).
-  Pie charts stay empty in the preview; the script cannot draw them.
+  The fix is merged for the next Open WebUI release ([open-webui#32876](https://github.com/open-webui/open-webui/pull/32876));
+  from then on the script's correction is not needed and does no harm.
+- Pie and doughnut charts stay empty in the PowerPoint preview; the script cannot draw them
+  ([open-webui#32884](https://github.com/open-webui/open-webui/issues/32884)).
 - Spreadsheet preview in dark mode: grey instead of blue-violet, like the rest of the page. Open WebUI
   0.12.3 fixes this itself; the rule does no harm there.
 

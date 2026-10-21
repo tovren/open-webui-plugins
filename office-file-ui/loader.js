@@ -1,4 +1,4 @@
-// Office File UI for Open WebUI (tested with 0.11.4 and 0.12.1)
+// Office File UI for Open WebUI (tested with 0.11.4, 0.12.0 and 0.12.1)
 //
 // Open WebUI loads /static/loader.js on every page. For files attached to an answer of the assistant
 // (e.g. by the Office Documents tool) this script
