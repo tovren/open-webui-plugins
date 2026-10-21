@@ -79,6 +79,10 @@ def js_value(code: str, prefix: str) -> Any:
     return json.JSONDecoder().raw_decode(code, start)[0]
 
 
+def close_brackets(text: str) -> str:
+    return od._close_brackets(text)[0]
+
+
 def make_tools(**valves: Any) -> Any:
     tools = od.Tools()
     tools.valves = tools.Valves(**{"delivery": "download", **valves})
@@ -352,7 +356,7 @@ def test_json_text_is_repaired() -> None:
     assert od.loads_lenient('[{"rows": [["a", "]"]]') == [
         {"rows": [["a", "]"]]}
     ]  # last "]" forgotten; "]" in text kept
-    assert od.close_brackets('{"a": ["x", {"b": 1]}') == '{"a": ["x", {"b": 1}]}'
+    assert close_brackets('{"a": ["x", {"b": 1]}') == '{"a": ["x", {"b": 1}]}'
     # table rows and list items written as several arrays without the outer brackets
     run = '[{"layout": "table", "title": "T", "table": ["A", "B"], ["1", "2"], ["3", "4"], "notes": "n"}]'
     assert od.loads_lenient(run)[0]["table"] == [["A", "B"], ["1", "2"], ["3", "4"]]
@@ -623,7 +627,7 @@ def test_excel_rows_without_formula_columns_and_german() -> None:
         ("B{row}-C{row}", "=B{row}-C{row}"),  # "=" is added
         ("=AND(B2>=1, B2<>5, TRUE)", "=AND(B{row}>=1,B{row}<>5,TRUE)"),
         ("=B2/$C$1", "=B{row}/$C$1"),  # absolute rows stay
-        ("=SUM(B2:B7)", "=SUM(B2:B7)"),  # other rows: meant as fixed cells
+        ("=SUM(B2:B7)", "=SUM($B$2:$B$7)"),  # a range over several rows: the same in every row, written so
         ("=B{row}*0,19", "=B{row}*0.19"),  # decimal comma outside of a function
         ("=RUNDEN(B{row}*0,19;2)", "=ROUND(B{row}*0.19,2)"),  # with ";" every comma in a number is decimal
         ("=IF(A{row}>0,1,0)", "=IF(A{row}>0,1,0)"),  # commas inside a function separate arguments
@@ -671,6 +675,7 @@ SHEETS = {"stundensätze": "Stundensätze", "plan 2026": "Plan 2026", "it's": "I
             "=SUMIF('Plan 2026'!$A$2:$A$9,A{row},'Plan 2026'!$C$2:$C$9)",
         ),
         ("='It''s'!$A$1+1", "='It''s'!$A$1+1"),
+        ("=SUM('Plan 2026'!B2:B9)", "=SUM('Plan 2026'!$B$2:$B$9)"),  # a range of several rows: fixed
     ],
 )
 def test_formula_cells_of_other_sheets(formula: str, expected: str) -> None:
@@ -681,9 +686,8 @@ def test_formula_cells_of_other_sheets(formula: str, expected: str) -> None:
     ("formula", "message"),
     [
         ("=B2*'Stundensätze'!B3", "write 'Stundensätze'!$B$3 for this one cell in every row"),  # which one is meant?
-        ("=SUM('Plan 2026'!B2:B9)", "'Plan 2026'!$B$2"),
         ("='Nope'!A1", "there is no sheet 'Nope' in this workbook (sheets: 'Stundensätze', 'Plan 2026', 'It's')"),
-        ("='C:\\x\\[evil.xlsx]Sheet1'!A1", "there is no sheet"),  # another workbook
+        ("='C:\\x\\[evil.xlsx]Sheet1'!A1", "references to other workbooks"),
         ("=Plan 2026!B{row}", "(cells of another sheet: 'Sheet name'!B3)"),
         ("=B{row}:'Plan 2026'!B3", "a range as 'Plan 2026'!B2:B9"),
         ("='Plan 2026'!SUM(A1)", "a range as 'Plan 2026'!B2:B9"),
@@ -1584,6 +1588,408 @@ def test_download_that_the_browser_does_not_confirm() -> None:
         tools.create_word_file(blocks=[{"type": "paragraph", "text": "x"}], title="T", __event_call__=gone)
     )
     assert result == od.RESULT_FAILED
+
+
+# ------------------------------------------------------------------------------- second review (0.3.0) --
+
+
+def test_escaped_line_breaks_take_linear_time() -> None:
+    """'\\n' * n + '\\x' took seconds with a regex over the whole text (holding the GIL for all of Open WebUI)."""
+    for text in ("\\n" * 30_000 + "\\x", "\\u2013" * 20_000 + "\\x", "\\n" * 30_000):
+        start = time.perf_counter()
+        od._unescape_newlines(text)
+        assert time.perf_counter() - start < 0.2
+    assert od._unescape_newlines("a\\nb") == "a\nb" and od._unescape_newlines("C:\\neu\\x") == "C:\\neu\\x"
+
+
+def sheet(columns: list[Any], rows: list[Any], **extra: Any) -> dict[str, Any]:
+    return {"name": "S", "columns": [c if isinstance(c, dict) else {"header": c} for c in columns], "rows": rows,
+            **extra}  # fmt: skip
+
+
+ARTICLES = [{"header": "Artikel"}, {"header": "Menge", "type": "integer"}, {"header": "Preis", "type": "currency"}]
+
+
+def with_total(formula: str, rows: list[Any] | None = None, **column: Any) -> dict[str, Any]:
+    total = {"header": "Summe", "type": "currency", "formula": formula, **column}
+    return sheet([*ARTICLES, total], rows or [["Stuhl", 6, 240], ["Tisch", 2, 890], ["Lampe", 3, 45]])
+
+
+@pytest.mark.parametrize(
+    ("formula", "expected"),
+    [
+        ("=B2/SUM(B2:B4)", "=B{row}/SUM($B$2:$B$4)"),  # the share of each row, not of B2 in every row
+        ("=SUM(B2:B{row})", "=SUM($B$2:B{row})"),  # a running total from the first data row
+        ("=SUM(D2*F2,D3*F3)", "=SUM(D2*F2,D3*F3)"),  # cells of several rows: fixed cells, as written
+        ("=SUMME(B2:D2)", "=SUM(B{row}:D{row})"),  # a range within the first data row
+        ("=SUM($B$2:B9)", "=SUM($B$2:$B$9)"),  # one end fixed, the other a fixed number: a fixed range
+        ("=SUM(B2:$B$9)", "=SUM($B$2:$B$9)"),
+        ("=SUM($B$2:B{row})", "=SUM($B$2:B{row})"),  # a running total stays
+    ],
+)
+def test_column_formula_rows(formula: str, expected: str) -> None:
+    assert od.normalize_formula(formula) == expected
+
+
+@pytest.mark.parametrize(
+    ("formula", "message"),
+    [
+        ("=B3*C3", "B3, C3 in a column formula"),  # one row off
+        ("=B1*C1", "(row 1 is the header row)"),
+        ("=B{row}*C2", "write C{row} for the cell in the same row (e.g. =B{row}*C{row}), $C$2 for one fixed cell"),
+    ],
+)
+def test_column_formula_without_row_is_sent_back(formula: str, message: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        od.normalize_formula(formula)
+
+
+def test_formula_on_a_text_column() -> None:
+    """Miscounted letters: '=A{row}*B{row}' with the article names in A gives #VALUE! in every row."""
+    result = invalid("create_excel_file", sheets=[with_total("=A{row}*B{row}")])
+    assert "the formula computes with A{row}, but 'Artikel' holds text (e.g. 'Stuhl'), which gives #VALUE!" in result
+    assert "(columns of 'S': A=Artikel, B=Menge, C=Preis, D=Summe)" in result
+    ws = excel([with_total('=IF(A{row}="Stuhl",B{row}*C{row}*0.9,B{row}*C{row})')])[0]["S"]  # comparisons are fine
+    assert ws["D2"].value == '=IF(A2="Stuhl",B2*C2*0.9,B2*C2)'
+    times = sheet(["Tag", "Beginn", "Ende", {"header": "Dauer", "formula": "=C{row}-B{row}"}],
+                  [["Mo", "08:00", "16:30"]])  # fmt: skip
+    assert excel([times])[0]["S"]["D2"].value == "=C2-B2"  # Excel computes with times written as text too
+    header = sheet(["A", {"header": "B", "type": "number"}], [["x", 2], ["y", "=B2*$B$1"]])
+    assert "$B$1 is in the header row ('B')" in invalid("create_excel_file", sheets=[header])
+    single = with_total("=B{row}*C{row}", [["Stuhl", 6, 240], ["Tisch", "-", 890]])
+    assert "but sheets[0].rows[1] has '-' there, which gives #VALUE!: send a number, or null" in invalid(
+        "create_excel_file", sheets=[single]
+    )
+
+
+def test_single_texts_in_number_columns() -> None:
+    """A text in a number column that a total, formula or chart uses would silently count as 0."""
+    costs = sheet(["Posten", {"header": "Betrag", "type": "currency", "total": "sum"}], [["a", 150], ["b", "ca. 500"]])
+    result = invalid("create_excel_file", sheets=[costs])
+    assert "sheets[0].rows[1]: 'ca. 500' in 'Betrag' is not a number, so the total cannot count it" in result
+    assert "send the number (500)" in result
+    costs["rows"][1][1] = "3 h"
+    assert "send the number (3) and put the unit into the header, e.g. 'Betrag (h)'" in invalid(
+        "create_excel_file", sheets=[costs]
+    )
+    hours = sheet(["Posten", {"header": "Dauer", "type": "number"}], [["a", "3 h"], ["b", "2 h"], ["c", 1]])
+    assert "If they are numbers with a unit: send the number (3)" in invalid("create_excel_file", sheets=[hours])
+    costs["rows"][1][1] = "offen"  # placeholders stay allowed
+    assert excel([costs])[0]["S"]["B3"].value == "offen"
+    unused = sheet(["Posten", {"header": "Betrag", "type": "currency"}], [["a", 150], ["b", "ca. 500"]])
+    assert excel([unused])[0]["S"]["B3"].value == "ca. 500"  # nothing uses the column: stays as sent
+
+
+@pytest.mark.parametrize(
+    ("formula", "written"),
+    [
+        ("=B{row}*(1-D{row}%)", "D{row}%"),
+        ("=B{row}*C{row}*(D{row})/100", "D{row}/100"),
+        ("=B{row}*C{row}*D{row}*0.01", "D{row}*0.01"),
+    ],
+)
+def test_percent_cells_divided_again(formula: str, written: str) -> None:
+    offer = sheet([*ARTICLES, {"header": "Rabatt", "type": "percent"}, {"header": "Netto", "formula": formula}],
+                  [["Stuhl", 6, 240, 5]])  # fmt: skip
+    result = invalid("create_excel_file", sheets=[offer])
+    assert "D{row} is a percent cell ('Rabatt'), which already holds the fraction" in result
+    assert f"instead of {written}" in result
+
+
+def test_list_marks_written_by_the_model() -> None:
+    blocks = [
+        {"type": "bullets", "items": ["• Punkt", "• Zweiter", "- Unterpunkt"]},
+        {"type": "numbered", "items": ["1. Erstens", "2) Zweitens", "3. Drittens"]},
+        {"type": "bullets", "items": ["* Stern", "Ohne"]},  # not every item: left as it is
+        {"type": "numbered", "items": ["3. Oktober", "5. November"]},  # no counting from 1: left as it is
+    ]
+    doc, _, _ = word(blocks=blocks, title="T")
+    assert [p.text for p in doc.paragraphs[1:]] == [
+        "Punkt", "Zweiter", "Unterpunkt", "Erstens", "Zweitens", "Drittens", "* Stern", "Ohne", "3. Oktober",
+        "5. November",
+    ]  # fmt: skip
+    prs, _ = powerpoint([{"layout": "bullets", "title": "Ziele", "bullets": ["– Effizienz", "– Qualität"]}], title="D")
+    assert [p.text for p in prs.slides[0].placeholders[1].text_frame.paragraphs] == ["Effizienz", "Qualität"]
+
+
+def test_markdown_headings_and_tables_in_paragraphs() -> None:
+    text = "## Abschnitt\nText darunter.\n\n---\n\n### Unterpunkt\n#hashtag bleibt"
+    doc, _, _ = word(blocks=[{"type": "paragraph", "text": text}], title="T")
+    assert [(p.style.name, p.text) for p in doc.paragraphs[1:]] == [
+        ("Heading 2", "Abschnitt"), ("Normal", "Text darunter."), ("Heading 3", "Unterpunkt"),
+        ("Normal", "#hashtag bleibt"),
+    ]  # fmt: skip
+    wide = (
+        "| " + " | ".join(f"S{i}" for i in range(15)) + " |\n|" + " --- |" * 15 + "\n| " + " | ".join("x" * 15) + " |"
+    )
+    assert "blocks[0] (paragraph): at most 12 columns (the Markdown table in the text)" in invalid(
+        "create_word_file", blocks=[{"type": "paragraph", "text": wide}], title="T"
+    )
+    long = "| A | B |\n| --- | --- |\n" + "| x | y |\n" * 600
+    assert "at most 500 rows (the Markdown table in the text)" in invalid(
+        "create_word_file", blocks=[{"type": "paragraph", "text": long}], title="T"
+    )
+
+
+@pytest.mark.parametrize(
+    ("formula", "expected"),
+    [
+        ("=SVERWEIS(A{row};$E$2:$F$9;2;FALSCH)", "=VLOOKUP(A{row},$E$2:$F$9,2,FALSE)"),
+        ("=SUMMEWENNS($C$2:$C$9;$A$2:$A$9;A{row})", "=SUMIFS($C$2:$C$9,$A$2:$A$9,A{row})"),
+        ("=NETTOARBEITSTAGE(B{row};C{row})", "=NETWORKDAYS(B{row},C{row})"),
+        ("=EDATUM(B{row};3)+MONATSENDE(B{row};0)-HEUTE()", "=EDATE(B{row},3)+EOMONTH(B{row},0)-TODAY()"),
+        ("=WENN(B{row}>5;„ja“;“nein”)", '=IF(B{row}>5,"ja","nein")'),  # German quotes in a formula
+        ("=XVERWEIS(A{row};$E$2:$E$9;$F$2:$F$9)", "=_xlfn.XLOOKUP(A{row},$E$2:$E$9,$F$2:$F$9)"),  # Excel 2019+
+        ("=_xlfn.MAXIFS($C$2:$C$9,$A$2:$A$9,A{row})", "=_xlfn.MAXIFS($C$2:$C$9,$A$2:$A$9,A{row})"),
+        ('=TEXTVERKETTEN(", ";WAHR;A{row};B{row})', '=_xlfn.TEXTJOIN(", ",TRUE,A{row},B{row})'),
+    ],
+)
+def test_formula_whitelist_new_functions(formula: str, expected: str) -> None:
+    assert od.normalize_formula(formula) == expected
+
+
+@pytest.mark.parametrize(
+    ("formula", "message"),
+    [
+        ("=B2*", "the formula ends with '*': a value is missing after it"),
+        ("=B2*/2", "'/' follows '*' without a value between them"),
+        ("=SUM()", "SUM has no arguments here; write it as SUM(B2:B9)"),
+        ("==B2", "the formula starts with '=='"),
+        ("=ROUND(B2)", "ROUND has 1 argument here; write it as ROUND(value, digits)"),
+        ("=IF(,1,2)", "an argument is missing before ','"),  # only arguments after the first may be left out
+        ("=(B2,C2)", "',' separates the arguments of a function"),
+        ("=SUMIFS(C2:C9,A2:A9)", "SUMIFS has 2 arguments here"),
+        ("=2B2", "'B2' follows '2' without an operator"),
+        ('=IF(B2>0;";1)', "a text in the formula is not closed"),
+        ("=SUMIF(A:A,1)", "whole columns (A:A) are not allowed: write the rows, e.g. $A$2:$A$50"),  # no sheet known
+        ("=C{row-1}+B{row}", "{row-1} (another row than the current one) is not possible in a column formula"),
+        ("=TIMEVALUE(C{row})", "give the column with the times the type time"),
+        ('=INDIRECT("A1")', "the function INDIRECT is not allowed"),
+        ("=" + "(" * 40 + "1" + ")" * 40, "nested too deeply"),
+    ],
+)
+def test_formula_syntax_is_checked(formula: str, message: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        od.normalize_formula(formula)
+
+
+def test_whole_columns_become_the_data_rows() -> None:
+    data = sheet(["Abteilung", {"header": "Kosten", "type": "currency"}], [["IT", 10], ["HR", 20], ["IT", 5]])
+    summary = {"name": "Summe", "columns": [{"header": "Abteilung"}, {"header": "Kosten", "type": "currency",
+               "formula": "=SUMIF(S!A:A,A{row},S!$B:$B)"}, {"header": "Anteil", "type": "percent",
+               "formula": "=B{row}/SUM(B:B)"}], "rows": [["IT"], ["HR"]]}  # fmt: skip
+    ws = excel([data, summary])[0]["Summe"]
+    assert ws["B2"].value == "=SUMIF('S'!$A$2:$A$4,A2,'S'!$B$2:$B$4)" and ws["C3"].value == "=B3/SUM($B$2:$B$3)"
+
+
+def test_whole_columns_in_a_cell_end_above_it() -> None:
+    """'=SUM(B:B)' in the total row would add up the cell itself (a circular reference)."""
+    total = sheet(["A", {"header": "B", "type": "number"}], [["Stuhl", 240], ["Tisch", 500], ["Summe", "=SUM(B:B)"]])
+    assert excel([total])[0]["S"]["B4"].value == "=SUM($B$2:$B$3)"
+    share = sheet(["A", {"header": "B", "type": "number"}, {"header": "C", "type": "percent"}],
+                  [["x", 1, "=B2/SUM(B:B)"], ["y", 3, None]])  # fmt: skip
+    assert excel([share])[0]["S"]["C2"].value == "=B2/SUM($B$2:$B$3)"  # another column: all data rows
+    between = sheet(["A", {"header": "B", "type": "number"}], [["x", 1], ["Summe", "=SUM(B:B)"], ["y", 3]])
+    assert "B:B in B3 includes B3 itself (a circular reference): write the rows to compute with, e.g. $B$2:$B$2" in (
+        invalid("create_excel_file", sheets=[between])
+    )
+    top = sheet(["A", {"header": "B", "type": "number"}], [["Summe", "=SUMME(B:B)"], ["x", 1], ["y", 3]])
+    assert "e.g. $B$3:$B$4" in invalid("create_excel_file", sheets=[top])
+
+
+@pytest.mark.parametrize(
+    ("formula", "expected"),
+    [
+        ('=A2&" ""x"""', '=A2&" ""x"""'),  # "" is a " inside a text
+        ('=WENN(A2="x";„[neu]“;"")', '=IF(A2="x","[neu]","")'),  # [ in a text with German quotes
+        ("=VLOOKUP(A2,$A$2:$C$9,2,)", "=VLOOKUP(A2,$A$2:$C$9,2,)"),  # arguments left out, as Excel allows
+        ("=IF(A2,,1)", "=IF(A2,,1)"),
+        ("=WENN(A2;;)", "=IF(A2,,)"),
+    ],
+)
+def test_formula_texts_and_left_out_arguments(formula: str, expected: str) -> None:
+    assert od.normalize_formula(formula, False) == expected
+    for unsafe in ("=[Book]S!A1", "='[Book]S'!A1", "=cmd|' /C calc'!A0", '=„x“&[Book]S!A1'):
+        with pytest.raises(od.UnsafeFormula):
+            od.normalize_formula(unsafe, False)
+    with pytest.raises(ValueError, match=re.escape("ROUND has 3 arguments here")):  # left out ones count
+        od.normalize_formula("=ROUND(A2,,)", False)
+
+
+def test_rows_as_objects_written_into_the_chart() -> None:
+    chart = {"type": "column", "category_column": "Artikel", "value_columns": ["Preis"],
+             "rows": [{"Artikel": "Stuhl", "Preis": 240}, {"Artikel": "Tisch", "Preis": 500}]}  # fmt: skip
+    columns = [{"header": "Artikel"}, {"header": "Preis", "type": "number"}]
+    ws = excel([{"name": "S", "columns": columns, "chart": chart}])[0]["S"]
+    assert (ws["A3"].value, ws["B3"].value, len(ws._charts)) == ("Tisch", 500, 1)
+
+
+def test_rejected_formulas_in_cells() -> None:
+    """A formula in a cell that is merely not allowed or broken comes back (it would be written as text); one that
+    reaches outside (HYPERLINK ...) stays text, a column of type text keeps everything as text."""
+    broken = sheet(["A", "B"], [["x", "=SUMMENPRODUKT(B2:B3;C2:C3)"]])
+    assert (
+        "sheets[0].rows[0]: the formula '=SUMMENPRODUKT(B2:B3;C2:C3)' in 'B' is not allowed: the function "
+        "SUMMENPRODUKT is not allowed: add a column with the product" in invalid("create_excel_file", sheets=[broken])
+    )
+    safe = sheet(["A", "B", {"header": "C", "type": "text"}],
+                 [["x", '=HYPERLINK("http://x")', "=SUMME(B2:"], ["y", "=> siehe unten", "=foo("]])  # fmt: skip
+    ws = excel([safe])[0]["S"]
+    assert ws["B2"].value == '=HYPERLINK("http://x")' and ws["B2"].data_type == "s"
+    assert (ws["B3"].value, ws["C2"].value, ws["C2"].data_type) == ("=> siehe unten", "=SUMME(B2:", "s")
+
+
+def test_dates_and_times() -> None:
+    dates = sheet(["A", {"header": "Datum", "type": "date"}], [["x", "22.10.26"], ["y", "2026-10-22 14:30"]])
+    ws = excel([dates], valves={"language": "de"})[0]["S"]
+    assert ws["B2"].value.date() == date(2026, 10, 22) and ws["B3"].value.hour == 14
+    assert ws["B2"].number_format == "DD.MM.YYYY hh:mm"
+    for value, message in [("05/11/2026", "could be day/month or month/day"), ("2026-11", "has no day"),
+                           ("31.11.2026", "is not a valid date"), ("14:30", "is a time")]:  # fmt: skip
+        result = invalid(
+            "create_excel_file", sheets=[sheet(["A", {"header": "Datum", "type": "date"}], [["x", value]])]
+        )
+        assert f"sheets[0].rows[0]: '{value}' {message}" in result
+    untyped = sheet(["A", "Datum", "Beginn"], [["x", "2026-11-02", "08:00"], ["y", "2026-11-03", "8:15 Uhr"]])
+    ws = excel([untyped])[0]["S"]
+    assert ws["B2"].value.date() == date(2026, 11, 2) and ws["C3"].number_format == "hh:mm"
+    work = sheet([{"header": "Beginn", "type": "time"}, {"header": "Ende", "type": "time"},
+                  {"header": "Dauer", "type": "time", "formula": "=B{row}-A{row}", "total": "sum"},
+                  {"header": "Stunden", "type": "number", "formula": "=(B{row}-A{row})*24", "total": "sum"}],
+                 [["08:00", "16:30"], ["08:15", "17:00"]])  # fmt: skip
+    wb = excel([work])[0]
+    ws = wb["S"]
+    assert ws["A2"].value.hour == 8 and ws["A2"].number_format == "hh:mm"
+    assert (ws["C2"].number_format, ws["C4"].value, ws["C4"].number_format) == ("[h]:mm", "=SUM(C2:C3)", "[h]:mm")
+    trap = {**work, "columns": [*work["columns"][:2], {"header": "Stunden", "type": "number",
+            "formula": "=B{row}-A{row}"}]}  # fmt: skip
+    assert "which Excel holds as fractions of a day (8 hours are 0.33), so this number column would show 0.35" in (
+        invalid("create_excel_file", sheets=[trap])
+    )
+    hours = {**work, "columns": [*work["columns"][:2], {"header": "Dauer", "type": "time",
+             "formula": "=(B{row}-A{row})*24"}]}  # fmt: skip
+    assert "multiplies the times by 24, so 8:30 would show as 204:00" in invalid("create_excel_file", sheets=[hours])
+    assert "write times as hh:mm" in invalid("create_excel_file", sheets=[{**work, "rows": [[8, "16:30"]]}])
+
+
+def test_currencies_of_the_values() -> None:
+    prices = sheet(["A", {"header": "Preis", "type": "currency", "total": "sum"},
+                    {"header": "Brutto", "type": "currency", "formula": "=B{row}*1.19"}],
+                   [["x", "$1,200.00"], ["y", "$5.50"]])  # fmt: skip
+    ws = excel([prices])[0]["S"]
+    assert ws["B2"].value == 1200 and ws["B2"].number_format == ws["C2"].number_format == od.CURRENCY_FORMATS["USD"]
+    assert ws["B4"].number_format == od.CURRENCY_FORMATS["USD"]  # the total row too
+    prices["rows"][1][1] = "5,50 €"
+    assert "the values have different currencies (USD, EUR)" in invalid("create_excel_file", sheets=[prices])
+    assert od.parse_number_text("1’234.50") == (1234.5, False) and od.parse_number_text("CHF 1'000.00") == (1000, False)
+
+
+def test_unambiguous_shapes_are_accepted() -> None:
+    rows = [{"Artikel": "Stuhl", "Preis (€)": 240}, {"Preis (€)": 890, "Artikel": "Tisch"}]
+    objects = sheet(["Artikel", {"header": "Preis (€)", "type": "currency"}], rows)
+    ws = excel([objects])[0]["S"]
+    assert [[c.value for c in row] for row in ws.iter_rows(min_row=2)] == [["Stuhl", 240], ["Tisch", 890]]
+    objects["rows"] = [{"Artikel": "Stuhl", "Preis": 240}]
+    assert "rows[0] is an object whose key 'Preis' is not a column header (Artikel, Preis (€))" in invalid(
+        "create_excel_file", sheets=[objects]
+    )
+    doc, _, _ = word(blocks=[{"type": "table", "rows": [["A", "B"], [None, "x"]]}], title="T")
+    assert [c.text for c in doc.tables[0].rows[1].cells] == ["", "x"]
+    prs, _ = powerpoint([{"layout": "table", "title": "T", "table": [["A", "B"], ["x", None]]}], title="D")
+    (shape,) = [s for s in prs.slides[0].shapes if s.has_table]
+    assert shape.table.cell(1, 1).text == ""
+    wrapped = json.dumps({"sheets": [sheet(["A"], [["x"]])], "title": "Inventar 2026"})
+    result, recorder = call("create_excel_file", sheets=wrapped)
+    assert result.startswith("Done") and recorder.download()[1] == "Inventar 2026.xlsx"
+    lost = json.dumps({"sheets": [sheet(["A"], [["x"]])], "notes": "Bitte prüfen"})
+    assert "sheets: 'notes' is not a parameter of this tool, its content would be lost" in invalid(
+        "create_excel_file", sheets=lost
+    )
+
+
+def test_formats_of_formula_columns_without_type() -> None:
+    plan = sheet(["Aufgabe", {"header": "Start", "type": "date"}, {"header": "Frist", "formula": "=B{row}+14"},
+                  {"header": "Menge", "type": "integer"}, {"header": "Preis", "type": "currency"},
+                  {"header": "Summe", "formula": "=D{row}*E{row}"}, {"header": "Tage", "formula": "=C{row}-B{row}"}],
+                 [["A", "2026-10-22", None, 3, 411.5]])  # fmt: skip
+    ws = excel([plan], valves={"language": "de"})[0]["S"]
+    assert [ws[f"{c}2"].number_format for c in "CFG"] == ["DD.MM.YYYY", od.CURRENCY_FORMATS["EUR"], "#,##0"]
+    wrong = {
+        **plan,
+        "columns": [*plan["columns"][:2], {"header": "Frist", "type": "currency", "formula": "=B{row}+14"}],
+    }
+    assert "the formula gives a date, which this currency column would show as a number" in invalid(
+        "create_excel_file", sheets=[{**wrong, "rows": [["A", "2026-10-22"]]}]
+    )
+
+
+def test_word_letter_without_title() -> None:
+    doc, filename, _ = word(blocks=[{"type": "paragraph", "text": "Sehr geehrte Frau Keller,"}])
+    assert [p.text for p in doc.paragraphs] == ["Sehr geehrte Frau Keller,"] and filename == "Document.docx"
+    assert not any(p.style.name == "Title" for p in doc.paragraphs)
+
+
+def test_excel_several_charts_with_units() -> None:
+    charts = [{"type": "line", "category_column": "Monat", "value_columns": ["Umsatz"], "unit": "EUR"},
+              {"type": "column", "category_column": "Monat", "value_columns": ["Kosten"]}]  # fmt: skip
+    data = sheet(["Monat", {"header": "Umsatz", "type": "currency"}, {"header": "Kosten", "type": "currency"}],
+                 [["Jan", 10, 4], ["Feb", 12, 5]], chart=charts)  # fmt: skip
+    ws = excel([data])[0]["S"]
+    assert len(ws._charts) == 2 and [c.anchor._from.row for c in ws._charts] == [1, 1 + od.CHART_ROWS]
+    assert ws._charts[0].y_axis.title is not None and ws._charts[1].y_axis.title is None
+    result = invalid("create_excel_file", sheets=[{**data, "chart": [*charts, {"value_columns": ["Gewinn"]}]}])
+    assert "sheets[0].chart[2].value_columns: 'Gewinn' is not a column header" in result
+    assert "at most 4 charts" in invalid("create_excel_file", sheets=[{**data, "chart": charts * 3}])
+    for chart, message in [({"type": "pi"}, "sheets[0].chart.type: Input should be"),
+                           ([{"type": "pi"}], "sheets[0].chart[0].type: Input should be"),
+                           ("Umsatz", "sheets[0].chart: Input should be an object (or a list of objects)")]:  # fmt: skip
+        result = invalid("create_excel_file", sheets=[{**data, "chart": chart}])
+        assert message in result and "valid list" not in result and "instance of" not in result
+
+
+def test_values_sent_in_formula_columns() -> None:
+    """Values that differ from what the formula computes: wrong letters or wrong values; 0 or the same value in
+    every row are placeholders."""
+    result = invalid("create_excel_file", sheets=[with_total("=B{row}*C{row}", [["Stuhl", 6, 240, 1440],
+                                                                                ["Tisch", 2, 890, 999]])])  # fmt: skip
+    assert "sheets[0].rows[1]: the formula =B{row}*C{row} of 'Summe' gives 1780 in this row, but the row sends 999" \
+           in result and "A=Artikel, B=Menge" in result  # fmt: skip
+    for rows in ([["Stuhl", 6, 240, 0], ["Tisch", 2, 890, 0]], [["Stuhl", 6, 240, 20], ["Tisch", 2, 890, 20]],
+                 [["Stuhl", 6, 240, 1440.4], ["Tisch", 2, 890, 1780]]):  # fmt: skip
+        assert excel([with_total("=B{row}*C{row}", rows)])[0]["S"]["D2"].value == "=B2*C2"
+
+
+def test_numbers_right_aligned_in_word_and_slide_tables() -> None:
+    rows = [["Posten", "Betrag", "Notiz"], ["Lizenz", "4.800 €", "jährlich"], ["Einrichtung", "-", "einmalig"]]
+    doc, _, _ = word(blocks=[{"type": "table", "rows": rows}], title="T")
+    assert [c.paragraphs[0].alignment for c in doc.tables[0].rows[1].cells] == [None, od.WD_ALIGN_PARAGRAPH.RIGHT,
+                                                                               None]  # fmt: skip
+    prs, _ = powerpoint([{"layout": "table", "title": "T", "table": rows}], title="D")
+    (shape,) = [s for s in prs.slides[0].shapes if s.has_table]
+    assert shape.table.cell(0, 1).text_frame.paragraphs[0].alignment == od.PP_ALIGN.RIGHT
+    assert shape.table.cell(1, 2).text_frame.paragraphs[0].alignment is None
+
+
+@pytest.mark.skipif(not shutil.which("soffice"), reason="needs LibreOffice")
+def test_new_formulas_compute_in_libreoffice() -> None:
+    """The functions written with _xlfn., times and whole columns give values, not #NAME? or Err:5xx."""
+    work = sheet([{"header": "Name"}, {"header": "Beginn", "type": "time"}, {"header": "Ende", "type": "time"},
+                  {"header": "Stunden", "type": "number", "formula": "=(C{row}-B{row})*24"},
+                  {"header": "Stufe", "formula": '=IFS(D{row}>8,"lang",TRUE,"kurz")'},
+                  {"header": "Max", "formula": "=MAXIFS(D:D,A:A,A{row})"},
+                  {"header": "Text", "formula": '=TEXTJOIN("-",TRUE,A{row},E{row})'},
+                  {"header": "Suche", "formula": "=XLOOKUP(A{row},A:A,D:D)"}],
+                 [["Ana", "08:00", "16:30"], ["Ben", "08:00", "16:00"]])  # fmt: skip
+    with tempfile.TemporaryDirectory() as tmp:
+        excel([work])[0].save(Path(tmp) / "work.xlsx")
+        subprocess.run(
+            ["soffice", f"-env:UserInstallation=file://{tmp}/profile", "--headless", "--convert-to", "xlsx",
+             "--outdir", f"{tmp}/out", "work.xlsx"],
+            cwd=tmp, check=True, capture_output=True, timeout=180,
+        )  # fmt: skip
+        ws = load_workbook(Path(tmp) / "out" / "work.xlsx", data_only=True).active  # with the computed values
+        assert [c.value for c in ws[2]][3:] == [8.5, "lang", 8.5, "Ana-lang", 8.5]
+        assert [c.value for c in ws[3]][3:] == [8, "kurz", 8, "Ben-kurz", 8]
 
 
 # ----------------------------------------------------------------------------------------- rendering --

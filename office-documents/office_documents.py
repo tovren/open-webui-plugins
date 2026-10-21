@@ -2,7 +2,7 @@
 title: Office Documents
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 0.2.1
+version: 0.3.0
 license: MIT
 required_open_webui_version: 0.11.4
 description: Lets the model create Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files. The model only supplies the content as structured JSON; fixed code builds the file, so no model-written code is ever run. The file is attached to the answer, where it can be previewed and downloaded.
@@ -12,7 +12,7 @@ Tools
   numbered lists (two levels), tables, quotes, page breaks, header text and page numbers; optionally
   with the header, footer and margins of a company template (word_template valve).
 - create_excel_file: several sheets with typed columns (text, number, integer, currency, percent,
-  date), row formulas from a checked whitelist, total rows and native Excel charts.
+  date, time), row formulas from a checked whitelist, total rows and native Excel charts.
 - create_powerpoint_file: 16:9 slides with the layouts title, section, bullets, two columns,
   table and chart (native PowerPoint charts), plus speaker notes.
 Inline **bold**, *italic* and [links](https://...) work in Word and PowerPoint; Excel cells get plain text.
@@ -21,9 +21,10 @@ Security & privacy
 - The model never writes code: it fills in a fixed JSON schema, the plugin validates it and builds
   the file. No shell, no network access, nothing is loaded from URLs.
 - Every formula, whether a column's `formula` field or a formula written into a cell, is checked against a
-  whitelist (SUM, IF, ROUND ...): only cells of the same workbook, no external references, no DDE, no
-  WEBSERVICE/HYPERLINK.
-  Anything else (e.g. "=HYPERLINK(...)") is written as text, also in the data sheets of PowerPoint charts.
+  whitelist (SUM, IF, ROUND, VLOOKUP ...): only cells of the same workbook, no external references, no DDE, no
+  WEBSERVICE/HYPERLINK/INDIRECT.
+  A cell value with such a function (e.g. "=HYPERLINK(...)") is written as text, also in the data sheets of
+  PowerPoint charts; other formulas that are not allowed go back to the model.
 - Links are only created for http, https and mailto. Limits on slides, rows, columns and text
   length keep a runaway model from blocking the server.
 - The file is stored in Open WebUI's own file storage under the user's account, so only the user
@@ -40,7 +41,7 @@ import logging
 import re
 import unicodedata
 import zipfile
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Iterator
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import Any, ClassVar, Literal, NamedTuple
@@ -90,6 +91,7 @@ from pydantic import (
     PrivateAttr,
     TypeAdapter,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -128,6 +130,7 @@ MAX_SLIDE_TABLE_ROWS = 16
 MAX_SLIDE_TABLE_COLUMNS = 8
 MAX_CHART_CATEGORIES = 50
 MAX_CHART_SERIES = 10
+MAX_SHEET_CHARTS = 4
 MAX_ERRORS_SHOWN = 8
 
 MIN_COLUMN_WIDTH = 8
@@ -315,8 +318,13 @@ class WordBlock(Schema):
 
     @field_validator("items")
     @classmethod
-    def _top_level(cls, items: list[str]) -> list[str]:
-        return top_level(items)
+    def _top_level(cls, items: list[str], info: ValidationInfo) -> list[str]:
+        return top_level(items, numbered=info.data.get("type") == "numbered")
+
+    @field_validator("rows", mode="before")
+    @classmethod
+    def _null_cells(cls, rows: Any) -> Any:
+        return null_cells(rows)
 
     @model_validator(mode="after")
     def _content_in_the_field_of_the_type(self) -> "WordBlock":
@@ -339,11 +347,13 @@ WORD_CONTENT_FIELDS = {
 
 class ExcelColumn(Schema):
     header: str = Field(description="Column header.")
-    type: Literal["text", "number", "integer", "currency", "percent", "date"] = Field(
+    type: Literal["text", "number", "integer", "currency", "percent", "date", "time"] = Field(
         default="text",
         description="Value type. percent: send 12.5 for 12.5 % (not 0.125); the cell then holds 0.125, as in "
         "Excel, so formulas use it as it is: =B{row}*(1-C{row}), without /100, and a percent formula column computes "
-        "the fraction (=B{row}/C{row}, without *100). date: YYYY-MM-DD.",
+        "the fraction (=B{row}/C{row}, without *100). date: YYYY-MM-DD. time: hh:mm; the cell holds the fraction of "
+        "a day, so a time column with =C{row}-B{row} shows 8:30, and hours as a number (8.5) need a number column "
+        "with =(C{row}-B{row})*24.",
     )
     formula: str = Field(
         default="",
@@ -374,6 +384,7 @@ class ExcelChart(Schema):
         description="Only when each data series is a row, e.g. months as columns: the labels in the first column of "
         'the rows to plot, e.g. ["Income", "Expenses"].',
     )
+    unit: str = Field(default="", description="Unit of the values, e.g. 'EUR' or 'hours'; shown at the value axis.")
 
 
 class ExcelSheet(Schema):
@@ -384,17 +395,48 @@ class ExcelSheet(Schema):
         description="Data rows. Each row has one value per column, in column order. Use JSON numbers for "
         "numbers and null for empty cells and formula columns.",
     )
-    chart: ExcelChart | None = Field(default=None, description="Optional chart next to the table.")
+    chart: ExcelChart | list[ExcelChart] | None = Field(
+        default=None, description=f"Optional chart next to the table; a list for up to {MAX_SHEET_CHARTS} charts."
+    )
 
     @model_validator(mode="before")
     @classmethod
-    def _fields_inside_the_chart(cls, data: Any) -> Any:
-        return take_out_of_chart(data, ("columns", "rows"))
+    def _rows_as_objects(cls, data: Any) -> Any:
+        """Rows written as objects with the column headers as keys ({"Artikel": "Stuhl", "Preis (€)": 240}) become
+        lists in column order; a key that is no header is sent back, its value would have no column. Columns and
+        rows written into the chart are taken back first, in the same validator: pydantic runs the 'before'
+        validators from the last to the first, so the order of two would decide."""
+        data = take_out_of_chart(data, ("columns", "rows"))
+        rows, columns = (data.get("rows"), data.get("columns")) if isinstance(data, dict) else (None, None)
+        if not isinstance(rows, list) or not isinstance(columns, list) or not any(isinstance(r, dict) for r in rows):
+            return data
+        headers = [str(c.get("header") or "").strip() if isinstance(c, dict) else "" for c in columns]
+        if len(set(headers)) < len(headers):
+            return data  # two columns with the same header: which one is meant is unclear
+        converted = []
+        for r, row in enumerate(rows):
+            if isinstance(row, dict):
+                values = {str(key).strip(): value for key, value in row.items()}
+                unknown = next((key for key in values if key not in headers), None)
+                if unknown is not None:
+                    raise ValueError(
+                        f"rows[{r}] is an object whose key '{unknown}' is not a column header ({', '.join(headers)}); "
+                        "send each row as a list of values in column order"
+                    )
+                row = [values.get(header) for header in headers]
+            converted.append(row)
+        return {**data, "rows": converted}
 
     @field_validator("chart", mode="before")
     @classmethod
     def _empty_chart_is_no_chart(cls, chart: Any) -> Any:
+        if isinstance(chart, list):
+            return [c for c in chart if c is not None and not (isinstance(c, dict) and not has_content(c))] or None
         return None if isinstance(chart, dict) and not has_content(chart) else chart
+
+    @property
+    def charts(self) -> list[ExcelChart]:
+        return self.chart if isinstance(self.chart, list) else [self.chart] if self.chart is not None else []
 
 
 class ChartSeries(Schema):
@@ -436,6 +478,11 @@ class Slide(Schema):
     def _top_level(cls, items: list[str]) -> list[str]:
         return top_level(items)
 
+    @field_validator("table", mode="before")
+    @classmethod
+    def _null_cells(cls, rows: Any) -> Any:
+        return null_cells(rows)
+
     @model_validator(mode="before")
     @classmethod
     def _fields_inside_the_chart(cls, data: Any) -> Any:
@@ -458,12 +505,36 @@ def take_out_of_chart(data: Any, fields: Collection[str]) -> Any:
     return {**data, **{k: chart[k] for k in moved}, "chart": {k: v for k, v in chart.items() if k not in moved}}
 
 
-def top_level(items: list[str]) -> list[str]:
-    """Models used to Markdown start every item with '- '; without any top-level item these are no sub items."""
+BULLET_MARKS = ("• ", "* ", "– ", "· ")  # written by the model in front of the items; the list adds its own
+ITEM_NUMBER_RE = re.compile(r"(\d{1,3})[.)]\s+(?=\S)")
+
+
+def top_level(items: list[str], numbered: bool = False) -> list[str]:
+    """Models used to Markdown start every item with '- '; without any top-level item these are no sub items. A
+    bullet ('• ', '* ', '– ') in front of every top-level item, or in a numbered list the numbers 1., 2., 3. …, would
+    be shown next to the list's own ('• • Punkt', '1. 1. Erstens'), so they are removed."""
     texts = [item.strip() for item in items if item.strip()]
     if texts and all(text.startswith(SUB_ITEM_PREFIX) for text in texts):
         return [item.strip()[len(SUB_ITEM_PREFIX) :].strip() for item in items]
-    return items
+    main = [text for text in texts if not text.startswith(SUB_ITEM_PREFIX)]
+    mark = next((mark for mark in BULLET_MARKS if main and all(text.startswith(mark) for text in main)), None)
+    numbers = [match and int(match[1]) for match in map(ITEM_NUMBER_RE.match, main)] if numbered else []
+    if mark is None and not (main and numbers == list(range(1, len(main) + 1))):
+        return items
+    result = []
+    for item in items:
+        if not item.strip() or item.strip().startswith(SUB_ITEM_PREFIX):
+            result.append(item)
+        else:
+            result.append(item.strip()[len(mark) :].strip() if mark else ITEM_NUMBER_RE.sub("", item.strip(), count=1))
+    return result
+
+
+def null_cells(rows: Any) -> Any:
+    """null in a table cell is an empty cell."""
+    if not isinstance(rows, list):
+        return rows
+    return [["" if cell is None else cell for cell in row] if isinstance(row, list) else row for row in rows]
 
 
 WORD_BLOCKS = TypeAdapter(list[WordBlock])
@@ -480,7 +551,9 @@ class InvalidInput(ValueError):
         self.errors = errors
 
 
-LOCATION_NOISE_RE = re.compile(r"(str|float|int|bool|list\[.*\]|function-.*)")
+LOCATION_NOISE_RE = re.compile(r"(str|float|int|bool|list\[.*\]|function-.*|[A-Z]\w*)")
+UNION_MEMBER_RE = re.compile(r"[A-Z]\w*|list\[[A-Z]\w*\]")  # 'ExcelChart', 'list[ExcelChart]': one chart or a list
+SHAPE_ERRORS = ("model_type", "list_type")
 
 
 def _location(parts: tuple[Any, ...]) -> str:
@@ -492,6 +565,24 @@ def _location(parts: tuple[Any, ...]) -> str:
     return text
 
 
+def _union_errors(errors: list[Any]) -> list[Any]:
+    """For a field that takes one object or a list of them (a sheet's chart), pydantic reports both: that the value
+    is no list and what is wrong in the object. Only the errors of the shape the model sent are kept."""
+    kept: list[Any] = []
+    for error in errors:
+        loc = error["loc"]
+        at = next((i for i, part in enumerate(loc) if isinstance(part, str) and UNION_MEMBER_RE.fullmatch(part)), None)
+        if at is not None and error["type"] in SHAPE_ERRORS and len(loc) == at + 1:
+            rivals = [other for other in errors if other is not error and other["loc"][:at] == loc[:at]]
+            if any(len(other["loc"]) > at + 1 or other["type"] not in SHAPE_ERRORS for other in rivals):
+                continue  # the other shape has the real problem
+            if any(k["loc"][:at] == loc[:at] for k in kept):
+                continue
+            error = {**error, "msg": "Input should be an object (or a list of objects)"}
+        kept.append(error)
+    return kept
+
+
 def parse_argument(adapter: TypeAdapter, value: Any, name: str, extras: dict[str, Any] | None = None) -> Any:
     """Validate a tool argument.
 
@@ -501,6 +592,15 @@ def parse_argument(adapter: TypeAdapter, value: Any, name: str, extras: dict[str
     """
     if isinstance(value, str):
         value = _loads_argument(value, name, extras)
+    if isinstance(value, dict) and isinstance(value.get(name), list) and len(value) > 1:
+        # {"sheets": [...], "title": "T"}: all parameters in one object
+        others = {k: v for k, v in value.items() if k != name}
+        lost = next((k for k, v in others.items() if k not in TOOL_PARAMETERS and has_content(v)), None)
+        if lost is not None:
+            raise InvalidInput([f"{name}: '{lost}' is not a parameter of this tool, its content would be lost"])
+        if extras is not None:
+            extras.update({k: v for k, v in others.items() if k in TOOL_PARAMETERS})
+        value = value[name]
     if isinstance(value, dict) and len(value) == 1 and isinstance(next(iter(value.values())), list):
         value = next(iter(value.values()))  # {"slides": [...]} instead of [...]
     value = _unescape_newlines(value)
@@ -516,8 +616,9 @@ def parse_argument(adapter: TypeAdapter, value: Any, name: str, extras: dict[str
         result = adapter.validate_python(value)
     except ValidationError as e:
         raise InvalidInput(
-            [f"{_location((name, *err['loc']))}: {err['msg'].removeprefix('Value error, ')}" for err in e.errors()]
-        ) from e
+            [f"{_location((name, *err['loc']))}: {err['msg'].removeprefix('Value error, ')}"
+             for err in _union_errors(e.errors())]
+        ) from e  # fmt: skip
     for i, item in enumerate(result):
         item._index = i
     return result
@@ -628,8 +729,10 @@ def open_brackets(text: str, end: int) -> str:
 
 HTML_BREAK_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
 ESCAPED_UNICODE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
-ESCAPED_UNICODE_ONLY_RE = re.compile(r"(?:[^\\]|\\u[0-9a-fA-F]{4}|\\n)*", re.DOTALL)
-ESCAPED_NEWLINES_RE = re.compile(r"(?:[^\\]|\\n)*\\n(?:[^\\]|\\n)*", re.DOTALL)
+# A backslash that starts something other than \\uXXXX or \\n (than \\n). Searched for instead of matching the whole
+# text: such a pattern with \\n in two places took quadratic time ('\\n' * 30000 + '\\x': seconds, holding the GIL).
+OTHER_THAN_UNICODE_RE = re.compile(r"\\(?!u[0-9a-fA-F]{4}|n)")
+OTHER_THAN_NEWLINE_RE = re.compile(r"\\(?!n)")
 
 
 def _unescape_newlines(value: Any) -> Any:
@@ -638,9 +741,10 @@ def _unescape_newlines(value: Any) -> Any:
     'C:\\neu\\Ordner' stays as it is."""
     if isinstance(value, str):
         value = HTML_BREAK_RE.sub("\n", value)
-        if "\\u" in value and ESCAPED_UNICODE_ONLY_RE.fullmatch(value):  # '\\u2013' escaped twice
+        if "\\u" in value and not OTHER_THAN_UNICODE_RE.search(value):  # '\\u2013' escaped twice
             value = ESCAPED_UNICODE_RE.sub(lambda m: chr(int(m[1], 16)), value)
-        return value.replace("\\n", "\n") if "\n" not in value and ESCAPED_NEWLINES_RE.fullmatch(value) else value
+        escaped = "\\n" in value and "\n" not in value and not OTHER_THAN_NEWLINE_RE.search(value)
+        return value.replace("\\n", "\n") if escaped else value
     if isinstance(value, dict):
         return {k: _unescape_newlines(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -649,7 +753,7 @@ def _unescape_newlines(value: Any) -> Any:
 
 
 GARBLED_KEY_RE = re.compile(r'",[a-z_]+:|\}\s*,\s*\{\s*[a-z_]+:')  # 'paragraph",text:', '},{text:' in a text
-PLAIN_KEY_RE = re.compile(r"[\w -]+")  # '"name' or '{type' as a key: the syntax broke there
+PLAIN_KEY_RE = re.compile(r'[^"{}\[\]:\\<>|]+')  # '"name' or '{type' as a key: the syntax broke there
 
 
 def _garbled(value: Any) -> bool:
@@ -675,17 +779,26 @@ def _contains(value: Any, token: str) -> bool:
 TABLE_LINE_RE = re.compile(r"^\s*\|.*\|\s*$")
 TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
 LIST_LINE_RE = re.compile(r"^(?P<indent>\s*)(?:(?P<bullet>[-*•])|(?P<number>\d{1,3})[.)])\s+(?P<text>\S.*)$")
+HEADING_LINE_RE = re.compile(r"^\s{0,3}(?P<level>#{1,6})\s+(?P<text>\S.*?)(?:\s+#+)?\s*$")
+RULE_LINE_RE = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")  # ---, ***, ___
 
 
 def split_paragraph(text: str) -> list[tuple[str, list[str]]]:
-    """Split paragraph text into ("text", lines), ("bullets", items) and ("numbered", items) parts.
+    """Split paragraph text into ("text", lines), ("bullets", items), ("numbered", items), ("table", lines) and
+    ("heading1" to "heading3", [text]) parts.
 
-    Models often write Markdown lists into a paragraph; indented list lines become '- ' sub items.
-    Numbered lines only form a list when they count up from 1, so lines that merely start with a
-    number ('3. Oktober ist Feiertag.') stay text.
+    Models often write Markdown into a paragraph: lists (indented list lines become '- ' sub items), tables,
+    headings ('## Abschnitt') and rules ('---', left out). Numbered lines only form a list when they count up
+    from 1, so lines that merely start with a number ('3. Oktober ist Feiertag.') stay text.
     """
     parts: list[tuple[str, list[str]]] = []
     for line in text.strip().split("\n"):
+        if RULE_LINE_RE.match(line):
+            parts.append(("break", []))
+            continue
+        if heading := HEADING_LINE_RE.match(line):
+            parts.append((f"heading{min(len(heading['level']), MAX_HEADING_LEVEL)}", [heading["text"]]))
+            continue
         if TABLE_LINE_RE.match(line):  # a Markdown table row
             if parts and parts[-1][0] == "table":
                 parts[-1][1].append(line)
@@ -846,13 +959,9 @@ def wrap_array_run(text: str, pos: int) -> str | None:
     return text[:start] + "[" + text[start:end] + "]" + text[end:]
 
 
-def close_brackets(text: str) -> str:
-    """Add closing brackets the text forgot: before a bracket that closes an outer one, and at the end."""
-    return _close_brackets(text)[0]
-
-
 def _close_brackets(text: str) -> tuple[str, int]:
-    """close_brackets, plus the number of brackets added at the end."""
+    """Add closing brackets the text forgot (before a bracket that closes an outer one, and at the end); returns the
+    text and the number of brackets added at the end."""
     out: list[str] = []
     stack: list[str] = []
     in_string = escaped = False
@@ -1117,11 +1226,12 @@ class WordOptions:
     template: bytes | None = None  # see read_word_template
 
 
-def word_title(title: str, blocks: list[WordBlock], fallback: str) -> tuple[str, list[WordBlock]]:
+def word_title(title: str, blocks: list[WordBlock], fallback: str = "") -> tuple[str, list[WordBlock]]:
     """Return the document title and the blocks without a first heading that only repeats it.
 
     Models often leave out the title and start with it as a heading instead, or pass a file name
-    ('Minutes_2026_10_12'). Then the first heading becomes the title.
+    ('Minutes_2026_10_12'). Then the first heading becomes the title. Without either, the title is `fallback`;
+    an empty title means no title block (a letter), the file name then falls back to the default title.
     """
     title = re.sub(r"\.(docx?)$", "", to_plain(title).strip(), flags=re.IGNORECASE)
     first = blocks[0] if blocks and blocks[0].type == "heading" and blocks[0].text.strip() else None
@@ -1166,10 +1276,16 @@ def check_word(options: WordOptions, blocks: list[WordBlock]) -> None:
     for i, block in enumerate(blocks):
         where = f"blocks[{block._index if block._index >= 0 else i}] ({block.type})"
         check.text(block.text, *block.items, *(cell for row in block.rows for cell in row))
-        if block.type == "table":
-            columns = table_columns(block.rows)
-            check.require(columns <= MAX_WORD_TABLE_COLUMNS, f"{where}: at most {MAX_WORD_TABLE_COLUMNS} columns")
-            check.require(len(block.rows) <= MAX_WORD_TABLE_ROWS, f"{where}: at most {MAX_WORD_TABLE_ROWS} rows")
+        tables = [block.rows] if block.type == "table" else []
+        if block.type == "paragraph":  # Markdown tables in the text become tables too
+            tables = [markdown_table_rows(lines) for kind, lines in split_paragraph(block.text) if kind == "table"]
+        for rows in tables:
+            table = "" if block.type == "table" else " (the Markdown table in the text)"
+            columns = table_columns(rows)
+            check.require(
+                columns <= MAX_WORD_TABLE_COLUMNS, f"{where}: at most {MAX_WORD_TABLE_COLUMNS} columns{table}"
+            )
+            check.require(len(rows) <= MAX_WORD_TABLE_ROWS, f"{where}: at most {MAX_WORD_TABLE_ROWS} rows{table}")
     check.raise_if_failed()
 
 
@@ -1272,6 +1388,17 @@ def table_columns(rows: list[list[str]]) -> int:
     """Number of columns: the header's, or more if a row has more non-empty cells (trailing empty cells don't count)."""
     used = [max((i + 1 for i, cell in enumerate(row) if str(cell).strip()), default=0) for row in rows]
     return max(len(rows[0]), *used, 1)
+
+
+def number_columns(rows: list[list[str]], columns: int) -> list[bool]:
+    """Columns whose cells below the header are all numbers ('4.800 €', '12 %', '-3,5'; empty cells and placeholders
+    such as '-' aside); Word and slide tables align them right."""
+    result = []
+    for c in range(columns):
+        texts = [to_plain(str(row[c])) for row in rows[1:] if c < len(row) and str(row[c]).strip()]
+        texts = [text for text in texts if text.lower() not in PLACEHOLDERS]
+        result.append(bool(texts) and all(parse_number_text(text) is not None for text in texts))
+    return result
 
 
 def column_widths(rows: list[list[str]], columns: int, total: int, font_size: float = 11) -> list[int]:
@@ -1478,12 +1605,13 @@ class DocxWriter:
             sum(len(b.text) + sum(map(len, b.items)) for b in blocks) + 40 * len(blocks) > LONG_DOCUMENT_CHARS
         )
         self._page_setup()
-        last = self.doc.add_heading(to_plain(self.options.title), level=0)
+        last = self.doc.add_heading(to_plain(self.options.title), level=0) if self.options.title.strip() else None
         if self.options.subtitle.strip():
             last = self.doc.add_paragraph(style="Subtitle")
             self._add_runs(last, parse_inline(self.options.subtitle))
-        _set_borders(last._p.get_or_add_pPr(), "w:pBdr", PPR_AFTER_BORDERS, [("bottom", 12, self.design.accent)])
-        last.paragraph_format.space_after = Pt(18)
+        if last is not None:  # without a title and subtitle (a letter) there is no title block
+            _set_borders(last._p.get_or_add_pPr(), "w:pBdr", PPR_AFTER_BORDERS, [("bottom", 12, self.design.accent)])
+            last.paragraph_format.space_after = Pt(18)
         if self.options.table_of_contents:
             self._table_of_contents()
         for block in blocks:
@@ -1578,7 +1706,9 @@ class DocxWriter:
             if kind == "text":
                 self._add_runs(self.doc.add_paragraph(style=self.body_style), parse_inline("\n".join(lines)))
             elif kind == "table":
-                self._table(markdown_table_rows(lines)[:MAX_WORD_TABLE_ROWS])
+                self._table(markdown_table_rows(lines))
+            elif kind.startswith("heading"):
+                self.doc.add_heading(to_plain(lines[0]), level=int(kind[-1]))
             else:
                 self._list(lines, ordered=kind == "numbered")
 
@@ -1621,6 +1751,7 @@ class DocxWriter:
         _set_cell_margins(table, top=50, bottom=50)
         section = self.doc.sections[-1]
         widths = column_widths(rows, columns, section.page_width - section.left_margin - section.right_margin)
+        numbers = number_columns(rows, columns)
         cells = table._cells  # once: row.cells and column.cells rebuild the whole grid on every call
         for c, (column, width) in enumerate(zip(table.columns, widths, strict=True)):
             column.width = width  # read by LibreOffice
@@ -1639,6 +1770,8 @@ class DocxWriter:
                     paragraph.style = self.body_style
                 paragraph.paragraph_format.space_after = Pt(0)
                 paragraph.paragraph_format.line_spacing = 1.0
+                if numbers[column]:
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
                 self._add_runs(
                     paragraph, parse_inline(text, Run("", bold=row_index == 0)), WHITE if row_index == 0 else None
                 )
@@ -1699,7 +1832,8 @@ def markdown_items(items: list[str], ordered: bool = False) -> str:
 
 
 def word_markdown(options: WordOptions, blocks: list[WordBlock]) -> str:
-    parts = [f"# {to_plain(options.title)}", f"*{options.subtitle.strip()}*" if options.subtitle.strip() else ""]
+    parts = [f"# {to_plain(options.title)}" if options.title.strip() else ""]
+    parts.append(f"*{options.subtitle.strip()}*" if options.subtitle.strip() else "")
     for block in blocks:
         if block.type == "heading":
             parts.append("#" * (min(max(block.level, 1), MAX_HEADING_LEVEL) + 1) + " " + to_plain(block.text))
@@ -1728,48 +1862,120 @@ def build_docx(options: WordOptions, blocks: list[WordBlock], texts: dict[str, s
 # ----------------------------------------------------------------------------------------------- Excel --
 
 GERMAN_FUNCTIONS = {
-    "SUMME": "SUM",
-    "MITTELWERT": "AVERAGE",
-    "ANZAHL": "COUNT",
-    "ANZAHL2": "COUNTA",
-    "WENN": "IF",
-    "WENNFEHLER": "IFERROR",
-    "UND": "AND",
-    "ODER": "OR",
-    "NICHT": "NOT",
-    "RUNDEN": "ROUND",
-    "AUFRUNDEN": "ROUNDUP",
-    "ABRUNDEN": "ROUNDDOWN",
-    "ZÄHLENWENN": "COUNTIF",
-    "SUMMEWENN": "SUMIF",
-    "MITTELWERTWENN": "AVERAGEIF",
-    "PRODUKT": "PRODUCT",
-    "POTENZ": "POWER",
-    "WURZEL": "SQRT",
-    "REST": "MOD",
-    "GANZZAHL": "INT",
-    "BETRAG": "ABS",
-}
-FORMULA_FUNCTIONS = {
-    "SUM", "AVERAGE", "MIN", "MAX", "MEDIAN", "COUNT", "COUNTA", "COUNTIF", "SUMIF", "AVERAGEIF",
-    "IF", "IFERROR", "AND", "OR", "NOT", "ROUND", "ROUNDUP", "ROUNDDOWN", "ABS", "PRODUCT", "POWER",
-    "SQRT", "MOD", "INT",
+    "SUMME": "SUM", "MITTELWERT": "AVERAGE", "ANZAHL": "COUNT", "ANZAHL2": "COUNTA", "WENN": "IF", "WENNS": "IFS",
+    "WENNFEHLER": "IFERROR", "UND": "AND", "ODER": "OR", "NICHT": "NOT", "RUNDEN": "ROUND", "AUFRUNDEN": "ROUNDUP",
+    "ABRUNDEN": "ROUNDDOWN", "ZÄHLENWENN": "COUNTIF", "ZÄHLENWENNS": "COUNTIFS", "SUMMEWENN": "SUMIF",
+    "SUMMEWENNS": "SUMIFS", "MITTELWERTWENN": "AVERAGEIF", "MITTELWERTWENNS": "AVERAGEIFS", "MAXWENNS": "MAXIFS",
+    "MINWENNS": "MINIFS", "PRODUKT": "PRODUCT", "POTENZ": "POWER", "WURZEL": "SQRT", "REST": "MOD",
+    "GANZZAHL": "INT", "BETRAG": "ABS", "SVERWEIS": "VLOOKUP", "XVERWEIS": "XLOOKUP", "VERGLEICH": "MATCH",
+    "DATUM": "DATE", "HEUTE": "TODAY", "JAHR": "YEAR", "MONAT": "MONTH", "TAG": "DAY", "EDATUM": "EDATE",
+    "MONATSENDE": "EOMONTH", "NETTOARBEITSTAGE": "NETWORKDAYS", "WOCHENTAG": "WEEKDAY", "ZEIT": "TIME",
+    "STUNDE": "HOUR", "LINKS": "LEFT", "RECHTS": "RIGHT", "LÄNGE": "LEN", "VERKETTEN": "CONCATENATE",
+    "TEXTKETTE": "CONCAT", "TEXTVERKETTEN": "TEXTJOIN", "ISTLEER": "ISBLANK", "ISTZAHL": "ISNUMBER",
+    "ISTTEXT": "ISTEXT",
+    # not allowed, named in English in the message
+    "ZEITWERT": "TIMEVALUE", "DATWERT": "DATEVALUE", "SUMMENPRODUKT": "SUMPRODUCT", "INDIREKT": "INDIRECT",
+    "BEREICH.VERSCHIEBEN": "OFFSET", "ZELLE": "CELL", "WEBDIENST": "WEBSERVICE", "XMLFILTERN": "FILTERXML",
 }  # fmt: skip
+# The whitelist: (fewest arguments, most arguments, how the function is written); a wrong count gets the last back.
+FUNCTION_ARGUMENTS: dict[str, tuple[int, int, str]] = {
+    "SUM": (1, 255, "SUM(B2:B9)"),
+    "AVERAGE": (1, 255, "AVERAGE(B2:B9)"),
+    "MIN": (1, 255, "MIN(B2:B9)"),
+    "MAX": (1, 255, "MAX(B2:B9)"),
+    "MEDIAN": (1, 255, "MEDIAN(B2:B9)"),
+    "COUNT": (1, 255, "COUNT(B2:B9)"),
+    "COUNTA": (1, 255, "COUNTA(B2:B9)"),
+    "COUNTIF": (2, 2, 'COUNTIF(range, criterion), e.g. COUNTIF($A$2:$A$9, "Ja")'),
+    "COUNTIFS": (2, 254, "COUNTIFS(range1, criterion1, range2, criterion2, ...)"),
+    "SUMIF": (2, 3, "SUMIF(range, criterion, sum_range), e.g. SUMIF($A$2:$A$9, A{row}, $C$2:$C$9)"),
+    "SUMIFS": (3, 255, "SUMIFS(sum_range, range1, criterion1, range2, criterion2, ...)"),
+    "AVERAGEIF": (2, 3, "AVERAGEIF(range, criterion, average_range)"),
+    "AVERAGEIFS": (3, 255, "AVERAGEIFS(average_range, range1, criterion1, ...)"),
+    "MAXIFS": (3, 255, "MAXIFS(max_range, range1, criterion1, ...)"),
+    "MINIFS": (3, 255, "MINIFS(min_range, range1, criterion1, ...)"),
+    "IF": (2, 3, 'IF(condition, value_if_true, value_if_false), e.g. IF(B{row}>100, "hoch", "niedrig")'),
+    "IFS": (2, 254, "IFS(condition1, value1, condition2, value2, ...)"),
+    "IFERROR": (2, 2, "IFERROR(value, value_if_error), e.g. IFERROR(B{row}/C{row}, 0)"),
+    "AND": (1, 255, "AND(condition1, condition2, ...)"),
+    "OR": (1, 255, "OR(condition1, condition2, ...)"),
+    "NOT": (1, 1, "NOT(condition)"),
+    "ROUND": (2, 2, "ROUND(value, digits), e.g. ROUND(B{row}*0.19, 2)"),
+    "ROUNDUP": (2, 2, "ROUNDUP(value, digits)"),
+    "ROUNDDOWN": (2, 2, "ROUNDDOWN(value, digits)"),
+    "ABS": (1, 1, "ABS(value)"),
+    "PRODUCT": (1, 255, "PRODUCT(B{row}, C{row})"),
+    "POWER": (2, 2, "POWER(number, power)"),
+    "SQRT": (1, 1, "SQRT(number)"),
+    "MOD": (2, 2, "MOD(number, divisor)"),
+    "INT": (1, 1, "INT(number)"),
+    "VLOOKUP": (3, 4, "VLOOKUP(value, $A$2:$C$9, column_number, FALSE)"),
+    "XLOOKUP": (3, 6, "XLOOKUP(value, $A$2:$A$9, $C$2:$C$9)"),
+    "INDEX": (2, 3, "INDEX($C$2:$C$9, row_number)"),
+    "MATCH": (2, 3, "MATCH(value, $A$2:$A$9, 0)"),
+    "DATE": (3, 3, "DATE(year, month, day)"),
+    "TODAY": (0, 0, "TODAY()"),
+    "YEAR": (1, 1, "YEAR(date)"),
+    "MONTH": (1, 1, "MONTH(date)"),
+    "DAY": (1, 1, "DAY(date)"),
+    "EDATE": (2, 2, "EDATE(start_date, months)"),
+    "EOMONTH": (2, 2, "EOMONTH(start_date, months)"),
+    "NETWORKDAYS": (2, 3, "NETWORKDAYS(start_date, end_date, holidays)"),
+    "WEEKDAY": (1, 2, "WEEKDAY(date, 2)"),
+    "TIME": (3, 3, "TIME(hours, minutes, seconds)"),
+    "HOUR": (1, 1, "HOUR(time)"),
+    "MINUTE": (1, 1, "MINUTE(time)"),
+    "LEFT": (1, 2, "LEFT(text, count)"),
+    "RIGHT": (1, 2, "RIGHT(text, count)"),
+    "LEN": (1, 1, "LEN(text)"),
+    "CONCATENATE": (1, 255, 'CONCATENATE(A{row}, " ", B{row})'),
+    "CONCAT": (1, 254, 'CONCAT(A{row}, " ", B{row})'),
+    "TEXTJOIN": (3, 252, 'TEXTJOIN(", ", TRUE, A{row}, B{row})'),
+    "ISBLANK": (1, 1, "ISBLANK(B{row})"),
+    "ISNUMBER": (1, 1, "ISNUMBER(B{row})"),
+    "ISTEXT": (1, 1, "ISTEXT(B{row})"),
+}
+PAIRED_ARGUMENTS = {"SUMIFS": 1, "AVERAGEIFS": 1, "MAXIFS": 1, "MINIFS": 1, "COUNTIFS": 0, "IFS": 0}  # before the pairs
+FORMULA_FUNCTIONS = set(FUNCTION_ARGUMENTS)
+NEW_FUNCTIONS = {"XLOOKUP", "IFS", "MAXIFS", "MINIFS", "CONCAT", "TEXTJOIN"}  # Excel 2019 and later: _xlfn. in the file
+# Functions that load data from outside or reach cells by computed addresses; a cell value with one stays text.
+BLOCKED_FUNCTIONS = {
+    "HYPERLINK", "WEBSERVICE", "FILTERXML", "INDIRECT", "OFFSET", "CELL", "INFO", "CALL", "REGISTER", "REGISTER.ID",
+    "EXEC", "RTD", "DDE", "IMAGE", "IMPORTXML", "IMPORTDATA", "IMPORTRANGE", "ENCODEURL", "EVALUATE",
+}  # fmt: skip
+FUNCTION_ALTERNATIVES = {  # for functions models often try
+    "TIMEVALUE": "give the column with the times the type time, its cells hold them as numbers: =C{row}-B{row}",
+    "DATEVALUE": "give the column with the dates the type date, its cells hold them as numbers: =C{row}-B{row}",
+    "TEXT": "the column type sets how a value is shown (date, time, currency, percent)",
+    "SUMPRODUCT": "add a column with the product of each row (=B{row}*C{row}) and SUM it",
+    "DATEDIF": "subtract the dates: =C{row}-B{row} gives the days between them",
+    "SWITCH": "use IFS or IF",
+}
 FORMULA_CONSTANTS = {"TRUE": "TRUE", "FALSE": "FALSE", "WAHR": "TRUE", "FALSCH": "FALSE"}
 FORMULA_TOKEN_RE = re.compile(  # [0-9], not \d: \d also matches digits of other scripts
     r"(?P<space>\s+)"
-    r'|(?P<string>"[^"]*")'
+    r'|(?P<string>"(?:[^"]|"")*"|[„“”][^"„“”\n]*[“”])'  # "" is a " in a text; German quotes („ja“) are repaired
     r"|(?P<sheet>(?:'(?P<quoted>(?:[^']|'')+)'|(?P<bare>[^\W\d][\w.]*))!)"  # 'Rates 2026'!, Rates!
-    r"|(?P<function>[A-Za-zÄÖÜäöü][A-Za-z0-9ÄÖÜäöü.]*)\s*\("
+    r"|(?P<function>(?:_xlfn\.)?[A-Za-zÄÖÜäöü][A-Za-z0-9ÄÖÜäöü.]*)\s*\("
+    r"|(?P<columns>\$?(?P<first>[A-Za-z]{1,3}):\$?(?P<last>[A-Za-z]{1,3}))(?![A-Za-z0-9_(])"  # whole columns: B:B
     r"|(?P<cell>\$?(?P<column>[A-Za-z]{1,3})(?P<row_absolute>\$?)(?P<row>[1-9][0-9]{0,6}|\{row\}))(?![A-Za-z0-9_])"
+    r"|(?P<shifted>\$?[A-Za-z]{1,3}\$?\{row\s*[-+]\s*[0-9]+\})"  # B{row-1}
     r"|(?P<name>[A-Za-z]+)(?![A-Za-z0-9_(])"
     r"|(?P<number>[0-9]+(?:\.[0-9]+)?)"
     r"|(?P<operator><=|>=|<>|[-+*/^&=<>(),;:%])"
 )
 DECIMAL_COMMA_RE = re.compile(r",([0-9]+)(?![0-9A-Za-z(])")
 MAX_EXCEL_COLUMN, MAX_EXCEL_ROW = 16_384, 1_048_576  # XFD, the last column; the last row
-OPERAND_KINDS = ("cell", "number", "string", "name")
+MAX_FORMULA_DEPTH = 30  # parentheses inside each other
+OPERAND_KINDS = ("cell", "number", "string", "name", "columns")
 FIRST_DATA_ROW = "2"
+OPERATOR_LEVELS = (("=", "<>", "<", ">", "<=", ">="), ("&",), ("+", "-"), ("*", "/"), ("^",))  # lowest first
+ARITHMETIC = {"+", "-", "*", "/", "^"}
+SHIFTED_ROW_HINT = (
+    "{row-1} (another row than the current one) is not possible in a column formula; write such formulas into the "
+    "cells instead, e.g. a running balance in column D: '=B2-C2' in the first row, '=D2+B3-C3' in the second, "
+    "'=D3+B4-C4' in the third"
+)
 
 
 def _column_number(letters: str) -> int:
@@ -1788,28 +1994,70 @@ def sheet_lookup(sheets: list[ExcelSheet], names: list[str]) -> dict[str, str]:
     return lookup
 
 
-def normalize_formula(formula: str, infer_row: bool = True, sheets: dict[str, str] | None = None) -> str:
-    """Check a formula against the whitelist and return it in Excel's file syntax (English names, commas).
+def _sheet_prefix(name: str) -> str:
+    return "'" + name.replace("'", "''") + "'!"
+
+
+class UnsafeFormula(ValueError):
+    """A formula that reaches outside of the workbook or computes cell addresses (other workbooks, DDE, HYPERLINK,
+    INDIRECT ...)."""
+
+
+class FormulaToken(NamedTuple):
+    kind: str  # string, function, cell, name, number, operator
+    text: str  # in Excel's file syntax: English names, ',' between arguments, a cell with its sheet ('Rates'!$B$3)
+    sheet: str = ""  # cells: the written name of another sheet, "" for the formula's own sheet
+    column: str = ""  # cells: the column letters in upper case
+    row: str = ""  # cells: the row number or "{row}"
+    absolute: bool = False  # cells: the row is fixed ($3)
+
+
+def _outside_texts(text: str) -> str:
+    """The formula without its texts, split into tokens as parse_formula splits it: '"[neu]"', '„[neu]“' and
+    '"a""[b]"' are texts, '[Book]S!A1' and 'cmd|x' are not."""
+    parts, position = [], 1
+    while position < len(text):
+        match = FORMULA_TOKEN_RE.match(text, position)
+        if match is None:
+            parts.append(text[position])
+            position += 1
+        else:
+            parts.append("" if match.lastgroup == "string" else match.group())
+            position = match.end()
+    return "".join(parts)
+
+
+def parse_formula(
+    formula: str,
+    sheets: dict[str, str] | None = None,
+    last_rows: dict[str, int] | None = None,
+    cell: tuple[str, int, int] | None = None,
+) -> list[FormulaToken]:
+    """Check a formula against the whitelist and return its tokens in Excel's file syntax (without spaces).
 
     Only cell references of this workbook (other sheets by the names in `sheets`, see sheet_lookup), numbers,
-    quoted text, operators and whitelisted functions are allowed. External workbooks ([...]), DDE (|) and every
-    other function are rejected. With ';' as separator (German Excel), commas in numbers are decimal commas;
-    outside of functions a comma between digits is always one. A column formula (infer_row) without {row} whose
-    cells of its own sheet all point to the first data row ('=B2*C2') gets {row} there, so every row computes its
-    own values; a cell of another sheet has to say which: 'Rates'!$B$3 or 'Rates'!B{row}. Raises ValueError with
-    a message for the model.
+    quoted text, operators and whitelisted functions are allowed. Other workbooks ([...]), DDE (|) and the
+    BLOCKED_FUNCTIONS raise UnsafeFormula, everything else that is not allowed ValueError, with a message for the
+    model. With ';' as separator (German Excel), commas in numbers are decimal commas; outside of functions a comma
+    between digits is always one. Whole columns (B:B) become the data rows, from `last_rows` (the last data row by
+    written sheet name, "" for the formula's own sheet). In a formula of one cell (`cell`: the written name of its
+    sheet, its column number and row), whole columns with the cell itself end in the row above it: a total below
+    the data ('=SUM(B:B)' in B4 adds up $B$2:$B$3).
     """
     text = XML_ILLEGAL_RE.sub("", formula).strip()
     if not text.startswith("="):
         text = "=" + text  # models sometimes leave out the "="
     if len(text) > MAX_FORMULA_CHARS:
         raise ValueError(f"a formula may have at most {MAX_FORMULA_CHARS} characters")
-    german = ";" in re.sub(r'"[^"]*"|\'(?:[^\']|\'\')*\'', "", text)  # outside of texts and sheet names
+    if text.count('"') % 2:
+        raise ValueError('a text in the formula is not closed: a text needs a " at both ends ("" is an empty text)')
+    outside_texts = _outside_texts(text)
+    if "[" in outside_texts or "|" in outside_texts:  # a sheet name cannot have [ ]
+        raise UnsafeFormula("references to other workbooks ([...]) and DDE (|) are not allowed")
+    german = ";" in re.sub(r"'(?:[^']|'')*'", "", outside_texts)  # outside of texts and sheet names
     hint = " (cells of another sheet: 'Sheet name'!B3)" if "!" in text else ""
-    parts: list[str] = []
-    cells: list[tuple[int, re.Match[str], str]] = []  # (index in parts, match, sheet or "") of every cell reference
-    sheet = ""  # the sheet of the next cell; a range's second cell is on the first one's sheet
-    last = before_last = ("", "")  # (kind, token) of the last two tokens that are not spaces
+    tokens: list[FormulaToken] = []
+    sheet: str | None = None  # the sheet written before the next cell
     depth = 0
     position = 1
     previous = ""  # kind of the previous token, "space" included
@@ -1818,7 +2066,7 @@ def normalize_formula(formula: str, infer_row: bool = True, sheets: dict[str, st
         match = FORMULA_TOKEN_RE.match(text, position)
         if not match:
             raise ValueError(f"'{text[position : position + 10]}' is not allowed in a formula{hint}")
-        kind, token = match.lastgroup, match.group()
+        kind, token = match.lastgroup or "", match.group()
         end = match.end()
         if (
             kind != "space"
@@ -1828,7 +2076,9 @@ def normalize_formula(formula: str, infer_row: bool = True, sheets: dict[str, st
         ):
             near = text[position : position + 10]
             raise ValueError(f"a space between two values is not allowed near '{near}'; use an operator")
-        if kind == "sheet":
+        if kind == "space":
+            before_space = previous if previous != "space" else before_space
+        elif kind == "sheet":
             name = match["quoted"].replace("''", "'") if match["quoted"] is not None else match["bare"]
             sheet = (sheets or {}).get(" ".join(name.split()).lower(), "")
             if not sheet:
@@ -1837,36 +2087,65 @@ def normalize_formula(formula: str, infer_row: bool = True, sheets: dict[str, st
                     f"there is no sheet '{name}' in this workbook" + (f" (sheets: {known})" if known else "")
                 )
             following = FORMULA_TOKEN_RE.match(text, end)
-            if last[1] == ":" or not following or following.lastgroup != "cell":
+            if (tokens and tokens[-1].text == ":") or not following or following.lastgroup not in ("cell", "columns"):
                 raise ValueError(f"write a cell of another sheet as '{sheet}'!B3 and a range as '{sheet}'!B2:B9")
-            token = "'" + sheet.replace("'", "''") + "'!"
         elif kind == "function":
-            name = match["function"].upper()
-            name = GERMAN_FUNCTIONS.get(name, name)
+            written = match["function"]
+            name = GERMAN_FUNCTIONS.get(written.upper().removeprefix("_XLFN."), written.upper().removeprefix("_XLFN."))
+            if name in BLOCKED_FUNCTIONS:
+                raise UnsafeFormula(f"the function {written} is not allowed")
             if name not in FORMULA_FUNCTIONS:
-                raise ValueError(
-                    f"the function {match['function']} is not allowed (allowed: {', '.join(sorted(FORMULA_FUNCTIONS))})"
-                )
-            token = f"{name}("
+                alternative = f": {FUNCTION_ALTERNATIVES[name]}" if name in FUNCTION_ALTERNATIVES else ""
+                allowed = ", ".join(sorted(FORMULA_FUNCTIONS))
+                raise ValueError(f"the function {written} is not allowed{alternative} (allowed: {allowed})")
+            tokens.append(FormulaToken("function", ("_xlfn." if name in NEW_FUNCTIONS else "") + name + "("))
             depth += 1
         elif kind == "cell":
-            if _column_number(match["column"]) > MAX_EXCEL_COLUMN or (
-                match["row"] != "{row}" and int(match["row"]) > MAX_EXCEL_ROW
-            ):
+            column, row = match["column"].upper(), match["row"]
+            if _column_number(column) > MAX_EXCEL_COLUMN or (row != "{row}" and int(row) > MAX_EXCEL_ROW):
                 raise ValueError(f"'{token}' is outside of the sheet")
-            token = token.upper().replace("{ROW}", "{row}")
-            if not sheet and last[1] == ":" and before_last[0] == "cell":
-                sheet = cells[-1][2]  # the end of a range: 'Rates'!B2:B9
-            cells.append((len(parts), match, sheet))
-            sheet = ""
+            owner = sheet  # the end of a range is on the sheet of its start: 'Rates'!B2:B9
+            if owner is None:
+                range_end = len(tokens) >= 2 and tokens[-1].text == ":" and tokens[-2].kind == "cell"
+                owner = tokens[-2].sheet if range_end else ""
+            written = (_sheet_prefix(sheet) if sheet else "") + token.upper().replace("{ROW}", "{row}")
+            tokens.append(FormulaToken("cell", written, owner, column, row, bool(match["row_absolute"])))
+            sheet = None
+        elif kind == "columns":
+            owner, first, last = sheet or "", match["first"].upper(), match["last"].upper()
+            if last_rows is None or owner not in last_rows:
+                raise ValueError(f"whole columns ({token}) are not allowed: write the rows, e.g. ${first}$2:${last}$50")
+            rows = str(max(last_rows[owner], 2))  # the data rows: not the header, not the total row
+            columns = sorted((_column_number(first), _column_number(last)))
+            if cell and owner in ("", cell[0]) and columns[0] <= cell[1] <= columns[1] and 2 <= cell[2] <= int(rows):
+                here = f"{get_column_letter(cell[1])}{cell[2]}"
+                if cell[2] == 2 or cell[2] < int(rows):  # a total above or between the data: which rows is unclear
+                    above, below = f"${first}$2:${last}${cell[2] - 1}", f"${first}$3:${last}${max(int(rows), 3)}"
+                    example = above if cell[2] > 2 else below
+                    raise ValueError(
+                        f"{token} in {here} includes {here} itself (a circular reference): write the rows to "
+                        f"compute with, e.g. {example}"
+                    )
+                rows = str(cell[2] - 1)  # a total below the data: the rows above it
+            tokens += [
+                FormulaToken("cell", f"{_sheet_prefix(sheet) if sheet else ''}${first}$2", owner, first, "2", True),
+                FormulaToken("operator", ":"),
+                FormulaToken("cell", f"${last}${rows}", owner, last, rows, True),
+            ]
+            sheet = None
+        elif kind == "shifted":
+            raise ValueError(SHIFTED_ROW_HINT)
         elif kind == "name":
             if token.upper() not in FORMULA_CONSTANTS:
                 raise ValueError(f"'{token}' is not allowed in a formula (only cells like B{{row}} or B2){hint}")
-            token = FORMULA_CONSTANTS[token.upper()]
+            tokens.append(FormulaToken("name", FORMULA_CONSTANTS[token.upper()]))
         elif kind == "number":
             fraction = DECIMAL_COMMA_RE.match(text, end) if "." not in token and (german or depth == 0) else None
             if fraction:  # 0,19 -> 0.19
                 token, end = f"{token}.{fraction[1]}", fraction.end()
+            tokens.append(FormulaToken("number", token))
+        elif kind == "string":
+            tokens.append(FormulaToken("string", '"' + token[1:-1] + '"'))  # „ja“ -> "ja"
         elif kind == "operator":
             if token == ";":
                 token = ","
@@ -1876,39 +2155,238 @@ def normalize_formula(formula: str, infer_row: bool = True, sheets: dict[str, st
                 depth -= 1
                 if depth < 0:
                     raise ValueError("the formula has a ')' without '('")
-        elif kind == "space":
-            before_space = previous if previous != "space" else before_space
-            token = ""
-        parts.append(token)
+            tokens.append(FormulaToken("operator", token))
+        if depth > MAX_FORMULA_DEPTH:
+            raise ValueError(f"the formula is nested too deeply (at most {MAX_FORMULA_DEPTH} levels of parentheses)")
         previous = kind if kind != "operator" or token != ")" else ")"
-        if kind != "space":
-            last, before_last = (kind, token), last
         position = end
     if depth != 0:
         raise ValueError("the parentheses in the formula do not match")
-    relative_rows = {match["row"] for _, match, sheet in cells if not match["row_absolute"] and not sheet}
-    if infer_row and "{row}" not in relative_rows and relative_rows == {FIRST_DATA_ROW}:
-        for index, match, sheet in cells:
-            if not match["row_absolute"] and not sheet:
-                parts[index] = parts[index][: -len(FIRST_DATA_ROW)] + "{row}"
-    for _, match, sheet in cells if infer_row else ():
-        if sheet and not match["row_absolute"] and match["row"] != "{row}":
-            column, row = match["column"].upper(), match["row"]
-            raise ValueError(
-                f"'{sheet}'!{column}{row} in a column formula: write '{sheet}'!${column}${row} for this one cell in "
-                f"every row (ranges too: $B$2:$B$9), or '{sheet}'!{column}{{row}} for the cell in the same row"
-            )
-    return "=" + "".join(parts)
+    return tokens
 
 
-NUMBER_RE = re.compile(  # thousands separators: . , ' space, no-break space, narrow no-break space
+class FormulaNode(NamedTuple):
+    """A part of a parsed formula (see formula_tree)."""
+
+    kind: str  # number, string, bool, cell, range, unary, binary, percent, call, empty (an argument left out)
+    text: str  # the operator, the function's name, or the token as written into the file
+    args: tuple["FormulaNode", ...] = ()
+    cell: FormulaToken | None = None  # cell: its token
+    index: int = -1  # cell: its position in the token list
+
+
+def formula_tree(tokens: list[FormulaToken]) -> FormulaNode:
+    """Parse the tokens of parse_formula in Excel's order of operations; raises ValueError for formulas Excel cannot
+    read (=B2*, =B2*/2, ==B2) and for a wrong number of arguments (=ROUND(B2), =SUM())."""
+    return _FormulaParser(tokens).parse()
+
+
+def walk(node: FormulaNode) -> Iterator[FormulaNode]:
+    yield node
+    for arg in node.args:
+        yield from walk(arg)
+
+
+def number_value(node: FormulaNode) -> float | None:
+    return float(node.text) if node.kind == "number" else None
+
+
+class _FormulaParser:
+    """Recursive descent; unary minus binds closer than ^, as in Excel."""
+
+    def __init__(self, tokens: list[FormulaToken]) -> None:
+        self.tokens, self.i = tokens, 0
+
+    def peek(self) -> str:
+        return self.tokens[self.i].text if self.i < len(self.tokens) and self.tokens[self.i].kind == "operator" else ""
+
+    def parse(self) -> FormulaNode:
+        if not self.tokens:
+            raise ValueError("the formula is empty")
+        node = self.binary(0)
+        if self.i < len(self.tokens):
+            raise ValueError(self.unexpected())
+        return node
+
+    def unexpected(self) -> str:
+        token = self.tokens[self.i].text
+        if token == ",":
+            return "',' separates the arguments of a function; outside of one it is not allowed"
+        return f"'{token}' follows '{self.tokens[self.i - 1].text}' without an operator between them"
+
+    def binary(self, level: int) -> FormulaNode:
+        if level == len(OPERATOR_LEVELS):
+            return self.unary()
+        node = self.binary(level + 1)
+        while self.peek() in OPERATOR_LEVELS[level]:
+            operator = self.peek()
+            self.i += 1
+            node = FormulaNode("binary", operator, (node, self.binary(level + 1)))
+        return node
+
+    def unary(self) -> FormulaNode:
+        if self.peek() in ("+", "-"):
+            operator = self.peek()
+            self.i += 1
+            return FormulaNode("unary", operator, (self.unary(),))
+        node = self.primary()
+        while self.peek() == "%":
+            self.i += 1
+            node = FormulaNode("percent", "%", (node,))
+        return node
+
+    def primary(self) -> FormulaNode:
+        if self.i >= len(self.tokens):
+            raise ValueError(f"the formula ends with '{self.tokens[-1].text}': a value is missing after it")
+        token = self.tokens[self.i]
+        self.i += 1
+        if token.kind in ("number", "string"):
+            return FormulaNode(token.kind, token.text)
+        if token.kind == "name":
+            return FormulaNode("bool", token.text)
+        if token.kind == "function":
+            return self.call(token.text[:-1].removeprefix("_xlfn."))
+        if token.kind == "cell":
+            node = FormulaNode("cell", token.text, cell=token, index=self.i - 1)
+            if self.peek() != ":":
+                return node
+            self.i += 1
+            if self.i >= len(self.tokens) or self.tokens[self.i].kind != "cell":
+                raise ValueError("':' joins two cells to a range, e.g. B2:B9")
+            end = self.tokens[self.i]
+            self.i += 1
+            return FormulaNode("range", ":", (node, FormulaNode("cell", end.text, cell=end, index=self.i - 1)))
+        if token.text == "(":
+            node = self.binary(0)
+            if self.peek() != ")":
+                raise ValueError(self.unexpected())
+            self.i += 1
+            return node
+        before = self.tokens[self.i - 2].text if self.i >= 2 else "="
+        if token.text == "=" and self.i == 1:
+            raise ValueError("the formula starts with '==': write a single '='")
+        if token.text in (",", ")") and (before == "," or before.endswith("(")):
+            raise ValueError(f"an argument is missing before '{token.text}'")
+        if token.text == ":":
+            raise ValueError("':' joins two cells to a range, e.g. B2:B9")
+        raise ValueError(f"'{token.text}' follows '{before}' without a value between them")
+
+    def call(self, name: str) -> FormulaNode:
+        args: list[FormulaNode] = []
+        if self.peek() == ")":
+            self.i += 1
+        else:
+            while True:  # an argument after the first may be left out, as in Excel: IF(B2,,1), VLOOKUP(…,2,)
+                empty = args and self.peek() in (",", ")")
+                args.append(FormulaNode("empty", "") if empty else self.binary(0))
+                if self.peek() not in (",", ")"):
+                    raise ValueError(self.unexpected())
+                self.i += 1
+                if self.tokens[self.i - 1].text == ")":
+                    break
+        fewest, most, usage = FUNCTION_ARGUMENTS[name]
+        before_pairs = PAIRED_ARGUMENTS.get(name)
+        if not fewest <= len(args) <= most or (before_pairs is not None and (len(args) - before_pairs) % 2):
+            count = f"{len(args)} argument{'' if len(args) == 1 else 's'}" if args else "no arguments"
+            raise ValueError(f"{name} has {count} here; write it as {usage}")
+        return FormulaNode("call", name, tuple(args))
+
+
+def normalize_formula(
+    formula: str,
+    infer_row: bool = True,
+    sheets: dict[str, str] | None = None,
+    last_rows: dict[str, int] | None = None,
+    cell: tuple[str, int, int] | None = None,
+) -> str:
+    """Check a formula (parse_formula, formula_tree) and return it in Excel's file syntax (English names, commas).
+    A column formula (infer_row) gets its rows made clear, see column_formula_rows; `cell` is the place of a formula
+    in one cell, see parse_formula. Raises ValueError with a message for the model."""
+    tokens = parse_formula(formula, sheets, last_rows, cell)
+    tree = formula_tree(tokens)
+    if infer_row:
+        tokens = column_formula_rows(tokens, tree)
+    return "=" + "".join(token.text for token in tokens)
+
+
+def _absolute(token: FormulaToken) -> FormulaToken:
+    prefix = token.text[: token.text.rfind("!") + 1]
+    return token._replace(text=f"{prefix}${token.column}${token.row}", absolute=True)
+
+
+def column_formula_rows(tokens: list[FormulaToken], tree: FormulaNode) -> list[FormulaToken]:
+    """The cells of a column formula, which is filled into every data row, with their rows made clear.
+
+    A range over several rows without {row} ('SUM(B2:B9)', 'SUM($B$2:B9)') is the same range in every row and gets
+    written as one ($B$2:$B$9); so does the start of 'B2:B{row}'. If every other cell of its own sheet is in the
+    first data row ('=B2*C2', '=B2/SUM(B2:B4)'), these get {row}, so every row computes its own values. Any other cell
+    without {row} or $ in one row ('=B3*C3', '=B1*C1', '=B{row}*C2') is sent back: models count the rows wrong (row 1
+    is the header), or mean a fixed cell; cells of several rows ('SUM(D2*F2,D3*F3)') are fixed cells. A cell of
+    another sheet has to say which: 'Rates'!$B$3 or 'Rates'!B{row}.
+    """
+    tokens = list(tokens)
+    ends: dict[int, int] = {}
+    for node in walk(tree):
+        if node.kind == "range":
+            a, b = (arg.index for arg in node.args)
+            ends[a], ends[b] = b, a
+
+    def open_row(token: FormulaToken) -> bool:
+        return not token.absolute and token.row != "{row}"
+
+    fixed, open_rows = set(), []
+    for i, token in enumerate(tokens):
+        if token.kind != "cell" or not open_row(token):
+            continue
+        other = tokens[ends[i]] if i in ends else None
+        if other is not None and other.row != token.row:
+            fixed.add(i)  # B2:B9, $B$2:B9, or the start of B2:B{row}
+        else:
+            open_rows.append(i)
+    for i in fixed:
+        tokens[i] = _absolute(tokens[i])
+    own = [i for i in open_rows if not tokens[i].sheet]
+    current_row = any(token.kind == "cell" and token.row == "{row}" and not token.sheet for token in tokens)
+    if own and not current_row and all(tokens[i].row == FIRST_DATA_ROW for i in own):
+        for i in own:
+            tokens[i] = tokens[i]._replace(text=tokens[i].text[: -len(FIRST_DATA_ROW)] + "{row}", row="{row}")
+        own = []
+    other_sheet = [i for i in open_rows if tokens[i].sheet]
+    if other_sheet:
+        sheet, column, row = tokens[other_sheet[0]].sheet, tokens[other_sheet[0]].column, tokens[other_sheet[0]].row
+        raise ValueError(
+            f"'{sheet}'!{column}{row} in a column formula: write '{sheet}'!${column}${row} for this one cell in "
+            f"every row, or '{sheet}'!{column}{{row}} for the cell in the same row"
+        )
+    if len({tokens[i].row for i in own}) == 1:  # cells of several rows ('SUM(D2*F2,D3*F3)') are meant as they are
+        cells = ", ".join(dict.fromkeys(tokens[i].text for i in own))
+        first = tokens[own[0]]
+        header = " (row 1 is the header row)" if any(tokens[i].row == "1" for i in own) else ""
+        raise ValueError(
+            f"{cells} in a column formula: the formula is filled into every row, so a cell without {{row}} is the "
+            f"same cell in all of them{header}. The data starts in row 2: write {first.column}{{row}} for the cell in "
+            f"the same row (e.g. =B{{row}}*C{{row}}), ${first.column}${first.row} for one fixed cell, and $B$2:$B$9 "
+            "for a fixed range"
+        )
+    return tokens
+
+
+NUMBER_RE = re.compile(  # thousands separators: . , ' ’ space, no-break space, narrow no-break space
     r"(?P<prefix>€|\$|£|EUR|USD|GBP|CHF)?\s*"
     r"(?P<sign>[-+]?)"
-    r"(?P<int>\d{1,3}(?:(?P<group>[.,' \u00a0\u202f])\d{3}(?:(?P=group)\d{3})*)?|\d+)"
+    r"(?P<int>\d{1,3}(?:(?P<group>[.,' \u00a0\u202f\u2019])\d{3}(?:(?P=group)\d{3})*)?|\d+)"
     r"(?:(?!(?P=group))(?P<decimal>[.,])(?P<fraction>\d+))?"
     r"\s*(?P<suffix>%|€|\$|£|EUR|USD|GBP|CHF)?"
 )
-DATE_FORMATS = ("%Y-%m-%d", "%d.%m.%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M")
+CURRENCY_CODES = {"€": "EUR", "EUR": "EUR", "$": "USD", "USD": "USD", "£": "GBP", "GBP": "GBP", "CHF": "CHF"}
+DATE_FORMATS = ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M",
+                "%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M")  # fmt: skip
+DATE_LIKE_RE = re.compile(r"[0-9]{1,4}([./-])[0-9]{1,2}(?:\1[0-9]{1,4})?(?:[ T].*)?|[0-9]{1,2}[./][0-9]{4}")
+MONTH_ONLY_RE = re.compile(r"[0-9]{4}-[0-9]{1,2}|[0-9]{1,2}[./-][0-9]{4}")
+TIME_RE = re.compile(
+    r"(?P<hours>[0-9]{1,3}):(?P<minutes>[0-5][0-9])(?::(?P<seconds>[0-5][0-9]))?(?:\s*(?:Uhr|h))?", re.IGNORECASE
+)
+TIME_LIKE_RE = re.compile(r"[0-9]{1,2}(?:[.,][0-9]{1,2})?\s*(?:Uhr|h)|[0-9]{1,2}[.,][0-9]{2}", re.IGNORECASE)  # 8 Uhr
 
 
 def parse_number_text(text: str, decimal_comma: bool | None = None) -> tuple[float | int, bool] | None:
@@ -1934,6 +2412,12 @@ def parse_number_text(text: str, decimal_comma: bool | None = None) -> tuple[flo
     return number, False
 
 
+def value_currency(value: Any) -> str | None:
+    """The currency written with an amount ('$1,200.00' -> 'USD'); None without one."""
+    match = NUMBER_RE.fullmatch(value.strip().replace("\u2212", "-")) if isinstance(value, str) else None
+    return CURRENCY_CODES.get(match["prefix"] or match["suffix"] or "") if match else None
+
+
 def parse_date(text: str) -> date | datetime | None:
     for date_format in DATE_FORMATS:
         try:
@@ -1944,13 +2428,56 @@ def parse_date(text: str) -> date | datetime | None:
     return None
 
 
+def parse_time(text: Any) -> float | None:
+    """'08:30' -> 0.354 (the fraction of a day, as Excel stores times), '25:30' -> 1.0625 (a duration); None if the
+    text is no time."""
+    match = TIME_RE.fullmatch(text.strip()) if isinstance(text, str) else None
+    if not match:
+        return None
+    return (int(match["hours"]) * 3600 + int(match["minutes"]) * 60 + int(match["seconds"] or 0)) / 86400
+
+
+def date_problem(value: Any) -> str | None:
+    """Why a value of a date column cannot be written as a date; None for dates, and for words that may stay
+    text (e.g. 'offen')."""
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return f"{value:g} is a number, not a date: write dates as YYYY-MM-DD"
+    text = str(value).strip()
+    if not text or parse_date(text):
+        return None
+    if parse_time(text) is not None:
+        return f"'{text}' is a time: write dates as YYYY-MM-DD, and times into a column of type time"
+    if not DATE_LIKE_RE.fullmatch(text):
+        return None
+    if "/" in text:
+        return f"'{text}' could be day/month or month/day: write dates as YYYY-MM-DD (or DD.MM.YYYY)"
+    if MONTH_ONLY_RE.fullmatch(text):
+        return f"'{text}' has no day: write a whole date (e.g. 2026-11-01), or give the column the type text for months"
+    return f"'{text}' is not a valid date: write dates as YYYY-MM-DD, e.g. 2026-11-02"
+
+
+def time_problem(value: Any) -> str | None:
+    """Why a value of a time column cannot be written as a time; None for times, and for words that may stay text."""
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return f"{value:g} is a number, not a time: write times as hh:mm, e.g. 08:30"
+    text = str(value).strip()
+    if not text or parse_time(text) is not None:
+        return None
+    if parse_date(text):
+        return f"'{text}' is a date: a time column takes times only (hh:mm); a date with a time goes into a date column"
+    if TIME_LIKE_RE.fullmatch(text):
+        return f"'{text}': write times as hh:mm, e.g. 08:30"
+    return None
+
+
 NULL_TEXTS = {"null", "none", "nan"}
 
 
 def convert_value(value: str | float | None, column_type: str, decimal_comma: bool | None = None) -> tuple[Any, bool]:
     """Return (cell value, is_typed). Values that do not fit the column type stay text (is_typed False).
 
-    JSON numbers stay numbers in text columns too, so sums and charts over them work.
+    JSON numbers stay numbers in text columns too, so sums and charts over them work. A time is the fraction of a
+    day, as in Excel.
     """
     if value is None or (isinstance(value, str) and not value.strip()):
         return None, True
@@ -1958,9 +2485,9 @@ def convert_value(value: str | float | None, column_type: str, decimal_comma: bo
         if isinstance(value, float):
             return (int(value) if value.is_integer() else value), True
         return excel_text(value), True
-    if column_type == "date":
-        parsed = parse_date(str(value)) if isinstance(value, str) else None
-        return (parsed, True) if parsed else (excel_text(str(value)), False)
+    if column_type in ("date", "time"):
+        parsed = (parse_date if column_type == "date" else parse_time)(value) if isinstance(value, str) else None
+        return (parsed, True) if parsed is not None else (excel_text(str(value)), False)
     if isinstance(value, str):
         parsed_number = parse_number_text(value, decimal_comma)
         if parsed_number is None:
@@ -1977,6 +2504,15 @@ def convert_value(value: str | float | None, column_type: str, decimal_comma: bo
     return number, True
 
 
+def computable(value: Any) -> bool:
+    """Whether Excel can compute with a cell value: empty, a number or date, or text that it reads as one ('12',
+    '08:00')."""
+    if value is None or isinstance(value, int | float | date):
+        return True
+    text = str(value)
+    return parse_number_text(text) is not None or parse_date(text) is not None or parse_time(text) is not None
+
+
 def _decimals(values: list[Any]) -> int:
     decimals = 0
     for value in values:
@@ -1984,23 +2520,6 @@ def _decimals(values: list[Any]) -> int:
             text = f"{value:.{MAX_DECIMALS}f}".rstrip("0")
             decimals = max(decimals, len(text.split(".")[1]) if "." in text else 0)
     return decimals
-
-
-def number_format(column: ExcelColumn, values: list[Any], currency: str, date_format: str) -> str | None:
-    match column.type:
-        case "integer":
-            return "#,##0"
-        case "number":
-            decimals = _decimals(values) if not column.formula else 2
-            return "#,##0" + ("." + "0" * decimals if decimals else "")
-        case "currency":
-            return CURRENCY_FORMATS[currency]
-        case "percent":
-            fractional = any(isinstance(v, float) and not round(v * 100, 9).is_integer() for v in values)
-            return "0.0%" if column.formula or fractional else "0%"
-        case "date":
-            return date_format
-    return None
 
 
 ROW_LINE = Border(bottom=Side(style="thin", color=RULE_COLOR))
@@ -2017,6 +2536,18 @@ SHEET_NAME_INVALID_RE = re.compile(r"[\[\]:*?/\\]")
 TOTAL_FUNCTIONS = {"sum": "SUM", "average": "AVERAGE", "min": "MIN", "max": "MAX", "count": "COUNTA"}
 RESERVED_SHEET_NAMES = {"history"}  # reserved by Excel
 FORMULA_START = ("=", "+", "-", "@", "\t", "\r")  # text starting like this may turn into a formula when edited
+# A cell value that is meant as a formula: '=' and a function, a cell or a sheet ('=> see below' is text)
+FORMULA_LIKE_RE = re.compile(
+    r"=\s*=?\s*(?:[A-Za-zÄÖÜäöü_][\w.]*\s*\(|\$?[A-Za-z]{1,3}\$?(?:[0-9]|\{row)|'|[^\W\d][\w.]*!|\()"
+)
+NUMBER_TYPES = ("number", "integer", "currency", "percent")
+TIME_TYPES = ("date", "time")
+PLACEHOLDERS = {"-", "\u2013", "\u2014", "/", "n/a", "na", "k.a.", "k. a.", "tbd", "offen", "?"}  # in number columns
+UNIT_TEXT_RE = re.compile(  # '3 h', '500 Stk', 'ca. 500'
+    r"(?P<about>(?:ca|circa|etwa|rund|approx|about|~)\.?\s*)?(?P<number>[-+]?[0-9][0-9.,'\u2019 \u00a0]*?)\s*"
+    r"(?P<unit>[^\W\d_][^\d]{0,15})?",
+    re.IGNORECASE,
+)
 
 
 def sheet_names(sheets: list[ExcelSheet], fallback: str = "Sheet") -> list[str]:
@@ -2036,7 +2567,7 @@ def sheet_names(sheets: list[ExcelSheet], fallback: str = "Sheet") -> list[str]:
 
 
 def align_rows(sheet: ExcelSheet) -> list[list[str | float | None]]:
-    """Rows that left out the formula columns get None inserted at those positions."""
+    """Rows that left out the formula columns get None inserted at those positions; short rows are filled up."""
     formula_positions = [i for i, column in enumerate(sheet.columns) if column.formula.strip()]
     short = len(sheet.columns) - len(formula_positions)
     aligned = []
@@ -2049,336 +2580,26 @@ def align_rows(sheet: ExcelSheet) -> list[list[str | float | None]]:
     return aligned
 
 
-def check_excel(
-    sheets: list[ExcelSheet], decimal_comma: bool | None = None, names: list[str] | None = None
-) -> dict[tuple[int, int], str]:
-    """Validate the workbook and return the normalized formulas by (sheet, column). `names` are the written sheet
-    names (see sheet_names), which formulas use for cells of other sheets."""
-    check = Checker()
-    formulas: dict[tuple[int, int], str] = {}
-    names = names or sheet_names(sheets)
-    lookup = sheet_lookup(sheets, names)
-    check.require(bool(sheets), "sheets: the workbook has no sheets")
-    check.require(len(sheets) <= MAX_SHEETS, f"sheets: at most {MAX_SHEETS} sheets")
-    cells = sum(len(sheet.rows) * len(sheet.columns) for sheet in sheets)
-    check.require(cells <= MAX_CELLS, f"sheets: at most {MAX_CELLS} cells in all sheets together ({cells} sent)")
-    for s, sheet in enumerate(sheets):
-        where = f"sheets[{sheet._index if sheet._index >= 0 else s}]"
-        headers = [column.header.strip() for column in sheet.columns]
-        check.require(bool(sheet.columns), f"{where}.columns: the sheet has no columns")
-        check.require(len(sheet.columns) <= MAX_SHEET_COLUMNS, f"{where}.columns: at most {MAX_SHEET_COLUMNS} columns")
-        check.require(len(sheet.rows) <= MAX_SHEET_ROWS, f"{where}.rows: at most {MAX_SHEET_ROWS} rows")
-        check.text(sheet.name, *headers)
-        for c, column in enumerate(sheet.columns):
-            if column.formula.strip():
-                try:
-                    formulas[(s, c)] = normalize_formula(column.formula, sheets=lookup)
-                except ValueError as e:
-                    check.require(False, f"{where}.columns[{c}].formula: {e}")
-        for r, row in enumerate(sheet.rows):
-            check.require(
-                len(row) <= len(sheet.columns),
-                f"{where}.rows[{r}]: {len(row)} values but only {len(sheet.columns)} columns",
-            )
-            for value in row:
-                if isinstance(value, str):
-                    check.text(value)
-                    check.require(
-                        len(value) <= MAX_CELL_CHARS,
-                        f"{where}.rows[{r}]: a cell has more than {MAX_CELL_CHARS} characters",
-                    )
-        if len(check.errors) > MAX_ERRORS_SHOWN:
-            break
-        if sheet.rows and all(len(row) <= len(sheet.columns) for row in sheet.rows):
-            check.errors.extend(
-                _column_problems(
-                    sheet, where, {c: f for (i, c), f in formulas.items() if i == s}, decimal_comma, lookup, names[s]
-                )
-            )
-        if sheet.chart:
-            if check.require(bool(sheet.rows), f"{where}.chart: the sheet has no rows to plot"):
-                try:
-                    chart_layout(sheet, sheet.chart)
-                except ValueError as e:
-                    check.errors.extend(f"{where}.chart.{error}" for error in e.args[0])
-    if not check.errors:  # all sheets are complete: cells of other sheets can be looked up
-        check.errors.extend(_reference_problems(sheets, names, formulas, lookup))
-        check.errors.extend(_percent_problems(sheets, names, formulas, lookup))
-    check.raise_if_failed()
-    return formulas
-
-
-PLACEHOLDERS = {"-", "\u2013", "\u2014", "/", "n/a", "na", "k.a.", "k. a.", "tbd", "offen", "?"}  # in number columns
-
-
-class CellReference(NamedTuple):
-    sheet: str  # "" for the formula's own sheet
-    column: str
-    row: str  # a number or "{row}"
-    in_range: bool  # one end of a range such as B2:B9
-
-
-def formula_references(formula: str, own: str = "") -> list[CellReference]:
-    """The cells a checked formula (see normalize_formula) uses; cells of the sheet named `own` count as cells of the
-    formula's own sheet."""
-    tokens = [match for match in FORMULA_TOKEN_RE.finditer(formula, 1) if match.lastgroup != "space"]
-    references: list[CellReference] = []
-    for i, match in enumerate(tokens):
-        if match.lastgroup != "cell":
-            continue
-        before = tokens[i - 1] if i else None
-        range_end = i >= 2 and before.group() == ":" and tokens[i - 2].lastgroup == "cell"
-        if before is not None and before.lastgroup == "sheet":
-            sheet = before["quoted"].replace("''", "'") if before["quoted"] is not None else before["bare"]
-        else:
-            sheet = references[-1].sheet if range_end else ""
-        range_start = i + 2 < len(tokens) and tokens[i + 1].group() == ":" and tokens[i + 2].lastgroup == "cell"
-        sheet = "" if sheet == own else sheet
-        references.append(CellReference(sheet, match["column"].upper(), match["row"], range_start or range_end))
-    return references
-
-
-def _column_problems(
-    sheet: ExcelSheet, where: str, formulas: dict[int, str], decimal_comma: bool | None,
-    lookup: dict[str, str] | None = None, own: str = "",
-) -> list[str]:  # fmt: skip
-    """Columns whose content cannot be what the model meant; these usually come from rows whose values are
-    shifted against the columns, or from values the model forgot."""
-    rows = align_rows(sheet)
-    problems: list[str] = []
-    filled = [any(row[c] is not None and str(row[c]).strip() for row in rows) for c in range(len(sheet.columns))]
-    for c, column in enumerate(sheet.columns):
-        name = f"{where}.columns[{c}] ('{column.header.strip()}')"
-        if c in formulas:
-            continue
-        if column.total != "none" and not filled[c]:
-            problems.append(
-                f"{name}: the total needs values in this column: fill them in, give the column a formula "
-                "(e.g. '=B{row}*C{row}'), or put the total on the column with the numbers"
-            )
-        if column.type in NUMBER_TYPES:
-            values = [row[c] for row in rows if row[c] is not None and str(row[c]).strip()]
-            texts = [
-                v for v in values
-                if str(v).strip().lower() not in PLACEHOLDERS and not convert_value(v, column.type, decimal_comma)[1]
-                and not cell_formula(v, column, lookup)
-            ]  # fmt: skip
-            bad_formula = next((str(v).strip() for v in texts if str(v).strip().startswith("=")), None)
-            if bad_formula is not None:
-                try:
-                    normalize_formula(bad_formula, infer_row=False, sheets=lookup)
-                except ValueError as e:
-                    problems.append(f"{name}: the formula '{bad_formula[:60]}' is not allowed: {e}")
-            elif len(texts) >= 2 and len(texts) * 2 > len(values):
-                problems.append(
-                    f"{name}: {len(texts)} of {len(values)} values are not numbers (e.g. '{texts[0]}'). Each row needs "
-                    f"one value per column, in column order - is a column missing? Or give the column type 'text'."
-                )
-            elif column.type == "percent" and (fraction := _fractions_only(values, decimal_comma)) is not None:
-                problems.append(
-                    f"{name}: all values are below 1 (e.g. {fraction}), but a percent column takes percent numbers: "
-                    f"5 means 5 %, so {fraction} would show as {fraction} %. Send 5 for 5 % (or '5 %'); a value that "
-                    f"really is below 1 % needs the sign, e.g. '0.5 %'."
-                )
-    for c, formula in formulas.items():
-        own_sheet = [reference.column for reference in formula_references(formula, own) if not reference.sheet]
-        if get_column_letter(c + 1) in own_sheet:
-            problems.append(
-                f"{where}.columns[{c}] ('{sheet.columns[c].header.strip()}'): the formula uses its own column "
-                f"{get_column_letter(c + 1)}; it may only use the other columns (e.g. quantity * price)"
-            )
-            continue
-        for letters in dict.fromkeys(own_sheet):
-            used = _column_number(letters) - 1
-            if used < len(sheet.columns) and used not in formulas and not filled[used] and used != c:
-                problems.append(
-                    f"{where}.columns[{used}] ('{sheet.columns[used].header.strip()}') is empty, but the formula of "
-                    f"'{sheet.columns[c].header.strip()}' uses it: fill in its values"
-                )
-    if problem := _total_row_problem(sheet, rows, where, formulas):
-        problems.append(problem)
-    return problems
-
-
-def _fractions_only(values: list[Any], decimal_comma: bool | None) -> float | None:
-    """The first value if every value of a percent column but 0 is a plain number between -1 and 1: the model sent
-    fractions (0.05 for 5 %), which the column would show as 0.05 %. None if any value has a '%' or is 1 or more."""
-    numbers = []
-    for value in values:
-        if isinstance(value, bool) or str(value).strip().lower() in PLACEHOLDERS:
-            continue
-        if isinstance(value, (int, float)):
-            numbers.append(value)
-        elif isinstance(value, str) and (parsed := parse_number_text(value, decimal_comma)) and not parsed[1]:
-            numbers.append(parsed[0])
-        else:
-            return None
-    numbers = [n for n in numbers if n != 0]
-    return numbers[0] if numbers and all(abs(n) < 1 for n in numbers) else None
-
-
-def _sheet_formulas(
-    sheets: list[ExcelSheet], aligned: list[list[list[Any]]], formulas: dict[tuple[int, int], str],
-    lookup: dict[str, str],
-) -> list[tuple[int, int, str, str]]:  # fmt: skip
-    """Every formula of the workbook as (sheet, column, place for messages, formula): column formulas and formulas
-    written into single cells."""
-    used = []
-    for s, sheet in enumerate(sheets):
-        where = f"sheets[{sheet._index if sheet._index >= 0 else s}]"
-        used += [(s, c, f"{where}.columns[{c}].formula", f) for (i, c), f in formulas.items() if i == s]
-        used += [
-            (s, c, f"{where}.rows[{r}]", formula)
-            for r, row in enumerate(aligned[s])
-            for c, (column, value) in enumerate(zip(sheet.columns, row, strict=True))
-            if (formula := cell_formula(value, column, lookup))
-        ]
-    return used
-
-
-def _percent_problems(
-    sheets: list[ExcelSheet], names: list[str], formulas: dict[tuple[int, int], str], lookup: dict[str, str]
-) -> list[str]:
-    """Formulas that treat a percent cell as a percent number: a percent cell holds the fraction (5 % is 0.05), so
-    '/100' on it divides a second time, and '*100' in a percent column shows 100 times the share (2500 %)."""
-    problems: list[str] = []
-    aligned = [align_rows(sheet) for sheet in sheets]
-    for s, c, place, formula in _sheet_formulas(sheets, aligned, formulas, lookup):
-        tokens = [match for match in FORMULA_TOKEN_RE.finditer(formula, 1) if match.lastgroup != "space"]
-
-        def hundred(i: int) -> bool:
-            return 0 <= i < len(tokens) and tokens[i].lastgroup == "number" and float(tokens[i].group()) == 100
-
-        if sheets[s].columns[c].type == "percent" and any(
-            token.group() == "*" and (hundred(i - 1) or hundred(i + 1)) for i, token in enumerate(tokens)
-        ):
-            problems.append(
-                f"{place}: '{sheets[s].columns[c].header.strip()}' is a percent column, whose cells hold the fraction "
-                f"(0.25 shows as 25 %): drop the *100, or 25 % shows as 2500 %"
-            )
-        for i, token in enumerate(tokens):
-            divided = i + 2 < len(tokens) and tokens[i + 1].group() == "/" and hundred(i + 2)
-            if token.lastgroup != "cell" or not divided:
-                continue
-            before = tokens[i - 1] if i else None
-            sheet = s
-            if before is not None and before.lastgroup == "sheet":
-                written = before["quoted"].replace("''", "'") if before["quoted"] is not None else before["bare"]
-                sheet = names.index(written) if written in names else -1
-            column = _column_number(token["column"]) - 1
-            if sheet < 0 or not 0 <= column < len(sheets[sheet].columns):
-                continue
-            target = sheets[sheet].columns[column]
-            if target.type == "percent":
-                cell = token.group() if sheet == s else f"'{names[sheet]}'!{token.group()}"
-                problems.append(
-                    f"{place}: {cell} is a percent cell ('{target.header.strip()}'), which already holds the "
-                    f"fraction (5 % is 0.05): write {cell} instead of {cell}/100"
-                )
-    return problems
-
-
-def _reference_problems(
-    sheets: list[ExcelSheet], names: list[str], formulas: dict[tuple[int, int], str], lookup: dict[str, str]
-) -> list[str]:
-    """Single cells of other sheets that are empty: models count the rows there wrong (row 1 is the header), and
-    an empty cell silently counts as 0. Ranges may reach beyond the data, e.g. in SUMIF."""
-    aligned = [align_rows(sheet) for sheet in sheets]
-
-    def filled(t: int, row: int, column: int) -> bool:
-        target = sheets[t]
-        if not 1 <= column <= len(target.columns):
-            return False
-        if row == 1:
-            return bool(target.columns[column - 1].header.strip())
-        if row == len(target.rows) + 2 and has_totals(target):  # the total row, with its label in column A
-            return target.columns[column - 1].total != "none" or column == 1
-        if not 2 <= row <= len(target.rows) + 1:
-            return False
-        value = aligned[t][row - 2][column - 1]
-        return (t, column - 1) in formulas or (value is not None and str(value).strip() != "")
-
-    problems: list[str] = []
-    for s, _, place, formula in _sheet_formulas(sheets, aligned, formulas, lookup):
-        sheet = sheets[s]
-        for reference in formula_references(formula, names[s]):
-            if not reference.sheet or reference.in_range:
-                continue
-            t, column = names.index(reference.sheet), _column_number(reference.column)
-            target, cell = sheets[t], f"'{reference.sheet}'!{reference.column}{reference.row}"
-            if reference.row == "{row}":
-                if not any(filled(t, row, column) for row in range(2, len(target.rows) + 2)):
-                    problems.append(
-                        f"{place}: {cell} is empty: '{reference.sheet}' has no values in column "
-                        f"{reference.column} (it has the columns A to {get_column_letter(len(target.columns))})"
-                    )
-                elif len(target.rows) < len(sheet.rows):
-                    problems.append(
-                        f"{place}: {cell} is empty in the last rows: '{reference.sheet}' has {len(target.rows)} "
-                        f"data rows, this sheet {len(sheet.rows)}"
-                    )
-            elif not filled(t, int(reference.row), column):
-                total = f", total row {len(target.rows) + 2}" if has_totals(target) else ""
-                problems.append(
-                    f"{place}: {cell} is an empty cell. On '{reference.sheet}', row 1 is the header and the data "
-                    f"is in rows 2 to {len(target.rows) + 1}{total}, columns A to "
-                    f"{get_column_letter(len(target.columns))}"
-                )
-    return problems
-
-
-# 'Summe', 'Netto-Summe', 'Summe Ausgaben', 'Gesamt (EUR):' …; the whole label: 'Total Quality Management' is none
-TOTAL_ROW_LABEL_RE = re.compile(
-    r"(?:(?:netto|brutto|zwischen|gesamt)[- ]?)?"
-    r"(?:summe(?:\s+[^\W\d_]+)?|gesamt(?:summe|betrag|kosten|preis)?(?:\s+(?:netto|brutto))?|insgesamt|total|sum)"
-    r"\s*(?:\([^()]*\))?\s*:?",
-    re.IGNORECASE,
-)
-
-
-def _total_row_problem(sheet: ExcelSheet, rows: list[list[Any]], where: str, formulas: dict[int, str]) -> str | None:
-    """A total row written into the rows: with column formulas it gets them too (quantity * price of the total
-    row), next to a column's "total" it is counted twice, and without its own values it adds up nothing. The
-    column's "total" builds a correct one."""
-    label = rows[-1][0] if len(rows) >= 2 and rows[-1] else None
-    if not isinstance(label, str) or not TOTAL_ROW_LABEL_RE.fullmatch(to_plain(label).strip()):
-        return None
-    numbers = bool(formulas) or any(c.total != "none" or c.type in NUMBER_TYPES for c in sheet.columns[1:])
-    others = [v for c, v in enumerate(rows[-1]) if c > 0 and c not in formulas and v is not None and str(v).strip()]
-    totals = any(c.total != "none" for c in sheet.columns)
-    if not numbers or (others and not formulas and not totals):
-        return None  # nothing to add up, or the model's own sums ('=SUM(…)' cells are written as formulas)
-    return (
-        f"{where}.rows[{len(rows) - 1}] ('{label.strip()}') is a total row: remove it and set \"total\" "
-        '(e.g. "sum") on the columns to add up; the tool adds the total row with the right formulas'
-    )
-
-
-def cell_formula(value: Any, column: ExcelColumn, sheets: dict[str, str] | None = None) -> str | None:
-    """A formula written into a single cell ('=B2-B3'), checked against the same whitelist as column formulas;
-    None if the value is no allowed formula (then it is written as text). Columns the model marked as 'text'
-    keep such values as text."""
-    if not isinstance(value, str) or not value.strip().startswith("="):
-        return None
-    if column.type == "text" and "type" in column.model_fields_set:
-        return None
-    try:
-        return normalize_formula(value, infer_row=False, sheets=sheets)
-    except ValueError:
-        return None
+def prepare_sheet(sheet: ExcelSheet, decimal_comma: bool | None = None) -> ExcelSheet:
+    """The sheet as the checks and the writer use it: rows aligned to the columns (align_rows), the types of
+    columns sent without one inferred (infer_column_types), 'null' as text in typed columns an empty cell."""
+    sheet = sheet.model_copy(update={"rows": align_rows(sheet)})
+    return blank_null_texts(infer_column_types(sheet, decimal_comma))
 
 
 def infer_column_types(sheet: ExcelSheet, decimal_comma: bool | None = None) -> ExcelSheet:
-    """Columns sent without a type whose values are all numbers become number, currency or percent columns,
-    so the numbers are not stored as text (which would make sums 0 and charts empty)."""
-    rows = align_rows(sheet)
+    """Columns sent without a type whose values are all numbers become number, currency or percent columns, so the
+    numbers are not stored as text (which would make sums 0 and charts empty); all dates ('2026-11-02') or times
+    ('08:00') make date or time columns."""
     columns = []
     for c, column in enumerate(sheet.columns):
         if "type" not in column.model_fields_set and not column.formula.strip():
             values = [
-                row[c] for row in rows if row[c] is not None and str(row[c]).strip().lower() not in {"", *NULL_TEXTS}
+                row[c]
+                for row in sheet.rows
+                if c < len(row) and row[c] is not None and str(row[c]).strip().lower() not in {"", *NULL_TEXTS}
             ]
-            kind = _number_kind(values, decimal_comma)
+            kind = _number_kind(values, decimal_comma) or _time_kind(values)
             if kind is not None:
                 column = column.model_copy(update={"type": kind})
         columns.append(column)
@@ -2409,16 +2630,25 @@ def _number_kind(values: list[Any], decimal_comma: bool | None) -> str | None:
     return special.pop() if special else "number"
 
 
+def _time_kind(values: list[Any]) -> str | None:
+    texts = [value.strip() for value in values if isinstance(value, str) and not value.strip().startswith("=")]
+    if not texts or len(texts) < len([v for v in values if not str(v).strip().startswith("=")]):
+        return None
+    if all(parse_date(text) for text in texts):
+        return "date"
+    if all(parse_time(text) is not None for text in texts):
+        return "time"
+    return None
+
+
 def blank_null_texts(sheet: ExcelSheet) -> ExcelSheet:
     """'null' written as text is an empty cell in number and date columns (in a text column it may be a word)."""
     types = [column.type for column in sheet.columns]
     rows = [
-        [
-            None if c < len(types) and types[c] != "text" and str(v).strip().lower() in NULL_TEXTS else v
-            for c, v in enumerate(row)
-        ]
-        for row in align_rows(sheet)
-    ]
+        [None if c < len(types) and types[c] != "text" and str(v).strip().lower() in NULL_TEXTS else v
+         for c, v in enumerate(row)]
+        for row in sheet.rows
+    ]  # fmt: skip
     return sheet.model_copy(update={"rows": rows})
 
 
@@ -2426,7 +2656,767 @@ def has_totals(sheet: ExcelSheet) -> bool:
     return bool(sheet.rows) and any(column.total != "none" for column in sheet.columns)
 
 
-NUMBER_TYPES = ("number", "integer", "currency", "percent")
+# What a column or formula holds, for the checks and the number format of formula columns without a type: the
+# column types, plus 'hours' (times * 24), 'bool', 'text' and 'unknown'.
+NUMBER_KINDS = {"number", "integer", "currency", "percent", "hours", "bool"}
+COUNTING_FUNCTIONS = {"COUNT", "COUNTA", "COUNTIF", "COUNTIFS", "LEN", "NETWORKDAYS", "WEEKDAY", "YEAR", "MONTH",
+                      "DAY", "MATCH", "HOUR", "MINUTE"}  # fmt: skip
+TEXT_FUNCTIONS = {"LEFT", "RIGHT", "CONCATENATE", "CONCAT", "TEXTJOIN"}
+CONDITION_FUNCTIONS = {"AND", "OR", "NOT", "ISBLANK", "ISNUMBER", "ISTEXT"}
+
+
+def common_kind(kinds: list[str]) -> str:
+    """The kind of SUM, MIN, IF … over values of these kinds."""
+    unique = list(dict.fromkeys(kinds))
+    if len(unique) == 1:
+        return unique[0]
+    if unique and set(unique) <= NUMBER_KINDS:
+        return next((kind for kind in ("currency", "hours") if kind in unique), "number")
+    return "unknown"
+
+
+def operation_kind(operator: str, a: str, b: str, left: FormulaNode, right: FormulaNode) -> str:
+    """The kind of `a operator b`."""
+    if operator in OPERATOR_LEVELS[0]:
+        return "bool"
+    if operator == "&":
+        return "text"
+    if "unknown" in (a, b) or "text" in (a, b):
+        return "unknown"
+    numbers = a in NUMBER_KINDS and b in NUMBER_KINDS
+    if operator in ("+", "-"):
+        if numbers:
+            return common_kind([a, b])
+        if a == b == "date":
+            return "integer" if operator == "-" else "unknown"  # the days between two dates
+        if a == "date" or (b == "date" and operator == "+"):
+            return "date"  # a deadline: date + days
+        return "time" if "time" in (a, b) and {a, b} <= NUMBER_KINDS | {"time"} else "unknown"
+    if operator == "*":
+        if "time" in (a, b):
+            other, node = (b, right) if a == "time" else (a, left)
+            return "hours" if number_value(node) == 24 else "time" if other in NUMBER_KINDS else "unknown"
+        if not numbers:
+            return "unknown"
+        if "currency" in (a, b):
+            return "unknown" if a == b else "currency"
+        return a if a == b and a in ("percent", "integer") else "number"
+    if operator == "/":
+        if a == "time":
+            return "number" if b == "time" else "time" if b in NUMBER_KINDS else "unknown"
+        if a == "hours" and number_value(right) == 24:
+            return "time"
+        if not numbers:
+            return "unknown"
+        return ("number" if b == "currency" else "currency") if a == "currency" else "number"
+    return "number" if numbers else "unknown"  # ^
+
+
+def text_kind(values: list[Any]) -> str:
+    """What a text column holds for formulas: Excel computes with numbers, dates and times written as text too."""
+    values = [v for v in values if v is not None and str(v).strip()]
+    if not values:
+        return "unknown"
+    if all(isinstance(v, int | float) or parse_number_text(str(v)) is not None for v in values):
+        return "number"
+    if all(isinstance(v, str) and parse_date(v) for v in values):
+        return "date"
+    if all(isinstance(v, str) and parse_time(v) is not None for v in values):
+        return "time"
+    return "text"
+
+
+class FormulaUse(NamedTuple):
+    """A cell that a formula computes with (+ - * / ^)."""
+
+    place: str  # of the formula, for messages
+    sheet: int  # the formula's sheet
+    token: FormulaToken
+    target: tuple[int, int]  # the cell's sheet and column
+    rows: list[int]  # the data rows it reads (from 0; -1 is the header row)
+
+
+class Book:
+    """The workbook the checks and the writer work on: the prepared sheets (prepare_sheet), their written names, and
+    the checked formulas of the columns and of single cells."""
+
+    def __init__(
+        self, sheets: list[ExcelSheet], names: list[str], decimal_comma: bool | None = None, currency: str = "EUR"
+    ) -> None:
+        self.sheets, self.names, self.decimal_comma, self.currency = sheets, names, decimal_comma, currency
+        self.lookup = sheet_lookup(sheets, names)
+        self.columns: dict[tuple[int, int], str] = {}  # (sheet, column): the column formula, with {row}
+        self.cells: dict[tuple[int, int, int], str] = {}  # (sheet, data row from 0, column): a formula in one cell
+        self._parsed: dict[str, tuple[list[FormulaToken], FormulaNode]] = {}
+        self._kinds: dict[tuple[int, int], str] = {}
+
+    def where(self, s: int) -> str:
+        sheet = self.sheets[s]
+        return f"sheets[{sheet._index if sheet._index >= 0 else s}]"
+
+    def last_rows(self, s: int) -> dict[str, int]:
+        """The last data row of every sheet by written name, "" for sheet s (for whole columns such as B:B)."""
+        rows = {name: len(sheet.rows) + 1 for name, sheet in zip(self.names, self.sheets, strict=True)}
+        return {**rows, "": len(self.sheets[s].rows) + 1}
+
+    def columns_hint(self, s: int) -> str:
+        """'columns of 'S': A=Artikel, B=Menge, …', for messages about formulas: models miscount the letters."""
+        columns = self.sheets[s].columns
+        listed = [f"{get_column_letter(c + 1)}={to_plain(column.header.strip())[:25]}" for c, column in
+                  enumerate(columns[:26])]  # fmt: skip
+        return f"columns of '{self.names[s]}': " + ", ".join(listed) + (", …" if len(columns) > 26 else "")
+
+    def add_cell_formula(self, s: int, r: int, c: int, value: str) -> str | None:
+        """Check a formula written into a cell and keep it; returns a message if it is sent back. In a column of type
+        text it stays text, and so does a formula that reaches outside (HYPERLINK, ...) unless the column takes
+        numbers. A formula that is merely not allowed or broken is sent back, so the model can rewrite it."""
+        column = self.sheets[s].columns[c]
+        if column.type == "text" and "type" in column.model_fields_set:
+            return None
+        try:
+            place = (self.names[s], c + 1, r + 2)
+            self.cells[(s, r, c)] = normalize_formula(value, False, self.lookup, self.last_rows(s), place)
+        except UnsafeFormula as e:
+            if column.type in NUMBER_TYPES:
+                return f"the formula '{value.strip()[:60]}' is not allowed: {e}"
+        except ValueError as e:
+            if column.type in NUMBER_TYPES or FORMULA_LIKE_RE.match(value.strip()):
+                return f"the formula '{value.strip()[:60]}' in '{column.header.strip()}' is not allowed: {e}"
+        return None
+
+    def parsed(self, formula: str) -> tuple[list[FormulaToken], FormulaNode]:
+        """The tokens and tree of a checked formula."""
+        if formula not in self._parsed:
+            tokens = parse_formula(formula, self.lookup)
+            self._parsed[formula] = tokens, formula_tree(tokens)
+        return self._parsed[formula]
+
+    def formulas(self) -> list[tuple[int, int, int | None, str, str]]:
+        """Every formula as (sheet, column, data row or None for a column formula, place for messages, formula)."""
+        result = [(s, c, None, f"{self.where(s)}.columns[{c}].formula", f) for (s, c), f in self.columns.items()]
+        return result + [(s, c, r, f"{self.where(s)}.rows[{r}]", f) for (s, r, c), f in self.cells.items()]
+
+    def target(self, token: FormulaToken, s: int) -> tuple[int, int]:
+        """(sheet, column) of a cell in a formula of sheet s."""
+        return (self.names.index(token.sheet) if token.sheet else s), _column_number(token.column) - 1
+
+    def cell_name(self, token: FormulaToken) -> str:
+        return token.text if "!" in token.text or not token.sheet else _sheet_prefix(token.sheet) + token.text
+
+    def value(self, s: int, r: int, c: int) -> Any:
+        """What is written into data row r (from 0) of column c: a number, date, text or None."""
+        rows = self.sheets[s].rows
+        raw = rows[r][c] if 0 <= r < len(rows) and c < len(rows[r]) else None
+        return convert_value(raw, self.sheets[s].columns[c].type, self.decimal_comma)[0]
+
+    def used_columns(self) -> set[tuple[int, int]]:
+        """(sheet, column) of every column a formula uses, the columns of ranges included."""
+        used = set()
+        for s, _, _, _, formula in self.formulas():
+            for node in walk(self.parsed(formula)[1]):
+                if node.kind == "cell" and node.cell is not None:
+                    used.add(self.target(node.cell, s))
+                elif node.kind == "range":
+                    (t, a), (_, b) = (self.target(arg.cell, s) for arg in node.args if arg.cell is not None)
+                    used.update((t, c) for c in range(min(a, b), max(a, b) + 1))
+        return used
+
+    def arithmetic_uses(self) -> list[FormulaUse]:
+        """The cells that formulas compute with: operands of + - * / ^, also -B2 and B2%."""
+        uses = []
+        for s, _, r, place, formula in self.formulas():
+            for node in walk(self.parsed(formula)[1]):
+                if node.kind in ("unary", "percent") or (node.kind == "binary" and node.text in ARITHMETIC):
+                    for arg in node.args:
+                        if arg.kind == "cell" and arg.cell is not None:
+                            if arg.cell.row == "{row}":
+                                rows = list(range(len(self.sheets[s].rows))) if r is None else [r]
+                            else:
+                                rows = [int(arg.cell.row) - 2]
+                            uses.append(FormulaUse(place, s, arg.cell, self.target(arg.cell, s), rows))
+        return uses
+
+    def kind(self, s: int, c: int) -> str:
+        """What the cells of a column hold: its type; for a formula column without a type what the formula gives;
+        for a text column what its values are."""
+        key = (s, c)
+        if key not in self._kinds:
+            self._kinds[key] = "unknown"  # a formula that uses its own column (sent back elsewhere)
+            column = self.sheets[s].columns[c]
+            if column.type != "text":
+                kind = column.type
+            elif key in self.columns:
+                kind = self.expression_kind(self.parsed(self.columns[key])[1], s)
+            else:
+                kind = text_kind([self.value(s, r, c) for r in range(len(self.sheets[s].rows))])
+            self._kinds[key] = kind
+        return self._kinds[key]
+
+    def expression_kind(self, node: FormulaNode, s: int) -> str:
+        """What a formula (or part of one) gives, from the kinds of the cells it uses."""
+        if node.kind == "empty":
+            return "unknown"
+        if node.kind == "number":
+            return "number" if "." in node.text else "integer"
+        if node.kind in ("string", "bool"):
+            return "text" if node.kind == "string" else "bool"
+        if node.kind in ("cell", "range"):
+            cell = node.cell if node.kind == "cell" else node.args[0].cell
+            assert cell is not None
+            t, c = self.target(cell, s)
+            if cell.row == "1" or c >= len(self.sheets[t].columns):
+                return "text" if cell.row == "1" else "unknown"
+            return self.kind(t, c)
+        if node.kind == "unary":
+            return self.expression_kind(node.args[0], s)
+        if node.kind == "percent":
+            return "number"
+        if node.kind == "binary":
+            left, right = node.args
+            a, b = self.expression_kind(left, s), self.expression_kind(right, s)
+            return operation_kind(node.text, a, b, left, right)
+        return self._call_kind(node, s)
+
+    def _call_kind(self, node: FormulaNode, s: int) -> str:
+        name, args = node.text, node.args
+
+        def kinds(nodes: Collection[FormulaNode]) -> list[str]:  # "" in IF(…, "", B*C) says nothing
+            return [self.expression_kind(n, s) for n in nodes if n.kind not in ("string", "empty")] or ["text"]
+
+        if name in ("SUM", "MIN", "MAX", "AVERAGE", "MEDIAN", "PRODUCT"):
+            return common_kind(kinds(args)) if name != "PRODUCT" or len(args) == 1 else "number"
+        if name in ("ROUND", "ROUNDUP", "ROUNDDOWN", "ABS", "MOD", "INT"):
+            kind = self.expression_kind(args[0], s)
+            return "integer" if name == "INT" and kind == "number" else kind
+        if name in ("SUMIF", "AVERAGEIF"):
+            return self.expression_kind(args[2] if len(args) > 2 else args[0], s)
+        if name in ("SUMIFS", "AVERAGEIFS", "MAXIFS", "MINIFS", "INDEX"):
+            return self.expression_kind(args[0], s)
+        if name == "XLOOKUP":
+            return self.expression_kind(args[2], s)
+        if name in ("IF", "IFERROR", "IFS"):
+            return common_kind(kinds(args[1:] if name == "IF" else args if name == "IFERROR" else args[1::2]))
+        if name in COUNTING_FUNCTIONS:
+            return "integer"
+        if name in ("DATE", "TODAY", "EDATE", "EOMONTH"):
+            return "date"
+        if name == "TIME":
+            return "time"
+        if name in TEXT_FUNCTIONS:
+            return "text"
+        if name in CONDITION_FUNCTIONS:
+            return "bool"
+        if name == "VLOOKUP" and args[1].kind == "range" and (index := number_value(args[2])) is not None:
+            first = args[1].args[0].cell
+            assert first is not None
+            t, c = self.target(first, s)
+            column = c + int(index) - 1
+            return self.kind(t, column) if 0 <= column < len(self.sheets[t].columns) else "unknown"
+        return "number" if name in ("POWER", "SQRT") else "unknown"
+
+    def evaluate(self, node: FormulaNode, s: int, r: int) -> float | None:
+        """The value of a formula of + - * / ^ with numbers and number cells of its own sheet in data row r; None if
+        it uses anything else (functions, text, other sheets, formula columns)."""
+        if node.kind == "number":
+            return float(node.text)
+        if node.kind == "cell" and node.cell is not None:
+            t, c = self.target(node.cell, s)
+            row = r if node.cell.row == "{row}" else int(node.cell.row) - 2
+            if t != s or c >= len(self.sheets[s].columns) or not 0 <= row < len(self.sheets[s].rows):
+                return None
+            if (s, c) in self.columns or (s, row, c) in self.cells:
+                return None
+            if self.sheets[s].columns[c].type not in NUMBER_TYPES:
+                return None
+            value = self.value(s, row, c)
+            return 0.0 if value is None else float(value) if isinstance(value, int | float) else None
+        values = [self.evaluate(arg, s, r) for arg in node.args]
+        if not values or None in values or node.kind not in ("unary", "percent", "binary"):
+            return None
+        if node.kind == "unary":
+            return -values[0] if node.text == "-" else values[0]
+        if node.kind == "percent":
+            return values[0] / 100
+        a, b = values
+        try:
+            match node.text:
+                case "+":
+                    return a + b
+                case "-":
+                    return a - b
+                case "*":
+                    return a * b
+                case "/":
+                    return a / b if b else None
+                case "^":
+                    return float(a**b) if abs(b) <= 100 else None
+        except (OverflowError, ZeroDivisionError, TypeError):
+            return None
+        return None
+
+    def currencies(self, s: int, c: int) -> list[str]:
+        """The currencies written with the values of a column ('$1,200.00'), in order of appearance."""
+        return list(dict.fromkeys(code for row in self.sheets[s].rows if (code := value_currency(row[c]))))
+
+    def currency_of(self, s: int, c: int, seen: frozenset[tuple[int, int]] = frozenset()) -> str:
+        """The currency of a column: the one written with its values, for a formula column the one of the first
+        currency column it uses, otherwise the currency valve."""
+        if (s, c) in self.columns and (s, c) not in seen:
+            for token in self.parsed(self.columns[(s, c)])[0]:
+                if token.kind == "cell":
+                    t, u = self.target(token, s)
+                    if u < len(self.sheets[t].columns) and (t, u) != (s, c) and self.kind(t, u) == "currency":
+                        return self.currency_of(t, u, seen | {(s, c)})
+            return self.currency
+        found = self.currencies(s, c)
+        return found[0] if len(found) == 1 else self.currency
+
+    def number_format(self, s: int, c: int, values: list[Any], date_format: str) -> str | None:
+        """The number format of a column from its type; a formula column without a type gets the format of what its
+        formula gives (a deadline =B{row}+14 a date, quantity * price the currency)."""
+        column = self.sheets[s].columns[c]
+        formula = (s, c) in self.columns
+        kind = self.kind(s, c) if formula and column.type == "text" else column.type
+        match kind:
+            case "integer":
+                return "#,##0"
+            case "number" | "hours":
+                decimals = _decimals(values) if not formula else 2
+                return "#,##0" + ("." + "0" * decimals if decimals else "")
+            case "currency":
+                return CURRENCY_FORMATS[self.currency_of(s, c)]
+            case "percent":
+                fractional = any(isinstance(v, float) and not round(v * 100, 9).is_integer() for v in values)
+                return "0.0%" if formula or fractional else "0%"
+            case "date":
+                timed = any(isinstance(v, datetime) and (v.hour, v.minute, v.second) != (0, 0, 0) for v in values)
+                return date_format + (" hh:mm" if timed else "")
+            case "time":  # a duration may be 24 hours or more: [h]
+                if formula or any(isinstance(v, float) and v >= 1 for v in values):
+                    return "[h]:mm"
+                return "hh:mm:ss" if any(isinstance(v, float) and round(v * 86400) % 60 for v in values) else "hh:mm"
+        return None
+
+
+def check_excel(
+    sheets: list[ExcelSheet], decimal_comma: bool | None = None, names: list[str] | None = None, currency: str = "EUR"
+) -> Book:
+    """Validate the prepared sheets (prepare_sheet) and return the workbook with its checked formulas. `names` are
+    the written sheet names (see sheet_names), which formulas use for cells of other sheets."""
+    check = Checker()
+    book = Book(sheets, names or sheet_names(sheets), decimal_comma, currency)
+    check.require(bool(sheets), "sheets: the workbook has no sheets")
+    check.require(len(sheets) <= MAX_SHEETS, f"sheets: at most {MAX_SHEETS} sheets")
+    cells = sum(len(sheet.rows) * len(sheet.columns) for sheet in sheets)
+    check.require(cells <= MAX_CELLS, f"sheets: at most {MAX_CELLS} cells in all sheets together ({cells} sent)")
+    complete, charted = [], set()
+    for s, sheet in enumerate(sheets):
+        where = book.where(s)
+        headers = [column.header.strip() for column in sheet.columns]
+        check.require(bool(sheet.columns), f"{where}.columns: the sheet has no columns")
+        check.require(len(sheet.columns) <= MAX_SHEET_COLUMNS, f"{where}.columns: at most {MAX_SHEET_COLUMNS} columns")
+        check.require(len(sheet.rows) <= MAX_SHEET_ROWS, f"{where}.rows: at most {MAX_SHEET_ROWS} rows")
+        check.text(sheet.name, *headers)
+        hint = book.columns_hint(s) if sheet.columns else ""
+        for c, column in enumerate(sheet.columns):
+            if column.formula.strip():
+                try:
+                    book.columns[(s, c)] = normalize_formula(column.formula, True, book.lookup, book.last_rows(s))
+                except ValueError as e:
+                    check.require(False, f"{where}.columns[{c}].formula: {e} ({hint})")
+        fits = all(len(row) <= len(sheet.columns) for row in sheet.rows)
+        for r, row in enumerate(sheet.rows):
+            check.require(
+                len(row) <= len(sheet.columns),
+                f"{where}.rows[{r}]: {len(row)} values but only {len(sheet.columns)} columns",
+            )
+            for c, value in enumerate(row):
+                if not isinstance(value, str):
+                    continue
+                check.text(value)
+                check.require(
+                    len(value) <= MAX_CELL_CHARS, f"{where}.rows[{r}]: a cell has more than {MAX_CELL_CHARS} characters"
+                )
+                formula = fits and value.strip().startswith("=") and (s, c) not in book.columns
+                if formula and (problem := book.add_cell_formula(s, r, c, value)):
+                    check.errors.append(f"{where}.rows[{r}]: {problem} ({hint})")
+        check.require(len(sheet.charts) <= MAX_SHEET_CHARTS, f"{where}.chart: at most {MAX_SHEET_CHARTS} charts")
+        for k, chart in enumerate(sheet.charts):
+            place = f"{where}.chart" + (f"[{k}]" if isinstance(sheet.chart, list) else "")
+            if check.require(bool(sheet.rows), f"{place}: the sheet has no rows to plot"):
+                try:
+                    layout = chart_layout(sheet, chart)
+                except ValueError as e:
+                    check.errors.extend(f"{place}.{error}" for error in e.args[0])
+                    continue
+                first, last = layout.categories[:2]
+                plotted = range(first, last + 1) if layout.by_rows else (index for _, index in layout.series)
+                charted.update((s, column - 1) for column in plotted)
+        if len(check.errors) > MAX_ERRORS_SHOWN:
+            break
+        if sheet.rows and fits:
+            complete.append(s)
+    used = book.used_columns()
+    for s in complete:
+        check.errors.extend(_column_problems(book, s, used, charted))
+    if not check.errors:  # all sheets are complete: cells of other sheets can be looked up
+        for problems in (_reference_problems, _percent_problems, _arithmetic_problems, _kind_problems, _value_problems):
+            check.errors.extend(problems(book))
+    check.raise_if_failed()
+    return book
+
+
+def number_advice(text: str, header: str) -> str:
+    """How to send a text of a number column as a number: '3 h' -> the unit into the header."""
+    match = UNIT_TEXT_RE.fullmatch(text.strip())
+    if match and match["about"]:
+        number, about = match["number"].strip(), match["about"].strip()
+        return f"send the number ({number}); a note such as '{about}' goes into a text column"
+    if match and match["unit"]:
+        unit = match["unit"].strip()
+        return f"send the number ({match['number'].strip()}) and put the unit into the header, e.g. '{header} ({unit})'"
+    return "send a number, or null for an empty cell"
+
+
+def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: set[tuple[int, int]]) -> list[str]:
+    """Columns whose content cannot be what the model meant; these usually come from rows whose values are
+    shifted against the columns, or from values the model forgot or wrote as text."""
+    sheet, where, rows = book.sheets[s], book.where(s), book.sheets[s].rows
+    formulas = {c: f for (t, c), f in book.columns.items() if t == s}
+    problems: list[str] = []
+    filled = [any(row[c] is not None and str(row[c]).strip() for row in rows) for c in range(len(sheet.columns))]
+    for c, column in enumerate(sheet.columns):
+        header = column.header.strip()
+        name = f"{where}.columns[{c}] ('{header}')"
+        if c in formulas:
+            continue
+        if column.total != "none" and not filled[c]:
+            problems.append(
+                f"{name}: the total needs values in this column: fill them in, give the column a formula "
+                "(e.g. '=B{row}*C{row}'), or put the total on the column with the numbers"
+            )
+        uses = [what for what, given in (("the total", column.total != "none"), ("the formulas", (s, c) in used),
+                                         ("the chart", (s, c) in charted)) if given]  # fmt: skip
+        values = [(r, row[c]) for r, row in enumerate(rows)
+                  if row[c] is not None and str(row[c]).strip() and (s, r, c) not in book.cells]  # fmt: skip
+        texts = [(r, v) for r, v in values if not convert_value(v, column.type, book.decimal_comma)[1]]
+        words = [(r, v) for r, v in texts if str(v).strip().lower() not in PLACEHOLDERS]
+        if column.type in NUMBER_TYPES:
+            if len(texts) >= 2 and len(texts) * 2 > len(values):
+                example = str(texts[0][1])
+                advice = (
+                    "If they are numbers with a unit: " + number_advice(example, header)
+                    if UNIT_TEXT_RE.fullmatch(example.strip())
+                    else "Each row needs one value per column, in column order - is a column missing? Or give the "
+                    "column type 'text'."
+                )
+                count = f"{len(texts)} of {len(values)}"
+                problems.append(f"{name}: {count} values are not numbers (e.g. '{example}'). {advice}")
+            elif column.type == "percent" and (fraction := _fractions_only([v for _, v in values], book)) is not None:
+                problems.append(
+                    f"{name}: all values are below 1 (e.g. {fraction}), but a percent column takes percent numbers: "
+                    f"5 means 5 %, so {fraction} would show as {fraction} %. Send 5 for 5 % (or '5 %'); a value that "
+                    f"really is below 1 % needs the sign, e.g. '0.5 %'."
+                )
+            elif words and uses:
+                r, value = words[0]
+                more = f" (and {len(words) - 1} more)" if len(words) > 1 else ""
+                problems.append(
+                    f"{where}.rows[{r}]: '{value}' in '{header}' is not a number{more}, so {' and '.join(uses)} "
+                    f"cannot count it: {number_advice(str(value), header)}"
+                )
+            if column.type == "currency" and len(found := book.currencies(s, c)) > 1:
+                problems.append(
+                    f"{name}: the values have different currencies ({', '.join(found)}); a column has one currency: "
+                    "put each currency into a column of its own, or convert the amounts"
+                )
+        elif column.type in TIME_TYPES:
+            problem = date_problem if column.type == "date" else time_problem
+            found = next(((r, text) for r, v in values if (text := problem(v))), None)
+            if found:
+                problems.append(f"{where}.rows[{found[0]}]: {found[1]} (column '{header}')")
+            elif words and uses:
+                r, value = words[0]
+                problems.append(
+                    f"{where}.rows[{r}]: '{value}' in '{header}' is not a {column.type}, so {' and '.join(uses)} "
+                    "cannot use it: leave the cell empty (null) and put such notes into a text column"
+                )
+    hint = book.columns_hint(s)
+    for c, formula in formulas.items():
+        tokens = book.parsed(formula)[0]
+        own_sheet = [
+            (i, token) for i, token in enumerate(tokens)
+            if token.kind == "cell" and book.target(token, s)[0] == s
+        ]  # fmt: skip
+        letter = get_column_letter(c + 1)
+        if any(token.column == letter for _, token in own_sheet):
+            problems.append(
+                f"{where}.columns[{c}] ('{sheet.columns[c].header.strip()}'): the formula uses its own column "
+                f"{letter}; it may only use the other columns (e.g. quantity * price) ({hint})"
+            )
+            continue
+        for i, token in own_sheet:
+            used_column = _column_number(token.column) - 1
+            in_range = (i and tokens[i - 1].text == ":") or (i + 1 < len(tokens) and tokens[i + 1].text == ":")
+            if used_column >= len(sheet.columns) and not in_range:
+                problems.append(
+                    f"{where}.columns[{c}] ('{sheet.columns[c].header.strip()}'): the formula uses {token.text}, but "
+                    f"the sheet has only the columns A to {get_column_letter(len(sheet.columns))} ({hint})"
+                )
+                break
+        for letters in dict.fromkeys(token.column for _, token in own_sheet):
+            used_column = _column_number(letters) - 1
+            if used_column < len(sheet.columns) and used_column not in formulas and not filled[used_column]:
+                problems.append(
+                    f"{where}.columns[{used_column}] ('{sheet.columns[used_column].header.strip()}') is empty, but the "
+                    f"formula of '{sheet.columns[c].header.strip()}' uses it: fill in its values ({hint})"
+                )
+    if problem := _total_row_problem(sheet, rows, where, formulas):
+        problems.append(problem)
+    return problems
+
+
+def _fractions_only(values: list[Any], book: Book) -> float | None:
+    """The first value if every value of a percent column but 0 is a plain number between -1 and 1: the model sent
+    fractions (0.05 for 5 %), which the column would show as 0.05 %. None if any value has a '%' or is 1 or more."""
+    numbers = []
+    for value in values:
+        if isinstance(value, bool) or str(value).strip().lower() in PLACEHOLDERS:
+            continue
+        if isinstance(value, int | float):
+            numbers.append(value)
+        elif isinstance(value, str) and (parsed := parse_number_text(value, book.decimal_comma)) and not parsed[1]:
+            numbers.append(parsed[0])
+        else:
+            return None
+    numbers = [n for n in numbers if n != 0]
+    return numbers[0] if numbers and all(abs(n) < 1 for n in numbers) else None
+
+
+def factors(node: FormulaNode) -> list[FormulaNode]:
+    """The cells a part of a formula multiplies: B{row} and C{row} in -B{row}*C{row}/D{row}, none in (1-C{row})."""
+    if node.kind == "cell":
+        return [node]
+    if node.kind == "binary" and node.text in ("*", "/"):
+        return factors(node.args[0]) + (factors(node.args[1]) if node.text == "*" else [])
+    return factors(node.args[0]) if node.kind == "unary" else []
+
+
+def _percent_problems(book: Book) -> list[str]:
+    """Formulas that treat a percent cell as a percent number: a percent cell holds the fraction (5 % is 0.05), so
+    '/100', '*0.01' or '%' on it divides a second time, and '*100' in a percent column shows 100 times the share
+    (2500 %)."""
+    problems: list[str] = []
+    for s, c, _, place, formula in book.formulas():
+        nodes = list(walk(book.parsed(formula)[1]))
+        column = book.sheets[s].columns[c]
+        if column.type == "percent" and any(
+            node.kind == "binary" and node.text == "*" and 100 in map(number_value, node.args) for node in nodes
+        ):
+            problems.append(
+                f"{place}: '{column.header.strip()}' is a percent column, whose cells hold the fraction "
+                f"(0.25 shows as 25 %): drop the *100, or 25 % shows as 2500 %"
+            )
+        for node in nodes:
+            if node.kind == "binary" and node.text == "/" and number_value(node.args[1]) == 100:
+                cells, written = factors(node.args[0]), "/100"
+            elif node.kind == "binary" and node.text == "*" and 0.01 in map(number_value, node.args):
+                cells, written = [cell for arg in node.args for cell in factors(arg)], "*0.01"
+            elif node.kind == "percent":
+                cells, written = factors(node.args[0]), "%"
+            else:
+                continue
+            for cell in cells:
+                assert cell.cell is not None
+                t, target = book.target(cell.cell, s)
+                if target < len(book.sheets[t].columns) and book.sheets[t].columns[target].type == "percent":
+                    name = book.cell_name(cell.cell)
+                    problems.append(
+                        f"{place}: {name} is a percent cell ('{book.sheets[t].columns[target].header.strip()}'), which "
+                        f"already holds the fraction (5 % is 0.05): write {name} instead of {name}{written}"
+                    )
+    return problems
+
+
+def _reference_problems(book: Book) -> list[str]:
+    """Single cells of other sheets that are empty: models count the rows there wrong (row 1 is the header), and
+    an empty cell silently counts as 0. Ranges may reach beyond the data, e.g. in SUMIF."""
+    sheets = book.sheets
+
+    def filled(t: int, row: int, column: int) -> bool:
+        target = sheets[t]
+        if not 1 <= column <= len(target.columns):
+            return False
+        if row == 1:
+            return bool(target.columns[column - 1].header.strip())
+        if row == len(target.rows) + 2 and has_totals(target):  # the total row, with its label in column A
+            return target.columns[column - 1].total != "none" or column == 1
+        if not 2 <= row <= len(target.rows) + 1:
+            return False
+        value = target.rows[row - 2][column - 1]
+        return (t, column - 1) in book.columns or (value is not None and str(value).strip() != "")
+
+    problems: list[str] = []
+    for s, _, _, place, formula in book.formulas():
+        tokens, tree = book.parsed(formula)
+        in_ranges = {arg.index for node in walk(tree) if node.kind == "range" for arg in node.args}
+        for i, token in enumerate(tokens):
+            if token.kind != "cell" or i in in_ranges or not token.sheet or book.target(token, s)[0] == s:
+                continue
+            t, column = book.names.index(token.sheet), _column_number(token.column)
+            target, cell = sheets[t], f"'{token.sheet}'!{token.column}{token.row}"
+            if token.row == "{row}":
+                if not any(filled(t, row, column) for row in range(2, len(target.rows) + 2)):
+                    problems.append(
+                        f"{place}: {cell} is empty: '{token.sheet}' has no values in column {token.column} (it has "
+                        f"the columns A to {get_column_letter(len(target.columns))})"
+                    )
+                elif len(target.rows) < len(sheets[s].rows):
+                    problems.append(
+                        f"{place}: {cell} is empty in the last rows: '{token.sheet}' has {len(target.rows)} "
+                        f"data rows, this sheet {len(sheets[s].rows)}"
+                    )
+            elif not filled(t, int(token.row), column):
+                total = f", total row {len(target.rows) + 2}" if has_totals(target) else ""
+                problems.append(
+                    f"{place}: {cell} is an empty cell. On '{token.sheet}', row 1 is the header and the data "
+                    f"is in rows 2 to {len(target.rows) + 1}{total}, columns A to "
+                    f"{get_column_letter(len(target.columns))}"
+                )
+    return problems
+
+
+def _arithmetic_problems(book: Book) -> list[str]:
+    """Formulas that compute (+ - * / ^) with text, which Excel shows as #VALUE!: a text column (usually the column
+    letters were miscounted: '=A{row}*B{row}' with the article names in A), the header row, or single texts in the
+    rows (a word or '-' where a number belongs). Comparisons, SUM and the like may use text."""
+    problems: list[str] = []
+    reported = set()
+    for use in book.arithmetic_uses():
+        t, column = use.target
+        target = book.sheets[t]
+        key = (use.place, use.target)
+        if column >= len(target.columns) or use.target in book.columns or key in reported:
+            continue
+        header, name = target.columns[column].header.strip(), book.cell_name(use.token)
+        if -1 in use.rows:
+            reported.add(key)
+            problems.append(
+                f"{use.place}: {name} is in the header row ('{header}'), and computing with its text gives #VALUE!; "
+                f"the data starts in row 2 ({book.columns_hint(t)})"
+            )
+            continue
+        bad = [(r, value) for r in use.rows if 0 <= r < len(target.rows) and (t, r, column) not in book.cells
+               and not computable(value := book.value(t, r, column))]  # fmt: skip
+        if not bad:
+            continue
+        reported.add(key)
+        values = [book.value(t, r, column) for r in range(len(target.rows))]
+        if not any(value is not None and computable(value) for value in values):
+            problems.append(
+                f"{use.place}: the formula computes with {name}, but '{header}' holds text (e.g. '{bad[0][1]}'), which "
+                f"gives #VALUE!; is the column letter right? ({book.columns_hint(t)})"
+            )
+        else:
+            r, value = bad[0]
+            more = f" (and {len(bad) - 1} more rows)" if len(bad) > 1 else ""
+            problems.append(
+                f"{use.place}: the formula computes with '{header}' ({name}), but {book.where(t)}.rows[{r}] has "
+                f"'{value}' there{more}, which gives #VALUE!: send a number, or null for an empty cell"
+            )
+    return problems
+
+
+def _kind_problems(book: Book) -> list[str]:
+    """Column formulas whose result the column type would show wrong: times subtracted in a number column (a
+    fraction of a day: 0.35 for 8:30), times * 24 in a time column (204:00), a date in a number column."""
+    problems: list[str] = []
+    for (s, c), formula in book.columns.items():
+        column = book.sheets[s].columns[c]
+        kind = book.expression_kind(book.parsed(formula)[1], s)
+        place = f"{book.where(s)}.columns[{c}] ('{column.header.strip()}')"
+        if kind == "time" and column.type in NUMBER_TYPES:
+            problems.append(
+                f"{place}: the formula computes with times, which Excel holds as fractions of a day (8 hours are "
+                f"0.33), so this {column.type} column would show 0.35 for 8:30. For hours as a number multiply by 24 "
+                f"(=({formula[1:]})*24), or give the column the type time to show 8:30"
+            )
+        elif kind == "hours" and column.type == "time":
+            problems.append(
+                f"{place}: a time column shows the fraction of a day as hh:mm, but the formula multiplies the times "
+                "by 24, so 8:30 would show as 204:00: drop the *24, or give the column the type number for hours as "
+                "a number (8.5)"
+            )
+        elif kind == "date" and column.type in NUMBER_TYPES:
+            problems.append(
+                f"{place}: the formula gives a date, which this {column.type} column would show as a number "
+                "(e.g. 46328): give the column the type date"
+            )
+    return problems
+
+
+def _value_problems(book: Book) -> list[str]:
+    """Values sent in a formula column that differ from what its formula computes: the formula fills the column,
+    so either it uses the wrong columns (miscounted letters, a percent trap) or the values are wrong (e.g. sums of
+    rows below the data, which the formula overwrites with 0). Only formulas of + - * / with numbers and cells of
+    the same sheet are computed (see Book.evaluate); 0 and the same value in every row are placeholders."""
+    problems: list[str] = []
+    for (s, c), formula in book.columns.items():
+        sheet, column = book.sheets[s], book.sheets[s].columns[c]
+        tree = book.parsed(formula)[1]
+        differ, sent_values = [], set()
+        for r, row in enumerate(sheet.rows):
+            sent = row[c]
+            if sent is None or isinstance(sent, bool) or (isinstance(sent, str) and sent.strip()[:1] in ("", "=")):
+                continue
+            sent_values.add(str(sent))
+            computed = book.evaluate(tree, s, r)
+            number, typed = convert_value(sent, column.type if column.type in NUMBER_TYPES else "number",
+                                          book.decimal_comma)  # fmt: skip
+            if computed is None or not typed or not isinstance(number, int | float) or number == 0:
+                continue  # 0 for "the formula fills it in"
+            plain = sent if isinstance(sent, int | float) else number  # a percent sent as 0.25 for 25 %
+            if not any(abs(x - computed) <= max(0.015, 0.01 * abs(computed)) for x in (number, plain)):
+                differ.append((r, sent, computed))
+        if differ and len(sent_values) > 1:  # the same value in every row is a placeholder too
+            r, sent, computed = differ[0]
+            shown = f"{round(computed * 100, 4):g} %" if column.type == "percent" else f"{round(computed, 4):g}"
+            more = f" ({len(differ)} of {len(sheet.rows)} rows differ)" if len(differ) > 1 else ""
+            header = column.header.strip()
+            problems.append(
+                f"{book.where(s)}.rows[{r}]: the formula {formula} of '{header}' gives {shown} in this row, but the "
+                f"row sends {json.dumps(sent, ensure_ascii=False)}{more}. The formula fills the column, the values "
+                f"sent for it are not used: check which columns it uses ({book.columns_hint(s)}), and send null for "
+                f"'{header}'"
+            )
+    return problems
+
+
+# 'Summe', 'Netto-Summe', 'Summe Ausgaben', 'Gesamt (EUR):' …; the whole label: 'Total Quality Management' is none
+TOTAL_ROW_LABEL_RE = re.compile(
+    r"(?:(?:netto|brutto|zwischen|gesamt)[- ]?)?"
+    r"(?:summe(?:\s+[^\W\d_]+)?|gesamt(?:summe|betrag|kosten|preis)?(?:\s+(?:netto|brutto))?|insgesamt|total|sum)"
+    r"\s*(?:\([^()]*\))?\s*:?",
+    re.IGNORECASE,
+)
+
+
+def _total_row_problem(sheet: ExcelSheet, rows: list[list[Any]], where: str, formulas: dict[int, str]) -> str | None:
+    """A total row written into the rows: with column formulas it gets them too (quantity * price of the total
+    row), next to a column's "total" it is counted twice, and without its own values it adds up nothing. The
+    column's "total" builds a correct one."""
+    label = rows[-1][0] if len(rows) >= 2 and rows[-1] else None
+    if not isinstance(label, str) or not TOTAL_ROW_LABEL_RE.fullmatch(to_plain(label).strip()):
+        return None
+    numbers = bool(formulas) or any(c.total != "none" or c.type in NUMBER_TYPES for c in sheet.columns[1:])
+    others = [v for c, v in enumerate(rows[-1]) if c > 0 and c not in formulas and v is not None and str(v).strip()]
+    totals = any(c.total != "none" for c in sheet.columns)
+    if not numbers or (others and not formulas and not totals):
+        return None  # nothing to add up, or the model's own sums ('=SUM(…)' cells are written as formulas)
+    return (
+        f"{where}.rows[{len(rows) - 1}] ('{label.strip()}') is a total row: remove it and set \"total\" "
+        '(e.g. "sum") on the columns to add up; the tool adds the total row with the right formulas'
+    )
 
 
 @dataclass
@@ -2439,13 +3429,14 @@ class ChartLayout:
 
 
 def chart_layout(sheet: ExcelSheet, chart: ExcelChart) -> ChartLayout:
-    """Work out what to plot; raises ValueError with a list of messages for the model."""
+    """Work out what to plot (the rows of a prepared sheet, see prepare_sheet); raises ValueError with a list of
+    messages for the model."""
     headers = [column.header.strip() for column in sheet.columns]
     last_row = len(sheet.rows) + 1
     listed = f"({', '.join(headers)})"
     errors: list[str] = []
     if chart.series_rows:
-        labels = [to_plain(str(row[0] if row and row[0] is not None else "")) for row in align_rows(sheet)]
+        labels = [to_plain(str(row[0] if row and row[0] is not None else "")) for row in sheet.rows]
         keys = [label.casefold() for label in labels]
         series = []
         for name in chart.series_rows:
@@ -2483,7 +3474,6 @@ def chart_layout(sheet: ExcelSheet, chart: ExcelChart) -> ChartLayout:
         for name in chart.value_columns
         if name.strip() not in headers
     ]
-    rows = align_rows(sheet)
     for name in chart.value_columns:
         if name.strip() in headers:
             c = headers.index(name.strip())
@@ -2494,7 +3484,7 @@ def chart_layout(sheet: ExcelSheet, chart: ExcelChart) -> ChartLayout:
                     isinstance(row[c], str)
                     and (parse_number_text(row[c]) is not None or row[c].strip().startswith("="))
                 )
-                for row in rows
+                for row in sheet.rows
             )
             if not column.formula.strip() and not has_numbers:
                 errors.append(f"value_columns: '{name}' has no numbers to plot")
@@ -2503,6 +3493,9 @@ def chart_layout(sheet: ExcelSheet, chart: ExcelChart) -> ChartLayout:
     category = headers.index(chart.category_column.strip()) + 1
     series = [(name.strip(), headers.index(name.strip()) + 1) for name in chart.value_columns]
     return ChartLayout(False, series, (category, category, 2, last_row))
+
+
+CHART_ROWS = 22  # charts below each other next to the table, one every 22 rows
 
 
 class XlsxWriter:
@@ -2523,21 +3516,20 @@ class XlsxWriter:
         self.chart_titles: dict[str, list[str]] = {}  # per sheet, for the text version
         self.narrow_font = design.font.casefold() in NARROW_FONTS  # the column widths are measured for Calibri
 
-    def render(self, sheets: list[ExcelSheet], formulas: dict[tuple[int, int], str], names: list[str]) -> bytes:
-        self.lookup = sheet_lookup(sheets, names)
-        for s, (sheet, name) in enumerate(zip(sheets, names, strict=True)):
-            self._sheet(
-                self.workbook.create_sheet(title=name), sheet, {c: f for (i, c), f in formulas.items() if i == s}
-            )
+    def render(self, book: Book) -> bytes:
+        self.book = book
+        for s, name in enumerate(book.names):
+            self._sheet(self.workbook.create_sheet(title=name), s)
         buffer = io.BytesIO()
         self.workbook.save(buffer)
         return buffer.getvalue()
 
-    def _sheet(self, ws: Worksheet, sheet: ExcelSheet, formulas: dict[int, str]) -> None:
+    def _sheet(self, ws: Worksheet, s: int) -> None:
         """Header row in the accent colour with white text, every second row lightly tinted, thin lines between the
         rows, no grid lines; printed on one page width with the header row on every page."""
+        sheet = self.book.sheets[s]
         header_fill = PatternFill("solid", fgColor=self.design.accent)
-        rows = align_rows(sheet)
+        rows = sheet.rows
         last_row = len(rows) + 1
         widths = [len(column.header.strip()) for column in sheet.columns]
         for c, column in enumerate(sheet.columns, start=1):
@@ -2548,7 +3540,7 @@ class XlsxWriter:
             cell.fill = header_fill
             kind = (
                 "date"
-                if column.type == "date"
+                if column.type in TIME_TYPES
                 else "number"
                 if column.type in NUMBER_TYPES or column.formula
                 else "text"
@@ -2563,15 +3555,20 @@ class XlsxWriter:
             for c, (column, raw) in enumerate(zip(sheet.columns, row, strict=True), start=1):
                 cell = ws.cell(row=r, column=c)
                 cell.font, cell.border = self.body_font, ROW_LINE
-                if (c - 1) in formulas or (formula := cell_formula(raw, column, self.lookup)):  # whitelist checked
-                    cell.value = (formulas[c - 1] if (c - 1) in formulas else formula).replace("{row}", str(r))
-                    cell.alignment = ALIGN["date" if column.type == "date" else "number"]
+                formula = self.book.columns.get((s, c - 1)) or self.book.cells.get((s, r - 2, c - 1))
+                if formula:  # checked against the whitelist
+                    cell.value = formula.replace("{row}", str(r))
+                    cell.alignment = ALIGN["date" if column.type in TIME_TYPES else "number"]
                     widths[c - 1] = max(widths[c - 1], 12)
                     continue
                 value, typed = convert_value(raw, column.type, self.decimal_comma)
                 cell.value = value
                 cell.alignment = ALIGN[
-                    "date" if isinstance(value, date) else "number" if isinstance(value, int | float) else "text"
+                    "date"
+                    if isinstance(value, date) or (column.type == "time" and typed)
+                    else "number"
+                    if isinstance(value, int | float)
+                    else "text"
                 ]
                 if isinstance(value, str):
                     cell.data_type = "s"  # other text never becomes a live formula ("=HYPERLINK(...)" stays text)
@@ -2581,13 +3578,14 @@ class XlsxWriter:
                     widths[c - 1] = max(widths[c - 1], *(len(line) for line in value.split("\n")))
                 elif value is not None:
                     columns_values[c - 1].append(value)
-                    widths[c - 1] = max(
-                        widths[c - 1], 12 if column.type in ("currency", "date") else len(str(value)) + 2
-                    )
+                    wide = column.type in ("currency", *TIME_TYPES)
+                    widths[c - 1] = max(widths[c - 1], 12 if wide else len(str(value)) + 2)
         date_format = self.texts["date_format"]
         format_rows = last_row + (1 if has_totals(sheet) else 0)
+        formats = []
         for c, column in enumerate(sheet.columns, start=1):
-            fmt = number_format(column, columns_values[c - 1], self.currency, date_format)
+            fmt = self.book.number_format(s, c - 1, columns_values[c - 1], date_format)
+            formats.append(fmt)
             if fmt:
                 for (cell,) in ws.iter_rows(min_row=2, max_row=format_rows, min_col=c, max_col=c):
                     cell.number_format = fmt
@@ -2602,10 +3600,10 @@ class XlsxWriter:
                 f"A2:{get_column_letter(len(sheet.columns))}{last_row}",
                 FormulaRule(formula=["MOD(ROW(),2)=1"], fill=band),
             )
-        self._totals(ws, sheet, last_row)
-        if sheet.chart:
-            self._chart(ws, sheet, sheet.chart, last_row)
-        self._print_setup(ws, landscape=len(sheet.columns) > WIDE_SHEET_COLUMNS or sheet.chart is not None)
+        self._totals(ws, sheet, last_row, formats)
+        for k, chart in enumerate(sheet.charts):
+            self._chart(ws, sheet, chart, last_row, 2 + k * CHART_ROWS)
+        self._print_setup(ws, landscape=len(sheet.columns) > WIDE_SHEET_COLUMNS or bool(sheet.charts))
 
     def markdown(self) -> str:
         """The written sheets as Markdown tables, numbers shown like in the cells, formulas as formulas."""
@@ -2617,12 +3615,17 @@ class XlsxWriter:
         return "\n\n".join(part for part in parts if part)
 
     def _cell_text(self, cell: Any) -> str:
-        """A cell's value as it is shown: decimals, %, currency and date from its number format."""
+        """A cell's value as it is shown: decimals, %, currency, date and time from its number format."""
         value, fmt = cell.value, str(cell.number_format)
         if value is None or isinstance(value, str):
             return value or ""
         if isinstance(value, datetime | date):
-            return value.strftime("%d.%m.%Y" if self.texts["date_format"].startswith("DD") else "%Y-%m-%d")
+            shown = value.strftime("%d.%m.%Y" if self.texts["date_format"].startswith("DD") else "%Y-%m-%d")
+            return shown + (value.strftime(" %H:%M") if isinstance(value, datetime) and "hh:mm" in fmt else "")
+        if ":mm" in fmt and isinstance(value, int | float):  # a time: the fraction of a day
+            minutes = round(value * 1440)
+            hours = minutes // 60 if fmt.startswith("[h]") else minutes // 60 % 24
+            return f"{hours:02d}:{minutes % 60:02d}" if not fmt.startswith("[h]") else f"{hours}:{minutes % 60:02d}"
         percent = "%" in fmt
         value = value * 100 if percent else value
         decimals = re.search(r"\.(0+)", fmt)
@@ -2650,7 +3653,7 @@ class XlsxWriter:
         footer = ws.oddFooter.right
         footer.text, footer.size, footer.color, footer.font = page, 9, MUTED_COLOR, f"{self.design.font},Regular"
 
-    def _totals(self, ws: Worksheet, sheet: ExcelSheet, last_row: int) -> None:
+    def _totals(self, ws: Worksheet, sheet: ExcelSheet, last_row: int, formats: list[str | None]) -> None:
         if not has_totals(sheet):
             return
         row = last_row + 1
@@ -2663,13 +3666,15 @@ class XlsxWriter:
                 cell.value = f"={TOTAL_FUNCTIONS[column.total]}({letter}2:{letter}{last_row})"
                 if column.total == "count":
                     cell.number_format = "0"  # a count, not an amount or a percentage
+                elif column.total == "sum" and formats[c - 1] in ("hh:mm", "hh:mm:ss"):
+                    cell.number_format = "[h]:mm"  # the hours of all rows, not the time of day they add up to
             elif c == 1:  # no room for the label when the first column has a total itself
                 cell.value = self.texts["total"]
                 cell.data_type = "s"
             cell.font, cell.border, cell.fill = self.bold_font, lines, fill
             cell.alignment = ALIGN["number" if column.total != "none" else "text"]
 
-    def _chart(self, ws: Worksheet, sheet: ExcelSheet, chart: ExcelChart, last_row: int) -> None:
+    def _chart(self, ws: Worksheet, sheet: ExcelSheet, chart: ExcelChart, last_row: int, top: int) -> None:
         layout = chart_layout(sheet, chart)
         series = layout.series[:1] if chart.type == "pie" else layout.series
         if chart.type == "pie":
@@ -2695,8 +3700,10 @@ class XlsxWriter:
             excel_chart.legend.position = "b"
         categories = (max_col - min_col + 1) if layout.by_rows else (max_row - min_row + 1)
         self._chart_style(excel_chart, chart.type, categories)
+        if chart.unit.strip() and chart.type != "pie":
+            excel_chart.y_axis.title = excel_text(chart.unit.strip())[:60]
         excel_chart.width, excel_chart.height = 18, 10
-        ws.add_chart(excel_chart, f"{get_column_letter(len(sheet.columns) + 2)}2")
+        ws.add_chart(excel_chart, f"{get_column_letter(len(sheet.columns) + 2)}{top}")
         names = ", ".join(title for title, _ in series)
         self.chart_titles.setdefault(ws.title, []).append(f"{to_plain(chart.title.strip()) or names} ({chart.type})")
 
@@ -2751,11 +3758,10 @@ def build_xlsx(
     design: Design = DEFAULT_DESIGN, title: str = "",
 ) -> tuple[bytes, str]:  # fmt: skip
     """The file and its text as Markdown."""
-    sheets = [blank_null_texts(infer_column_types(sheet, decimal_comma)) for sheet in sheets]
-    names = sheet_names(sheets, texts["sheet"])
-    formulas = check_excel(sheets, decimal_comma, names)
+    sheets = [prepare_sheet(sheet, decimal_comma) for sheet in sheets]
+    book = check_excel(sheets, decimal_comma, sheet_names(sheets, texts["sheet"]), currency)
     writer = XlsxWriter(currency, texts, decimal_comma, design, title)
-    return writer.render(sheets, formulas, names), writer.markdown()
+    return writer.render(book), writer.markdown()
 
 
 # ------------------------------------------------------------------------------------------ PowerPoint --
@@ -3034,6 +4040,7 @@ class PptxWriter:
         size, row_height = table_font_size(data.table, columns) or (10, int(Inches(0.1) + PptxPt(12.5)))
         shape = slide.shapes.add_table(rows, columns, MARGIN, BODY_TOP, CONTENT_WIDTH, row_height * rows)
         widths = column_widths(data.table, columns, CONTENT_WIDTH, size)
+        numbers = number_columns(data.table, columns)
         for column, width in zip(shape.table.columns, widths, strict=True):
             column.width = Emu(width)  # by content, so long words are not broken
         for r, row in enumerate(data.table):
@@ -3045,6 +4052,8 @@ class PptxWriter:
                 cell.fill.fore_color.rgb = PptxRGBColor.from_string(fill)
                 frame = cell.text_frame
                 frame.word_wrap = True
+                if numbers[c]:
+                    frame.paragraphs[0].alignment = PP_ALIGN.RIGHT
                 runs = parse_inline(row[c] if c < len(row) else "")
                 self._runs(
                     frame.paragraphs[0], runs, size, bold=r == 0 or None, color=WHITE if r == 0 else SLIDE_TEXT_COLOR
@@ -3455,7 +4464,7 @@ class Tools:
             parsed = [block for block in parsed if not is_empty_block(block)]
             given = {k: _unescape_newlines(str(v or extras.get(k) or "")) for k, v in
                      (("title", title), ("subtitle", subtitle), ("header_text", header_text))}  # fmt: skip
-            display_title, parsed = word_title(given["title"], parsed, texts["default_title"])
+            display_title, parsed = word_title(given["title"], parsed)
             options = WordOptions(
                 title=display_title,
                 subtitle=given["subtitle"],

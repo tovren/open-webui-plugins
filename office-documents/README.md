@@ -7,8 +7,8 @@ answer, where the user can preview and download it.
 
 | Tool function | What the model can use |
 |---|---|
-| `create_word_file` | Title and subtitle, table of contents (at the top or where the model places it), headings (3 levels), paragraphs, bullet and numbered lists (2 levels, numbering restarts for each list), tables with a coloured header row that repeats on every page and column widths fitted to the content, quotes, page breaks, text in the page header, "Page X of Y" footer, landscape pages |
-| `create_excel_file` | Several sheets with typed columns (`text`, `number`, `integer`, `currency`, `percent`, `date`), formulas per column, a total row (`sum`, `average`, `min`, `max`, `count`) and native Excel charts (column, bar, line, pie). Header row coloured and frozen, with an auto filter and fitted column widths; printed on one page width |
+| `create_word_file` | Title and subtitle (or none, e.g. for a letter), table of contents (at the top or where the model places it), headings (3 levels), paragraphs, bullet and numbered lists (2 levels, numbering restarts for each list), tables with a coloured header row that repeats on every page, column widths fitted to the content and numbers aligned right, quotes, page breaks, text in the page header, "Page X of Y" footer, landscape pages |
+| `create_excel_file` | Several sheets with typed columns (`text`, `number`, `integer`, `currency`, `percent`, `date`, `time`), formulas per column, a total row (`sum`, `average`, `min`, `max`, `count`) and up to four native Excel charts per sheet (column, bar, line, pie, optionally with the unit at the value axis). Header row coloured and frozen, with an auto filter and fitted column widths; printed on one page width |
 | `create_powerpoint_file` | 16:9 slides with the layouts `title`, `section`, `bullets`, `two_columns`, `table` and `chart` (native PowerPoint charts: column, bar, line, pie, optionally with the unit at the value axis), plus speaker notes |
 
 Inline `**bold**`, `*italic*` and `[links](https://…)` work in all text fields of Word and PowerPoint;
@@ -49,29 +49,60 @@ A short example for a slide deck (the model sees the full schema with descriptio
 }
 ```
 
-- **Excel values:** numbers as JSON numbers, percentages as `12.5` for 12.5 %, dates as `YYYY-MM-DD`.
-  Text such as `1.234,56 €` or `7,5 %` is converted too. A separator followed by exactly three digits
-  is read as thousands (`1.500`), except after a leading zero (`0,125`) and for the decimal mark of the
-  `language` valve when it appears only once (`de`: `1,799` is 1.799; `en`: `1.500` is 1.5). Columns sent
-  without a type whose values are all numbers become number columns, so sums and charts work; values
-  with leading zeros (postal codes, article numbers) stay text.
+- **Excel values:** numbers as JSON numbers, percentages as `12.5` for 12.5 %, dates as `YYYY-MM-DD`,
+  times as `hh:mm`. Text such as `1.234,56 €`, `$1,200.00`, `CHF 1’234.50` or `7,5 %` is converted too. A
+  separator followed by exactly three digits is read as thousands (`1.500`), except after a leading zero
+  (`0,125`) and for the decimal mark of the `language` valve when it appears only once (`de`: `1,799` is
+  1.799; `en`: `1.500` is 1.5). Columns sent without a type whose values are all numbers become number
+  columns, so sums and charts work; values with leading zeros (postal codes, article numbers) stay text.
+  Columns without a type whose values are all dates (`2026-11-02`, `02.11.2026`) or times (`08:00`) become
+  date or time columns.
+- **Currencies:** a `currency` column is shown in the currency of the `currency` valve, unless its values
+  name another one (`$1,200.00` gives a dollar column, also for the formula columns computed from it).
+  Values with different currencies in one column are sent back.
+- **Dates and times:** `22.10.26` is read as 22 October 2026; `05/11/2026` (5 November or 11 May?), a date
+  without a day (`2026-11`), a day that does not exist (`31.11.2026`) and numbers in a date column are sent
+  back instead of being kept as text. A value with a time (`2026-10-22 14:30`) shows the time too. A `time`
+  cell holds the fraction of a day, as in Excel: `=C{row}-B{row}` in a `time` column shows 8:30 (total row
+  and formula columns as `[h]:mm`, so sums above 24 hours stay right), while hours as a number need a
+  `number` column with `=(C{row}-B{row})*24`. The two slips with this (times subtracted in a number column,
+  which shows 0.35 for 8:30, and `*24` in a time column, which shows 204:00) are sent back.
 - **Percent cells hold the fraction**, as in Excel: `12.5` is stored as 0.125 and shown as 12.5 %, so a
   formula uses the cell as it is (`=B{row}*(1-C{row})` for a discount in C). The tool sends back three
   slips that models make with this (35 of 660 Excel calls in the v0.1 runs of
   [office-bench-de](https://github.com/tovren/office-bench-de)): fractions sent into a percent
   column (`0.05` for 5 %, which would show as 0.05 %; a value below 1 % can be sent as `"0.5 %"`), a
   percent cell divided by 100 in a formula, and `*100` in the formula of a percent column (25 % would
-  show as 2500 %).
+  show as 2500 %). A percent cell divided again in another way (`D{row}%`, `(D{row})/100`, `D{row}*0.01`) is
+  sent back too.
 - **Excel formulas** belong to a column and are filled into every data row, e.g. `=B{row}*C{row}`
-  (`{row}` is the current row). A formula written for the first data row (`=B2*C2`) gets `{row}`
-  automatically. Allowed are cell references of the same workbook, numbers, quoted text,
-  operators and these functions: `SUM`, `AVERAGE`, `MIN`, `MAX`, `MEDIAN`, `COUNT`, `COUNTA`,
-  `COUNTIF`, `SUMIF`, `AVERAGEIF`, `IF`, `IFERROR`, `AND`, `OR`, `NOT`, `ROUND`, `ROUNDUP`,
-  `ROUNDDOWN`, `ABS`, `PRODUCT`, `POWER`, `SQRT`, `MOD`, `INT`. German names (`SUMME`, `WENN`,
-  `RUNDEN` …), `;` as separator and decimal commas (`=RUNDEN(B{row}*0,19;2)`) are translated. The
-  total row's `count` counts all filled cells (`COUNTA`). Formulas may also be written into single cells,
-  e.g. a balance row `=B2-B3`, `=C2-C3` … when the months are columns; they are checked against the same
-  whitelist. In columns the model marks as `text`, values that start with `=` stay text.
+  (`{row}` is the current row). A formula written for the first data row (`=B2*C2`, `=B2/SUM(B2:B4)`) gets
+  `{row}` automatically; a range over several rows (`SUM(B2:B9)`, `SUM($B$2:B9)`, also the start of
+  `B2:B{row}`) is the same range in every row and is written as one (`$B$2:$B$9`), and a whole column (`B:B`, `'Data'!$A:$A`) becomes
+  the data rows of that sheet, without the header and the total row; in a total written into a cell below
+  the data (`=SUM(B:B)` in `B4`) it ends in the row above (`$B$2:$B$3`). Cells without `{row}` in one other row
+  (`=B3*C3`, `=B1*C1`, `=B{row}*C2`) are sent back: either the rows were counted wrong (row 1 is the header)
+  or a fixed cell is meant, which is written `$C$2`. `{row-1}` is not possible; a running balance goes into
+  the cells. Allowed are cell references of the same workbook, numbers, quoted text, operators and these
+  functions: `SUM`, `AVERAGE`, `MIN`, `MAX`, `MEDIAN`, `COUNT`, `COUNTA`, `COUNTIF`, `COUNTIFS`, `SUMIF`,
+  `SUMIFS`, `AVERAGEIF`, `AVERAGEIFS`, `IF`, `IFERROR`, `AND`, `OR`, `NOT`, `ROUND`, `ROUNDUP`, `ROUNDDOWN`,
+  `ABS`, `PRODUCT`, `POWER`, `SQRT`, `MOD`, `INT`, `VLOOKUP`, `INDEX`, `MATCH`, `DATE`, `TODAY`, `YEAR`,
+  `MONTH`, `DAY`, `EDATE`, `EOMONTH`, `NETWORKDAYS`, `WEEKDAY`, `TIME`, `HOUR`, `MINUTE`, `LEFT`, `RIGHT`,
+  `LEN`, `CONCATENATE`, `ISBLANK`, `ISNUMBER`, `ISTEXT`, and the newer `XLOOKUP`, `IFS`, `MAXIFS`, `MINIFS`,
+  `CONCAT`, `TEXTJOIN` (written with Excel's `_xlfn.` prefix; they need Excel 2019 or later, `XLOOKUP` Excel
+  2021 or Microsoft 365, and show `#NAME?` in older versions). German names (`SUMME`, `WENN`, `SVERWEIS`,
+  `NETTOARBEITSTAGE` …), `;` as separator, decimal commas (`=RUNDEN(B{row}*0,19;2)`) and German quotes
+  (`„ja“`) are translated. Formulas Excel cannot read are sent back with the place: an operator without a
+  value (`=B2*`, `=B2*/2`, `==B2`), a missing argument, or a wrong number of arguments (`=ROUND(B2)`,
+  `=SUM()`; the message shows how the function is written). Functions models often try get an alternative
+  (`TIMEVALUE`: a `time` column; `SUMPRODUCT`: a product column). The total row's `count` counts all
+  filled cells (`COUNTA`). Formulas may also be written into single cells, e.g. a balance row `=B2-B3`,
+  `=C2-C3` … when the months are columns; they are checked against the same whitelist, and one that is not
+  allowed is sent back (only one with a function such as `HYPERLINK` stays text, see Security). In columns
+  the model marks as `text`, values that start with `=` stay text.
+- **Formats of formula columns without a type** follow what the formula computes: a date plus days
+  (`=B{row}+14`, a deadline) is a date, quantity times price the currency, the days between two dates a
+  whole number, the difference of two times `[h]:mm`.
 - **Cells of other sheets** are written as `'Rates'!$B$3` (also `Rates!B3`, without regard to case). In a
   column formula the model has to say which cell it means: `$B$3` for one cell in every row (e.g. an
   hourly rate) or `B{row}` for the same row; `B3` alone is sent back. A single cell of another sheet that
@@ -80,18 +111,27 @@ A short example for a slide deck (the model sees the full schema with descriptio
   may reach beyond the data.
 - **Excel charts** plot columns (`category_column` plus `value_columns`) or, for tables with e.g. the
   months as columns, rows (`series_rows`: the labels in the first column of the rows to plot). A chart
-  with only a type and title plots the number columns against the first column.
+  with only a type and title plots the number columns against the first column. `chart` may be a list of up
+  to four charts, which are placed below each other next to the table; `unit` is shown at the value axis.
 - **Errors go back to the model.** If something is missing or too long, the tool answers with a list
   of exact problems (e.g. `slides[3].chart.series[0]: 2 values for 3 categories`), and the model
   can call it again. The positions refer to the list the model sent.
 - **Content that cannot be meant is rejected**, so a technically valid but useless file is not reported
-  as done: a number column that holds mostly text (usually rows shifted against the columns), an empty
-  column that a formula uses (e.g. prices left out of an offer), a total on an empty column, a total row
-  written into the rows (a last row labelled e.g. "Summe" or "Netto-Summe": it would get the column
-  formulas too, be counted twice next to a column's `total`, or add up nothing, so the model is told to use
-  `total`), a chart column without numbers,
-  a formula that uses its own column, a slide table with only a header row, a table of contents without
-  chapters, and more text than fits on a slide or into a slide table.
+  as done: a number column that holds mostly text (usually rows shifted against the columns), a single text
+  in a number column that a total, formula or chart uses (`"ca. 500"` would silently count as 0; for a
+  number with a unit such as `"3 h"` the model is told to put the unit into the header), an empty column
+  that a formula uses (e.g. prices left out of an offer), a formula that computes (`+ - * / ^`) with text,
+  which gives `#VALUE!` (a text column, usually because the column letters were miscounted, the header
+  row, or a word or `-` in a row; comparisons and `SUM` may use text), a formula that uses a column the
+  sheet does not have, values sent in a formula column that differ from what its formula computes there
+  (`999` where quantity times price is 10: the formula or the values are wrong, e.g. sums of rows below the
+  data that the formula would overwrite with 0; `0` and the same value in every row count as
+  placeholders), a total on an empty column, a total row written into the rows (a last row labelled e.g.
+  "Summe" or "Netto-Summe": it would get the column formulas too, be counted twice next to a column's
+  `total`, or add up nothing, so the model is told to use `total`), a chart column without numbers, a
+  formula that uses its own column, a slide table with only a header row, a table of contents without
+  chapters, and more text than fits on a slide or into a slide table. Every message about a formula lists
+  the columns with their letters (`A=Artikel, B=Menge, C=Preis`).
 - **Content is never dropped without a word.** A field the tool does not know is sent back when it holds
   text or a list of values (`"content"` instead of `"text"`, `"formulas"`, a sheet-level `"total"`, a
   table under `"data"`), and so is content in a field that the block or layout does not show (a paragraph's
@@ -99,14 +139,19 @@ A short example for a slide deck (the model sees the full schema with descriptio
   empty value, and a chart's own `title` on a slide (the slide title is shown), are ignored.
 - **Other shapes are not guessed.** A block without `type`, a slide without `title` or a list sent as one
   text gets an error that names the field, and the model sends it again in the right shape. Only
-  unambiguous things are accepted as they are: `null` for unused fields, `{"slides": [...]}` instead of
-  the list, list items that all start with `- ` (top-level items, not sub items), `<br>` as a line break,
-  Markdown lists and tables inside a paragraph (numbered lines only become a list when they count up from
-  1, so "3. Oktober …" stays text), numbers sent as text in an Excel column without a type, `"null"` as
-  text in a number or date column (an empty cell), a chart object without data (no chart), formulas
-  without `=`, formulas written into single cells, file-name-style titles (`Report_Q3.xlsx`), a missing title (the
-  first heading or slide title is used), and empty paragraphs used as spacing (left out). A heading that
-  only repeats the title is left out.
+  unambiguous things are accepted as they are: `null` for unused fields and in table cells,
+  `{"slides": [...]}` instead of the list (also with the other parameters in the same object,
+  `{"sheets": [...], "title": "…"}`), Excel rows written as objects whose keys are the column headers, list
+  items that all start with `- ` (top-level items, not sub items), list items that all start with a bullet
+  of their own (`• `, `* `, `– `) or, in a numbered list, with the numbers `1.`, `2.` … (removed, so they are
+  not shown twice), `<br>` as a line break, Markdown lists, tables, headings (`## …`) and rules (`---`, left
+  out) inside a paragraph (numbered lines only become a list when they count up from 1, so "3. Oktober …"
+  stays text; a table there has the same limits as a table block), numbers sent as text in an Excel column
+  without a type, `"null"` as text in a number or date column (an empty cell), a chart object without data
+  (no chart), formulas without `=`, formulas written into single cells, file-name-style titles
+  (`Report_Q3.xlsx`), a missing title (the first heading or slide title is used; a Word document without
+  either, e.g. a letter, has no title block and is named "Document"), and empty paragraphs used as spacing
+  (left out). A heading that only repeats the title is left out.
 - **Broken JSON is repaired.** Long arguments often reach the tool as JSON text rather than as
   structured data (the server could not parse them), with the same few mistakes: German quotes
   closed with a straight quote (`„Hoch"`), a forgotten `}` or `]`, table rows written as several
@@ -161,10 +206,11 @@ With the `word_template` valve, Word documents are built on a company file, e.g.
   URLs (images are not supported for that reason).
 - **Excel:** every formula, in a column's `formula` field or in a cell, is checked against the whitelist
   above: references to other workbooks (`[…]`, or a sheet name that is not in the file), DDE (`|`) and every
-  other function, e.g. `WEBSERVICE`, `HYPERLINK` or `INDIRECT`, are rejected. A cell value that does not pass,
-  such as `=HYPERLINK(...)`, is written as text with Excel's quote prefix, so it stays text when the user
-  edits it (in a number column the model is told instead). The data sheet behind PowerPoint charts
-  ("Edit Data") gets labels and series names as text only, never as formulas or links.
+  other function, e.g. `WEBSERVICE`, `HYPERLINK`, `INDIRECT`, `OFFSET` or `CELL`, are rejected. A cell value
+  with such a function or reference, e.g. `=HYPERLINK(...)`, is written as text with Excel's quote prefix, so
+  it stays text when the user edits it (in a number column the model is told instead); other cell formulas
+  that do not pass go back to the model. The data sheet behind PowerPoint charts ("Edit Data") gets labels
+  and series names as text only, never as formulas or links.
 - **Links** are only created for `http`, `https` and `mailto` (only with `subject`, `body`, `cc`,
   `bcc`); other link targets stay plain text. Invisible format characters such as a right-to-left
   override are removed from file names.
