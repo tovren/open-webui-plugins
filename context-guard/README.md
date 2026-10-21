@@ -11,7 +11,12 @@ and warns or stops before the context window overflows.
 - Once the prompt uses `warn_percent` of the usable context, a status line appears above the
   answer. The usable context is the context size minus `answer_reserve_tokens`.
 - If the prompt would not fit, the request is stopped with a friendly explanation and next steps:
-  start a new chat, paste less text, attach fewer documents.
+  start a new chat, paste less text, attach fewer documents. If the user's own message makes up
+  most of the prompt (a long pasted text), the message says so and suggests pasting only the
+  relevant section or uploading the text as a file. Document excerpts that Open WebUI adds to the
+  message do not count as the user's text.
+- The messages are flowing text without line breaks, because Open WebUI shows errors as plain text
+  and would join the lines.
 
 Why this helps: **llama-server** and **vLLM** reject oversized requests with a technical HTTP 400
 error ("exceeds the available context size"). **Ollama** silently cuts off the oldest part of the
@@ -65,9 +70,15 @@ with the guard:
   The guard then stops the request with its message.
 - Long tool-call loops: Open WebUI 0.12.0 also compacts between the rounds, before the guard checks
   each round. In 0.11.4 only the guard covers a loop that keeps growing.
-- If the compaction threshold is not below the usable context, compaction never runs before the
-  guard stops a chat. The default of 80000 tokens is above most local context sizes. The guard logs
-  a warning once in that case.
+- The summary request contains the whole chat plus the summary prompt and room for the summary
+  (`max_tokens` 1000 by default), so it needs about 1500 tokens more than the threshold. If the
+  threshold plus these 1500 tokens is not below the usable context, the guard logs a warning once
+  and shows its hint as usual. The default of 80000 tokens is above most local context sizes, so
+  compaction never runs before the guard stops a chat.
+- If the summary request fails, for example because vLLM rejects a prompt plus `max_tokens` that
+  is larger than `--max-model-len`, Open WebUI does not report it: it stores the first 500
+  characters of each older message as the "summary" and carries on. The guard recognizes this,
+  logs a warning once per chat (without message content) and shows its hint as usual.
 
 Set `CONTEXT_COMPACTION_TOKEN_THRESHOLD`, or a model's `compact_token_threshold`, to about **half
 the context size**, e.g. `16000` for a 32k model. Compaction is only checked at the start of a turn,

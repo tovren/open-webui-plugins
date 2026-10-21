@@ -2,6 +2,25 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
+## Unreleased
+
+Context Guard 1.3.0. The other plugins are unchanged.
+
+### Context Guard 1.3.0
+
+- The stop message is flowing text. Open WebUI shows errors as plain text, so the line breaks and
+  bullet points of the old message ran together.
+- If the user's own message makes up most of the prompt (a long pasted text), the stop message says
+  so and suggests pasting only the relevant section or uploading the text as a file.
+- Context Compaction: the threshold must leave about 1500 tokens for the summary request (summary
+  prompt and the summary itself), not just be below the usable context. Otherwise the guard logs a
+  warning and keeps showing its hint. With vLLM, a threshold close to the limit made the summary
+  request fail.
+- Recognizes when Context Compaction could not get a summary from the model and only cut the older
+  messages short, and logs a warning once per chat.
+- New integration tests with a real Open WebUI (`tests/integration/`), checked with 0.11.4, 0.12.0
+  and 0.12.1.
+
 ## 2026-10-21, second update
 
 Response Export 1.2.0. The other plugins are unchanged.

@@ -1378,10 +1378,11 @@ def stub_compaction_config(monkeypatch: pytest.MonkeyPatch, values: dict[str, An
 
 
 def test_guard_compaction_hides_hint_for_normal_growth(monkeypatch: pytest.MonkeyPatch) -> None:
-    # usable = 8000 tokens, compaction from 7000: at 80 % the chat is summarized before the limit
+    # usable = 8000 tokens, compaction from 6500 (+ 1500 for the summary request): at 80 % the chat
+    # is summarized before the limit
     stub_compaction_config(
         monkeypatch,
-        {"chat.context_compaction.enable": True, "chat.context_compaction.token_threshold": 7000},
+        {"chat.context_compaction.enable": True, "chat.context_compaction.token_threshold": 6500},
     )
     flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=2000)
     assert run_guard(flt, body_with_chars(22384))[1].events == []
@@ -1404,6 +1405,76 @@ def test_guard_compaction_threshold_too_high(
     with pytest.raises(cg.ContextLimitError):
         run_guard(flt, body_with_chars(8001 * 35 // 10))
     assert caplog.text.count("Context Compaction threshold for model 'm' (80000 tokens)") == 1
+
+
+def test_guard_compaction_threshold_leaves_no_room_for_the_summary(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # 7000 is below the usable 8000 tokens, but the summary request (whole chat + about 1500 tokens)
+    # would not fit: vLLM rejects it and Open WebUI only cuts the old messages short
+    stub_compaction_config(
+        monkeypatch,
+        {"chat.context_compaction.enable": True, "chat.context_compaction.token_threshold": 7000},
+    )
+    flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=2000)
+    assert len(run_guard(flt, body_with_chars(22384))[1].events) == 1
+    assert "Context Compaction threshold for model 'm' (7000 tokens) leaves too little room" in caplog.text
+
+
+def summary_body(summary: str, chars: int) -> dict[str, Any]:
+    system = f"You are helpful.\n[CONVERSATION SUMMARY]\n{summary}"
+    return {
+        "model": "m",
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": "x" * chars}],
+    }
+
+
+def test_guard_detects_the_fallback_summary(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    stub_compaction_config(
+        monkeypatch,
+        {"chat.context_compaction.enable": True, "chat.context_compaction.token_threshold": 6500},
+    )
+    flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=2000)
+    real = summary_body("The user asked about A; decided B.\n- open: C", 22000)
+    assert run_guard(flt, real, {"chat_id": "c1"})[1].events == []
+    assert "could not get a summary" not in caplog.text
+    # failed summary request: the first 500 characters per message instead of a summary
+    fallback = summary_body("Earlier summary\n- user: Question one\n- assistant: Answer one", 22000)
+    _, recorder = run_guard(flt, fallback, {"chat_id": "c1"})
+    assert len(recorder.events) == 1  # compaction does not really help: the hint is shown
+    run_guard(flt, summary_body("- user: tiny", 100), {"chat_id": "c1"})
+    run_guard(flt, summary_body("- user: tiny", 100), {"chat_id": "c2"})
+    assert caplog.text.count("could not get a summary from the model for chat c1") == 1
+    assert caplog.text.count("for chat c2") == 1
+    assert "Question one" not in caplog.text and "tiny" not in caplog.text  # no message content
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [{"base_user_prompt": "x" * 26000}, {"user_message": {"role": "user", "content": "x" * 26000}}],
+)
+def test_guard_names_a_long_pasted_message(metadata: dict[str, Any]) -> None:
+    # 0.12 keeps the typed text in base_user_prompt, 0.11 in user_message
+    flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=2000, language="de")
+    with pytest.raises(cg.ContextLimitError) as error:
+        run_guard(flt, body_with_chars(30000), metadata)
+    assert str(error.value).startswith("Ihre Nachricht ist zu lang für das KI-Modell (zusammen mit dem Chat ca. 108 %")
+
+
+def test_guard_long_document_in_the_message_is_not_the_users_text() -> None:
+    # document excerpts are added to the user message; the typed question itself is short
+    flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=2000)
+    with pytest.raises(cg.ContextLimitError) as error:
+        run_guard(flt, body_with_chars(30000), {"base_user_prompt": "Summarize the file"})
+    assert str(error.value).startswith("This request is too large")
+
+
+@pytest.mark.parametrize("language", ["en", "de"])
+def test_guard_messages_need_no_line_breaks(language: str) -> None:
+    # Open WebUI's error box shows plain text: line breaks would be lost
+    assert not any("\n" in text for text in cg.TRANSLATIONS[language].values())
 
 
 def test_guard_compaction_threshold_resolution(monkeypatch: pytest.MonkeyPatch) -> None:

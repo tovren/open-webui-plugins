@@ -2,7 +2,7 @@
 title: Context Guard
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.2.0
+version: 1.3.0
 license: MIT
 required_open_webui_version: 0.11.4
 description: Estimates the prompt size right before each request is sent to the model - after document excerpts and tool results have been added - and shows a warning or stops with a clear, friendly message before the model's context window overflows.
@@ -14,7 +14,8 @@ How it works
 - Shows a status hint above the answer once the prompt uses warn_percent of the usable context
   (context size minus the space reserved for the answer).
 - Stops the request with an explanation and practical next steps when the prompt would not fit.
-  Without this, llama-server and vLLM reject the request with a technical HTTP 400 error
+  If the user's own message makes up most of it (a long pasted text), the message says so. Without
+  this, llama-server and vLLM reject the request with a technical HTTP 400 error
   ("exceeds the available context size"), and Ollama silently drops the oldest part of the
   conversation, so the model quietly forgets earlier messages and documents.
 - The token count is an estimate (characters / chars_per_token plus a flat amount per image),
@@ -22,8 +23,10 @@ How it works
   (Context Compaction) uses 4 characters per token, so the guard's default of 3.5 counts higher.
 - Works together with Open WebUI's Context Compaction: compaction runs first, so the guard checks
   the shortened history. While compaction will summarize the chat before the limit, the hint to
-  start a new chat is not shown. If the compaction threshold is not below the usable context, a
-  warning is logged once, because chats would then be stopped before they are ever compacted.
+  start a new chat is not shown. The summary request contains the whole chat, so the compaction
+  threshold must leave room for it (COMPACTION_RESERVE_TOKENS below the usable context); otherwise a
+  warning is logged once and the hint is shown as usual. If compaction could not get a summary from
+  the model and fell back to cutting the old messages short, a warning is logged once per chat.
 
 Security & privacy
 - Read-only: the request is never modified. No network access, nothing is stored, and no
@@ -33,6 +36,7 @@ Security & privacy
 import json
 import logging
 import math
+import re
 from collections.abc import Awaitable, Callable
 from functools import lru_cache
 from typing import Any, Literal
@@ -45,18 +49,28 @@ EventEmitter = Callable[[dict[str, Any]], Awaitable[Any]]
 
 MESSAGE_OVERHEAD_CHARS = 16  # role and chat-template tokens per message
 REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking")
+# Context Compaction: room the summary request needs besides the chat itself (prompt template
+# about 300 tokens, the summary up to Open WebUI's default max_tokens of 1000, plus a margin)
+COMPACTION_RESERVE_TOKENS = 1500
+SUMMARY_MARKER = "[CONVERSATION SUMMARY]\n"
+# Open WebUI's fallback when the summary request fails: "- role: first 500 characters" per message
+FALLBACK_SUMMARY_LINE = re.compile(r"^- (?:user|assistant|system|tool): ", re.MULTILINE)
 
+# The error box of Open WebUI (0.11, 0.12) shows plain text without line breaks, so the messages are
+# written as flowing text.
 TRANSLATIONS: dict[str, dict[str, str]] = {
     "en": {
         "blocked": (
-            "This request is too large for the AI model (about {percent}% of what it can handle). "
-            "The chat history, documents and your message no longer fit into its working memory "
-            "together.\n\n"
-            "How to continue:\n"
-            "• Start a new chat - always a good idea for a new topic.\n"
-            "• Paste only the relevant section of long texts, or upload them as a file or add them "
-            "to a knowledge base instead.\n"
-            "• Attach fewer documents at once."
+            "This request is too large for the AI model (about {percent}% of what it can handle): "
+            "the chat history, documents and your message no longer fit into its working memory "
+            "together. Please start a new chat, which is a good idea for a new topic anyway. Paste only "
+            "the relevant section of long texts, or upload them as a file or add them to a knowledge "
+            "base, and attach fewer documents at once."
+        ),
+        "message_too_long": (
+            "Your message is too long for the AI model (together with the chat about {percent}% of "
+            "what it can handle). Please paste only the relevant section, or upload the text as a "
+            "file or add it to a knowledge base instead."
         ),
         "warning": (
             "Note: this chat is getting very long (about {percent}% of the capacity). "
@@ -65,14 +79,16 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     },
     "de": {
         "blocked": (
-            "Diese Anfrage ist zu umfangreich für das KI-Modell (ca. {percent} % der möglichen Menge). "
+            "Diese Anfrage ist zu umfangreich für das KI-Modell (ca. {percent} % der möglichen Menge): "
             "Chatverlauf, Dokumente und Ihre Nachricht passen nicht mehr zusammen in sein "
-            "Arbeitsgedächtnis.\n\n"
-            "So geht es weiter:\n"
-            "• Einen neuen Chat beginnen – bei einem neuen Thema am besten immer.\n"
-            "• Lange Texte nicht komplett einfügen, sondern nur den wichtigen Abschnitt – oder als "
-            "Datei hochladen bzw. in eine Wissensdatenbank legen.\n"
-            "• Weniger Dokumente gleichzeitig anhängen."
+            "Arbeitsgedächtnis. Bitte einen neuen Chat beginnen, bei einem neuen Thema ohnehin am "
+            "besten. Lange Texte nur mit dem wichtigen Abschnitt einfügen oder als Datei hochladen bzw. "
+            "in eine Wissensdatenbank legen und weniger Dokumente gleichzeitig anhängen."
+        ),
+        "message_too_long": (
+            "Ihre Nachricht ist zu lang für das KI-Modell (zusammen mit dem Chat ca. {percent} % der "
+            "möglichen Menge). Bitte nur den wichtigen Abschnitt einfügen oder den Text als Datei "
+            "hochladen bzw. in eine Wissensdatenbank legen."
         ),
         "warning": (
             "Hinweis: Dieser Chat ist schon sehr lang (ca. {percent} % der Kapazität). "
@@ -160,6 +176,28 @@ def estimate_tokens(
     if body.get("tools"):
         chars += _json_length(body["tools"])
     return math.ceil(chars / chars_per_token) + images * tokens_per_image
+
+
+def typed_message_chars(metadata: dict[str, Any] | None) -> int:
+    """Characters of the message the user typed, before Open WebUI added document excerpts to it
+    (0.12: base_user_prompt, 0.11: user_message); 0 if unknown."""
+    metadata = metadata or {}
+    user_message = metadata.get("user_message")
+    content = metadata.get("base_user_prompt") or (
+        user_message.get("content") if isinstance(user_message, dict) else None
+    )
+    return _content_size(content)[0]
+
+
+def has_fallback_summary(messages: list[Any]) -> bool:
+    """True if Context Compaction could not get a summary from the model: Open WebUI then stores the
+    first 500 characters of each dropped message ("- user: ...") as the summary."""
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "system":
+            _, marker, summary = _text(message.get("content")).partition(SUMMARY_MARKER)
+            if marker and FALLBACK_SUMMARY_LINE.search(summary):
+                return True
+    return False
 
 
 def model_ids(body: dict[str, Any], model: dict[str, Any] | None) -> list[str]:
@@ -274,6 +312,7 @@ class Filter:
     def __init__(self) -> None:
         self.valves = self.Valves()
         self._reported_thresholds: set[tuple[str, int, int]] = set()
+        self._reported_fallbacks: set[str] = set()
 
     def _context_tokens(self, ids: list[str]) -> int:
         overrides = parse_model_overrides(self.valves.model_context_tokens)
@@ -286,13 +325,28 @@ class Filter:
             return
         self._reported_thresholds.add((model_id, threshold, usable))
         log.warning(
-            "Context Guard: the Context Compaction threshold for model %r (%d tokens) is not below its "
-            "usable context (%d tokens), so long chats are stopped before they are compacted. Set "
-            "CONTEXT_COMPACTION_TOKEN_THRESHOLD or the model's compact_token_threshold to about half the "
-            "context size.",
+            "Context Guard: the Context Compaction threshold for model %r (%d tokens) leaves too little "
+            "room: the summary request contains the whole chat plus about %d tokens and must fit into "
+            "the usable context (%d tokens). Otherwise long chats are stopped, or compacted without a "
+            "real summary. Set CONTEXT_COMPACTION_TOKEN_THRESHOLD or the model's compact_token_threshold "
+            "to about half the context size.",
             model_id,
             threshold,
+            COMPACTION_RESERVE_TOKENS,
             usable,
+        )
+
+    def _report_fallback_summary(self, chat_id: str) -> None:
+        if chat_id in self._reported_fallbacks:
+            return
+        if len(self._reported_fallbacks) >= 1000:
+            self._reported_fallbacks.clear()
+        self._reported_fallbacks.add(chat_id)
+        log.warning(
+            "Context Guard: Context Compaction could not get a summary from the model for chat %s (the "
+            "summary request probably did not fit into the context or failed), so the older messages "
+            "were only cut short. Lower the compaction threshold or check the compaction model.",
+            chat_id or "(unknown)",
         )
 
     async def request(
@@ -309,17 +363,24 @@ class Filter:
             log.warning("Context Guard: answer_reserve_tokens >= context size, check is skipped")
             return body
         used = estimate_tokens(body, self.valves.chars_per_token, self.valves.tokens_per_image, __metadata__)
+        fallback_summary = has_fallback_summary(body.get("messages") or [])
+        if fallback_summary:
+            self._report_fallback_summary(str((__metadata__ or {}).get("chat_id") or ""))
         if used * 100 < self.valves.warn_percent * usable:
             return body
         threshold = await compaction_threshold(__metadata__)
-        if threshold is not None and threshold >= usable:
+        compaction_fits = threshold is not None and threshold + COMPACTION_RESERVE_TOKENS <= usable
+        if threshold is not None and not compaction_fits:
             self._report_threshold_too_high(model_id, threshold, usable)
         percent = math.ceil(used * 100 / usable)
         texts = TRANSLATIONS[user_language(self.valves.language, __metadata__)]
         if used > usable:
-            raise ContextLimitError(texts["blocked"].format(percent=percent))
+            typed = math.ceil(typed_message_chars(__metadata__) / self.valves.chars_per_token)
+            # most of the prompt is the user's own message, e.g. a long pasted text
+            key = "message_too_long" if typed * 2 >= used else "blocked"
+            raise ContextLimitError(texts[key].format(percent=percent))
         # Normal chat growth: compaction summarizes the chat before it reaches the limit.
-        if threshold is not None and used < threshold < usable:
+        if compaction_fits and not fallback_summary and used < threshold:
             return body
         if __event_emitter__ is not None:
             await __event_emitter__(

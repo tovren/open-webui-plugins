@@ -73,6 +73,17 @@ parser). Its tests for attaching files to a chat replace Open WebUI's internals 
 
 The tests that read the PDF files of Response Export need `pypdf`; without it they are skipped.
 
+`tests/integration/` checks Context Guard together with Open WebUI's Context Compaction in a real
+Open WebUI: a mock model server with an 8k context (behaving like llama-server or like vLLM) and
+chats with normal growth, a tool loop and a long paste. Each test starts its own Open WebUI, so the
+tests take about 40 seconds. They are skipped unless `OWUI_BIN` points to an `open-webui`
+executable, which allows checking several versions:
+
+```bash
+python -m venv /tmp/owui-0120 && /tmp/owui-0120/bin/pip install open-webui==0.12.0
+OWUI_BIN=/tmp/owui-0120/bin/open-webui /tmp/owui-test/bin/python -I -m pytest -q tests/integration
+```
+
 Optional checks run when the tools are installed:
 
 - **Node.js** runs the generated browser snippets and the Office File UI script against small DOM
