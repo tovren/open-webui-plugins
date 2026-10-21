@@ -10,6 +10,10 @@ For files attached to an answer of the assistant (e.g. by the Office Documents t
 - Word, Excel and PowerPoint files open straight in the **Preview** tab of the file view; the
   **Content** tab (the extracted text) and the "extracted lines" note are hidden
 - a download button in the header of the file view
+- PowerPoint preview: titles and subtitles the file aligns left are shown on the left (Open WebUI
+  centres them, [open-webui#32873](https://github.com/open-webui/open-webui/issues/32873))
+- spreadsheet preview in dark mode: grey like the rest of the page instead of blue-violet (fixed in Open
+  WebUI 0.12.3 itself)
 
 Files the user uploads and file views elsewhere (workspace, knowledge, chat controls) stay unchanged,
 so the "Content" tab still shows what the model received from an upload.

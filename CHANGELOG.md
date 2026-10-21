@@ -4,7 +4,7 @@ Each plugin has its own version (in the header of its file). Earlier changes are
 
 ## Unreleased
 
-Context Guard 1.3.0 · Response Export 1.2.1. The other plugins are unchanged.
+Context Guard 1.3.0 · Response Export 1.2.1 · Office File UI. The other plugins are unchanged.
 
 ### Context Guard 1.3.0
 
@@ -29,6 +29,14 @@ Context Guard 1.3.0 · Response Export 1.2.1. The other plugins are unchanged.
   a different font.
 - Excel: numbers written with thousands separators (`1,240,000`, `1.234,56`) are shown with
   separators. Numbers without them, such as years and postcodes, stay as they are.
+
+### Office File UI
+
+- PowerPoint preview: titles and subtitles that the file aligns left are shown on the left. Open WebUI
+  centres them even when the file says left ([open-webui#32873](https://github.com/open-webui/open-webui/issues/32873)).
+  Pie charts stay empty in the preview; the script cannot draw them.
+- Spreadsheet preview in dark mode: grey instead of blue-violet, like the rest of the page. Open WebUI
+  0.12.3 fixes this itself; the rule does no harm there.
 
 ## 2026-10-21, second update
 
