@@ -18,9 +18,10 @@ so the "Content" tab still shows what the model received from an upload.
 
 ![A Word file opened straight in the preview, with a download button in the header](images/preview.png)
 
-Tested with Open WebUI 0.11.4 and 0.12.1. It depends on Open WebUI's markup, so check it after every
-update. If the markup changes, the icons and the tab switch just stop appearing; nothing else breaks:
-the "Content" | "Preview" bar is only hidden while the preview is really shown.
+Tested with Open WebUI 0.11.4; the markup it uses is the same in 0.12.1. It depends on Open WebUI's
+markup, so check it after every update. If the markup changes, the icons and the tab switch just
+stop appearing; nothing else breaks: the "Content" | "Preview" bar is only hidden while the preview
+is really shown.
 
 The script stays light in long chats: it handles page changes at most every 150 ms, and if a chip has
 no matching file in the saved chat, it loads the chat again at most three times for that chip, with

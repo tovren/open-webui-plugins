@@ -18,6 +18,8 @@ interface language by default (`auto`). Reasoning Toggle shows no texts of its o
 them use only the Python standard library and libraries that already ship with Open WebUI, so nothing
 has to be installed.
 
+What changed in each version, and what to check before updating, is in the [changelog](CHANGELOG.md).
+
 ![Files made by Office Documents: a Word document, an Excel sheet with a chart and slides](office-documents/images/files.png)
 
 ## Installation
