@@ -6,7 +6,7 @@ folder with a README:
 | Plugin | Type | What it does |
 |---|---|---|
 | [Office Documents](office-documents/) | Tool | Lets the model create Word, Excel and PowerPoint files and attaches them to its answer |
-| [Response Export](response-export/) | Action | Adds buttons to export an answer as Word or Excel, print or save it as PDF, or open it as an e-mail |
+| [Response Export](response-export/) | Action | Adds buttons to export an answer as Word, Excel or PDF, or open it as an e-mail |
 | [Context Guard](context-guard/) | Filter | Warns before the context window overflows and stops the request with a clear message |
 | [Company Context](company-context/) | Filter | Adds company name, date, language and form of address to every request |
 | [Reasoning Toggle](reasoning-toggle/) | Filter (toggle) | Adds a button to the chat input that lets local reasoning models (vLLM, llama-server) think before they answer |
@@ -58,11 +58,11 @@ orders several filters on the same hook.
 ## Tests
 
 The `tests/` folder contains a pytest suite for all plugins (document structure, number formats,
-e-mail/mailto/.eml, print HTML, both languages, warn/block thresholds, idempotence, reasoning
+e-mail/mailto/.eml, PDF layout, both languages, warn/block thresholds, idempotence, reasoning
 parameters per model …):
 
 ```bash
-python -m venv /tmp/owui-test && /tmp/owui-test/bin/pip install python-docx openpyxl python-pptx pydantic pytest
+python -m venv /tmp/owui-test && /tmp/owui-test/bin/pip install python-docx openpyxl python-pptx pydantic pytest pypdf
 /tmp/owui-test/bin/python -I -m pytest -q tests
 ```
 
@@ -71,15 +71,16 @@ whitelist, limits, repaired model input, content checks, error messages, run tim
 parser). Its tests for attaching files to a chat replace Open WebUI's internals with stubs and need
 `starlette` (`pip install starlette`); without it they are skipped.
 
+The tests that read the PDF files of Response Export need `pypdf`; without it they are skipped.
+
 Optional checks run when the tools are installed:
 
 - **Node.js** runs the generated browser snippets and the Office File UI script against small DOM
   stubs.
-- **A headless Chromium** renders the print page to a PDF (`chrome-headless-shell`, or set
-  `PRINT_TEST_BROWSER`).
 - **LibreOffice** converts the Word file to PDF to check list numbering, and renders the Word, Excel
   and PowerPoint files of Office Documents.
-- **poppler-utils** is needed for both PDF checks.
+- **qpdf** checks the structure of the PDF files of Response Export.
+- **poppler-utils** renders those PDF files, and is needed for the LibreOffice checks.
 
 ## License
 

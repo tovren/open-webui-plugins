@@ -2,6 +2,28 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
+## 2026-10-21, second update
+
+Response Export 1.2.0. The other plugins are unchanged.
+
+### Before you update
+
+- **The PDF button downloads a PDF file** instead of opening the browser's print dialog, so nobody
+  prints on paper by mistake any more. To print, open the file and print it from the PDF viewer.
+- The PDF uses the standard PDF fonts Helvetica and Courier. The `font` and `word_template` valves
+  still apply to Word only; `accent_color` now also colours the PDF.
+
+### Response Export 1.2.0
+
+- The plugin writes the PDF itself, without a new library: the content and design of the Word file
+  (headings, lists numbered as in Word, quotes, code blocks, horizontal rules, tables with a coloured
+  header row that is repeated on every page, banded rows and right-aligned number columns), clickable
+  links (http, https, mailto), page numbers ("Seite 2 von 5") and the note of `print_footer`. A4 for
+  German, Letter for English; the file name is made like the Word file's.
+- Characters the standard PDF fonts lack: arrows and symbols such as → ≤ ✓ get stand-ins (`->`, `<=`,
+  `+`), emoji are left out, other scripts become `?`. All German characters work.
+- New icon for the PDF button: a document with the letters PDF.
+
 ## 2026-10-21
 
 Office Documents 0.3.0 · Response Export 1.1.0 · Context Guard 1.2.0 · Company Context 1.1.0 ·

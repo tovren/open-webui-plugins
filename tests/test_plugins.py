@@ -1,13 +1,13 @@
 """Tests for the Open WebUI plugins in the parent folder.
 
 Run from anywhere (Python 3.11+):
-    pip install python-docx openpyxl pydantic pytest
+    pip install python-docx openpyxl pydantic pytest pypdf
     python -I -m pytest -q path/to/tests
 
-Optional checks run automatically when the tools are installed: Node.js (executes the generated
-browser snippets and office-file-ui/loader.js against small DOM stubs), a Chromium-based browser
-(renders the print page to PDF) and LibreOffice (converts the .docx to PDF); pdftotext/pdfinfo
-(poppler) are needed for the last two.
+pypdf reads the PDF files of Response Export; without it those tests are skipped. Optional checks
+run automatically when the tools are installed: Node.js (executes the generated browser snippets and
+office-file-ui/loader.js against small DOM stubs), LibreOffice (converts the .docx to PDF; needs
+pdftotext from poppler), qpdf (checks the PDF files) and pdftoppm from poppler (renders them).
 """
 
 import ast
@@ -18,7 +18,6 @@ import email.policy
 import importlib.util
 import io
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -456,45 +455,6 @@ def test_emphasis_across_lines() -> None:
     assert rx.blocks_to_text(blocks) == "bold\ncontinued x"
 
 
-def print_page(recorder: Recorder) -> str:
-    return js_value(recorder.code(), "frame.srcdoc = ")
-
-
-@pytest.mark.parametrize(
-    ("language", "footer"),
-    [
-        ("en", r"Created with the AI assistant on \d{4}-\d{2}-\d{2}\. Please check"),
-        ("de", r"Erstellt mit dem KI-Assistenten am \d{2}\.\d{2}\.\d{4} – Inhalte bitte prüfen\."),
-    ],
-)
-def test_print_html(language: str, footer: str) -> None:
-    content = '# Q&A <b>"Report"</b>\n' + SAMPLE
-    page = print_page(run_action("pdf", content, language=language))
-    title = re.search(r"<title>(.*?)</title>", page)[1]
-    assert re.fullmatch(r"Q&amp;A b Report b \d{4}-\d{2}-\d{2} \d{4}", title)
-    assert f'<html lang="{language}">' in page
-    assert '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'' in page
-    assert re.search(footer, page)
-    assert "SECRET REASONING" not in page
-    assert "<script>" not in page and "&lt;script&gt;alert(1)&lt;/script&gt;" in page
-    assert "javascript:" not in page.split("</title>")[1].replace("(javascript:alert(1))", "")
-    assert '<a href="https://example.org/a_(b)">docs</a>' in page
-    assert "<ol><li>First continued</li><li>Second<ul><li>sub a</li><li>sub b</li></ul></li>" in page
-    assert '<th style="text-align:right">Amount</th>' in page
-    assert "@page { size: A4;" in page
-
-
-def test_print_html_escapes_title_and_footer() -> None:
-    page = rx.build_print_html([], '<x> & "y"', "<b>footer</b>", 'en"><script>')
-    assert "<title>&lt;x&gt; &amp; &quot;y&quot;</title>" in page
-    assert '<div class="footer">&lt;b&gt;footer&lt;/b&gt;</div>' in page
-    assert '<html lang="en&quot;&gt;&lt;script&gt;">' in page
-
-
-def test_print_without_footer() -> None:
-    assert 'class="footer"' not in print_page(run_action("pdf", print_footer=False))
-
-
 def test_list_of_parts_content() -> None:
     content = [
         {"type": "text", "text": "# Parts title\n\n| a | b |\n|---|---|\n| 1 | 2 |"},
@@ -779,6 +739,292 @@ def test_docx_unreadable_template_is_skipped(tmp_path: Path, caplog: pytest.LogC
         assert str(path) in caplog.text
 
 
+# ------------------------------------------------------------------------------------------- PDF --
+
+try:
+    import pypdf
+    from pypdf.generic import ContentStream
+except ImportError:  # the PDF tests that read the file are skipped
+    pypdf = None
+
+needs_pypdf = pytest.mark.skipif(pypdf is None, reason="pypdf not installed")
+
+GERMAN = "ä ö ü Ä Ö Ü ß € „Anführung“ ‚einfach‘ – — … • 20 °C § 5 m² m³ ½ 3 × 4"
+LONG_TABLE = "# Materialliste\n\n| Nr. | Artikel | Betrag |\n|---|---|---|\n" + "".join(
+    f"| {n} | Artikel {n:03d} Kabelkanal weiß | {n},50 € |\n" for n in range(1, 61)
+)
+
+
+def make_pdf(markdown: str, **options: Any) -> bytes:
+    return rx.markdown_to_pdf(rx.parse_blocks(markdown), **options)
+
+
+def read_pdf(data: bytes) -> Any:
+    return pypdf.PdfReader(io.BytesIO(data))
+
+
+def page_texts(data: bytes) -> list[str]:
+    return [page.extract_text() for page in read_pdf(data).pages]
+
+
+def link_targets(data: bytes) -> list[str]:
+    return [
+        annotation.get_object()["/A"]["/URI"]
+        for page in read_pdf(data).pages
+        for annotation in page.get("/Annots", [])
+    ]
+
+
+def text_pieces(data: bytes) -> list[tuple[int, str, float, float, float, str]]:
+    """(page, font, size, x, y, text) of every piece of text, read from the content streams."""
+    reader, pieces = read_pdf(data), []
+    for number, page in enumerate(reader.pages):
+        fonts = {name: ref.get_object()["/BaseFont"][1:] for name, ref in page["/Resources"]["/Font"].items()}
+        font, size, x, y = "", 0.0, 0.0, 0.0
+        for operands, operator in ContentStream(page.get_contents(), reader).operations:
+            if operator == b"Tf":
+                font, size = fonts[operands[0]], float(operands[1])
+            elif operator == b"Td":
+                x, y = float(operands[0]), float(operands[1])
+            elif operator == b"Tj":
+                text = operands[0].original_bytes.decode("cp1252")
+                pieces.append((number, font, size, x, y, text))
+    return pieces
+
+
+def body_text(data: bytes) -> str:
+    """The text of all pages without the footers, without spaces and line breaks."""
+    return "".join(text for *_, y, text in text_pieces(data) if y > rx.PDF_FOOTER_Y + 1).replace(" ", "")
+
+
+def assert_inside_margins(data: bytes, paper: str = "letter") -> None:
+    width, height = rx.PDF_PAPER[paper]
+    for _, font, size, x, y, text in text_pieces(data):
+        assert x >= rx.PDF_SIDE_MARGIN - 0.01, text
+        assert x + rx.text_width(font, size, text) <= width - rx.PDF_SIDE_MARGIN + 0.01, text
+        assert rx.PDF_FOOTER_Y - 0.01 <= y <= height - rx.PDF_TOP_MARGIN, text
+
+
+def test_pdf_is_downloaded() -> None:
+    data, filename, mime = downloaded(run_action("pdf"))
+    assert mime == rx.PDF_MIME == "application/pdf"
+    assert re.fullmatch(r"Quarterly report C# \d{4}-\d{2}-\d{2} \d{4}\.pdf", filename)
+    assert data.startswith(b"%PDF-1.4\n") and data.endswith(b"%%EOF\n")
+
+
+@needs_pypdf
+@pytest.mark.parametrize(
+    ("language", "size", "footer", "page"),
+    [
+        ("en", (612, 792), r"Created with the AI assistant on \d{4}-\d{2}-\d{2}\. Please",
+         "Page 1 of 1"),
+        ("de", (595.28, 841.89), r"Erstellt mit dem KI-Assistenten am \d{2}\.\d{2}\.\d{4} – Inhalte",
+         "Seite 1 von 1"),
+    ],
+)  # fmt: skip
+def test_pdf_content(language: str, size: tuple[float, float], footer: str, page: str) -> None:
+    data, _, _ = downloaded(run_action("pdf", language=language))
+    reader = read_pdf(data)
+    assert reader.metadata.title == "Quarterly report C#"
+    assert len(reader.pages) == 1
+    assert [float(v) for v in reader.pages[0].mediabox[2:]] == pytest.approx(size, abs=0.01)
+    assert reader.trailer["/Root"]["/Lang"] == language
+    text = reader.pages[0].extract_text()
+    assert re.search(footer, text) and page in text
+    assert "SECRET REASONING" not in text
+    assert "<script>alert(1)</script>" in text  # shown as text
+    assert "bad (javascript:alert(1))" in text  # as in Word: not a link, the target stays visible
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    for line in ("1. First continued", "2. Second", "– sub a", "3. Third", "1. Restart", "2. Again"):
+        assert line in lines
+    assert "Intro line one" in lines and "A quote" in lines and "echo \"<b>hi</b>\"" in lines
+    assert link_targets(data) == ["https://example.org/a_(b)"]
+    assert_inside_margins(data, "a4" if language == "de" else "letter")
+
+
+@needs_pypdf
+def test_pdf_without_footer_note() -> None:
+    data, _, _ = downloaded(run_action("pdf", print_footer=False, language="de"))
+    text = page_texts(data)[0]
+    assert "Erstellt mit" not in text and "Seite 1 von 1" in text
+
+
+@needs_pypdf
+def test_pdf_german_characters() -> None:
+    data = make_pdf(f"# Übersicht für Größen\n\n{GERMAN}\n\n| Größe | Maß |\n|---|---|\n| {GERMAN} | ö |",
+                    paper="a4", title="Übersicht für Größen")  # fmt: skip
+    assert read_pdf(data).metadata.title == "Übersicht für Größen"
+    text = page_texts(data)[0]
+    assert "Übersicht für Größen" in text
+    for word in GERMAN.split():
+        assert word in text, word
+    assert {font for _, font, *_ in text_pieces(data)} == {"Helvetica", "Helvetica-Bold"}
+    fonts = read_pdf(data).pages[0]["/Resources"]["/Font"]
+    assert all(font.get_object()["/Encoding"] == "/WinAnsiEncoding" for font in fonts.values())
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("a → b ← c ⇒ d", "a -> b <- c => d"),
+        ("≤ ≥ ≠ ≈ − ✓ ✗ ✅ ❌ ☐ ☑", "<= >= != ~ - + - + - [ ] [x]"),
+        ("Start 🚀 👍🏽 👨‍👩‍👧 🇩🇪 ❤️ 1️⃣ Ende", "Start      1 Ende"),
+        ("zero​width soft­hyphen⁠", "zerowidth softhyphen"),
+        ("10 km 5 %", "10 km 5 %"),
+        ("Łódź Čeština Ș ﬁ ⅓ x⁴", "Lódz Ceština S fi 1/3 x4"),
+        ("漢字 αβ Жж", "?? ?? ??"),
+        ("tab\there\r\x07", "tab here"),
+        (GERMAN, GERMAN),
+    ],
+)
+def test_pdf_characters_outside_the_standard_fonts(text: str, expected: str) -> None:
+    assert rx.pdf_safe_text(text) == expected
+    rx.pdf_safe_text(expected).encode("cp1252")
+
+
+@needs_pypdf
+def test_pdf_unknown_characters_do_not_break_the_export() -> None:
+    data, _, _ = downloaded(run_action("pdf", "# 🚀 Plan → Ziel\n\n✅ fertig, 漢字 und \U0010ffff."))
+    assert read_pdf(data).metadata.title == "🚀 Plan → Ziel"  # the title is Unicode
+    text = page_texts(data)[0]
+    assert "Plan -> Ziel" in text and "+ fertig, ?? und ?." in text
+
+
+@needs_pypdf
+def test_pdf_empty_document() -> None:
+    reader = read_pdf(rx.markdown_to_pdf([]))
+    assert len(reader.pages) == 1 and reader.pages[0].extract_text().strip() == "Page 1 of 1"
+    recorder = run_action("pdf", "<think>only reasoning</think>")
+    assert not recorder.calls and recorder.notifications()[0][0] == "warning"
+
+
+@needs_pypdf
+def test_pdf_long_words_are_broken() -> None:
+    word, url = "x" * 5000, "https://example.org/" + "a" * 400
+    data = make_pdf(f"{word}\n\n[{url}]({url})\n\n`{'y' * 300}`\n\n| a | b |\n|---|---|\n| {'z' * 500} | 1 |")
+    assert_inside_margins(data)
+    text = body_text(data)
+    assert word in text and url in text and "y" * 300 in text and "z" * 500 in text
+    links = link_targets(data)
+    assert len(links) == 6 and set(links) == {url}  # one clickable area per line
+
+
+def test_wrap_words_keeps_to_the_width() -> None:
+    runs = rx.parse_inline("Ein **langer** Satz mit `Code` und " + "Wort" * 100 + " und Ende")
+    words = rx.pdf_words(runs, 10.5, rx.TEXT_COLOR, rx.DEFAULT_ACCENT)
+    for width in (5, 60, 200, 450):
+        lines = rx.wrap_words(words, width)
+        assert all(line.width <= width + 0.01 for line in lines if len(line.parts[0][1]) > 1)
+        assert "".join(text for line in lines for _, text in line.parts).replace(" ", "") == (
+            "EinlangerSatzmitCodeund" + "Wort" * 100 + "undEnde"
+        )
+
+
+@needs_pypdf
+def test_pdf_list_numbering() -> None:
+    data = make_pdf(
+        "Intro\n\n98. Achtundneunzig\n99. Neunundneunzig\n100. Hundert\n\nText\n\n"
+        "1. Eins\n   1. Eins-a\n   2. Eins-b\n2. Zwei\n   - Punkt\n\n- Oben\n  - Unten"
+    )
+    lines = [" ".join(line.split()) for line in page_texts(data)[0].splitlines()]
+    expected = ("98. Achtundneunzig", "100. Hundert", "1. Eins", "1. Eins-a", "2. Eins-b", "2. Zwei")
+    for line in (*expected, "– Punkt", "• Oben", "– Unten"):
+        assert line in lines, line
+    pieces = {text: x for _, _, _, x, _, text in reversed(text_pieces(data))}  # the first of each
+    assert pieces["Achtundneunzig"] == pieces["Hundert"] > pieces["100."]  # the same indent for all items
+    assert pieces["Eins-a"] > pieces["Eins"] and pieces["Unten"] > pieces["Oben"]
+    assert pieces["1."] == pieces["98."] == pieces["•"] == pytest.approx(rx.PDF_SIDE_MARGIN, abs=0.01)
+
+
+@needs_pypdf
+def test_pdf_code_block() -> None:
+    data = make_pdf("Before\n\n```python\ndef f():\n\treturn  1  # <b>\n```\n\nAfter")
+    code = [(font, text) for _, font, _, _, _, text in text_pieces(data) if font.startswith("Courier")]
+    assert code == [("Courier", "def f():"), ("Courier", "    return  1  # <b>")]
+    stream = read_pdf(data).pages[0].get_contents().get_data()
+    assert b"0.957 0.957 0.957 rg" in stream  # the light background
+
+
+@needs_pypdf
+def test_pdf_long_table_repeats_its_header() -> None:
+    data = make_pdf(LONG_TABLE, paper="a4")
+    texts = page_texts(data)
+    assert len(texts) == 2
+    assert all("Nr. Artikel Betrag" in " ".join(text.split()) for text in texts)
+    for n in range(1, 61):  # each row is on one page, complete
+        assert sum(f"{n} Artikel {n:03d} Kabelkanal weiß {n},50 €" in " ".join(t.split()) for t in texts) == 1
+    assert_inside_margins(data, "a4")
+
+
+@needs_pypdf
+def test_pdf_table_layout() -> None:
+    data = make_pdf(
+        "| Item | Text | Amount | Left |\n|---|---|---|:--|\n"
+        "| a | x | 1.234,56 € | 1 |\n| b | y | 2 € | 22 |\n"
+        "| **Total** | [z](https://example.org/z) | **1.236,56 €** | 3 |"
+    )
+    pieces = [(font, size, x, text) for _, font, size, x, _, text in text_pieces(data)]
+    right = {round(x + rx.text_width(font, size, text), 2) for font, size, x, text in pieces if "€" in text}
+    assert len(right) == 1  # number columns are right-aligned, also the bold total
+    left = {x for _, _, x, text in pieces if text in ("1", "22", "3")}
+    assert len(left) == 1  # an explicit alignment wins
+    header = [(font, text) for font, _, _, text in pieces[:4]]
+    assert header == [("Helvetica-Bold", name) for name in ("Item", "Text", "Amount", "Left")]
+    stream = read_pdf(data).pages[0].get_contents().get_data()
+    assert b"0.122 0.306 0.475 rg" in stream  # header row in the accent colour 1F4E79
+    assert f"{rx._rgb(rx.DEFAULT_DESIGN.band)} rg".encode() in stream  # banded rows
+    assert link_targets(data) == ["https://example.org/z"]
+    assert rx._numeric_column([["h"], ["1,5 %"], [""], ["**2**"]], 0)
+    assert not rx._numeric_column([["h"], ["1"], ["+49 711 123456"]], 0)
+
+
+@needs_pypdf
+def test_pdf_row_taller_than_a_page_is_split() -> None:
+    tall = "<br>".join(f"line {n}" for n in range(150))
+    data = make_pdf(f"| Key | Value |\n|---|---|\n| a | {tall} |\n| b | after |")
+    texts = page_texts(data)
+    assert len(texts) >= 3 and all("Key Value" in text for text in texts)
+    assert body_text(data).startswith("KeyValuealine0line1line2")
+    lines = [line.strip() for text in texts for line in text.splitlines()]
+    assert all(f"line {n}" in lines for n in range(1, 150)) and "b after" in lines
+    assert_inside_margins(data)
+
+
+@needs_pypdf
+def test_pdf_links_only_for_safe_targets() -> None:
+    data = make_pdf(
+        "[web](https://example.org/ä?q=1) [plain](http://example.org) [mail](mailto:a@example.org) "
+        "[mail with cc](mailto:a@example.org?cc=b@example.org) [attach](mailto:a@example.org?attach=x) "
+        "[js](javascript:alert(1)) [tel](tel:+49711) [file](file:///etc/passwd) <https://example.org/auto> "
+        "![picture](https://example.org/p.png)"
+    )
+    assert link_targets(data) == [
+        "https://example.org/%C3%A4?q=1",
+        "http://example.org",
+        "mailto:a@example.org",
+        "mailto:a@example.org?cc=b@example.org",
+        "https://example.org/auto",
+        "https://example.org/p.png",  # images are not loaded, they become links as in Word
+    ]
+    text = " ".join(page_texts(data)[0].split())
+    for shown in ("attach (mailto:a@example.org?attach=x)", "js (javascript:alert(1))", "tel (tel:+49711)"):
+        assert shown in text
+
+
+@needs_pypdf
+def test_pdf_accent_colour_valve() -> None:
+    content = "# Title\n\n[link](https://example.org)"
+    data, _, _ = downloaded(run_action("pdf", content, accent_color="#c00000"))
+    stream = read_pdf(data).pages[0].get_contents().get_data()
+    assert b"0.753 0 0 rg" in stream
+
+
+def test_pdf_icon_is_a_document() -> None:
+    svg = base64.b64decode(rx.ACTIONS["pdf"][1].split(",", 1)[1]).decode()
+    assert "M14 3v5h5" in svg  # the folded corner of the Word icon
+    assert "<rect" not in svg  # not the printer icon of 1.1.0
+
+
 # ------------------------------------------------------------------- browser snippets (Node.js) --
 
 node = pytest.mark.skipif(shutil.which("node") is None, reason="Node.js not installed")
@@ -800,6 +1046,14 @@ def test_js_download_runs() -> None:
 
 
 @node
+def test_js_pdf_download_runs() -> None:
+    report = run_in_node(run_action("pdf").code())
+    assert report["returned"] is True
+    assert report["blobs"][0]["type"] == rx.PDF_MIME and report["blobs"][0]["size"] > 1000
+    assert report["clicks"][0]["download"].endswith(".pdf")
+
+
+@node
 def test_js_mailto_runs() -> None:
     report = run_in_node(run_action("email", EMAIL).code())
     assert report["clicks"][0]["href"].startswith("mailto:?subject=Meeting%20on%20Friday")
@@ -810,13 +1064,6 @@ def test_js_browser_settings_runs() -> None:
     report = run_in_node(rx.BROWSER_SETTINGS_JS)
     locale, timezone = report["returned"]
     assert locale == "de-CH" and timezone and rx.zone(timezone) is not None
-
-
-@node
-def test_js_print_runs() -> None:
-    report = run_in_node(run_action("pdf").code())
-    assert report["returned"] is True and report["printed"] is True and report["frameRemoved"] is True
-    assert report["srcdoc"].startswith("<!DOCTYPE html>")
 
 
 LOADER_JS = REPO / "office-file-ui" / "loader.js"
@@ -869,18 +1116,6 @@ def test_loader_tab_switch(scenario: str, clicks: int, display: str, selected: i
 # ------------------------------------------------------------------------ optional rendering checks --
 
 
-def find_browser() -> str | None:
-    """Prefer a dedicated headless shell (env PRINT_TEST_BROWSER, PATH, Playwright cache)."""
-    candidates = [os.environ.get("PRINT_TEST_BROWSER"), shutil.which("chrome-headless-shell")]
-    candidates += sorted(
-        map(str, Path.home().glob(".cache/ms-playwright/chromium_headless_shell-*/*/chrome-headless-shell")),
-        reverse=True,
-    )
-    candidates += [shutil.which(name) for name in ("chromium", "google-chrome", "brave")]
-    return next((c for c in candidates if c and Path(c).is_file()), None)
-
-
-BROWSER = find_browser()
 HAS_POPPLER = shutil.which("pdftotext") is not None and shutil.which("pdfinfo") is not None
 
 
@@ -889,34 +1124,6 @@ def pdf_text(pdf: Path, layout: bool = False) -> str:
     return subprocess.run(
         ["pdftotext", *options, str(pdf), "-"], capture_output=True, text=True, check=True
     ).stdout
-
-
-@pytest.mark.skipif(not (BROWSER and HAS_POPPLER), reason="no headless browser or poppler")
-def test_print_page_renders_as_a4_pdf() -> None:
-    page = print_page(run_action("pdf", language="de"))
-    with tempfile.TemporaryDirectory() as tmp:
-        html_file, pdf_file = Path(tmp, "page.html"), Path(tmp, "page.pdf")
-        html_file.write_text(page, encoding="utf-8")
-        command = [
-            BROWSER,
-            "--headless=new",
-            "--disable-gpu",
-            "--no-pdf-header-footer",
-            f"--user-data-dir={tmp}/profile",
-            f"--print-to-pdf={pdf_file}",
-            html_file.as_uri(),
-        ]
-        try:
-            subprocess.run(command, capture_output=True, timeout=90, check=True)
-        except subprocess.TimeoutExpired:
-            pytest.skip(f"{BROWSER} did not finish printing (headless mode unavailable?)")
-        info = subprocess.run(["pdfinfo", str(pdf_file)], capture_output=True, text=True, check=True).stdout
-        text = pdf_text(pdf_file)
-    assert re.search(r"Page size:.*\(A4\)", info)
-    assert re.search(r"Title:\s+Quarterly report C#", info)
-    assert "Quarterly report C#" in text and "Erstellt mit dem KI-Assistenten" in text
-    assert "SECRET REASONING" not in text
-    assert "<script>alert(1)</script>" in "".join(text.split())  # shown as text, not executed
 
 
 @pytest.mark.skipif(not (shutil.which("soffice") and HAS_POPPLER), reason="LibreOffice or poppler missing")
@@ -943,6 +1150,34 @@ def test_docx_renders_in_libreoffice() -> None:
     lines = [" ".join(line.split()) for line in text.splitlines()]
     assert "3. Third" in lines
     assert "1. Restart" in lines and "2. Again" in lines  # second list restarts at 1
+
+
+@pytest.mark.skipif(not shutil.which("qpdf"), reason="qpdf not installed")
+@pytest.mark.parametrize("markdown", [SAMPLE, LONG_TABLE, "x"])
+def test_pdf_passes_qpdf_check(markdown: str) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf = Path(tmp, "export.pdf")
+        pdf.write_bytes(make_pdf(markdown))
+        result = subprocess.run(["qpdf", "--check", str(pdf)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "No syntax or stream encoding errors found" in result.stdout
+
+
+@pytest.mark.skipif(not (shutil.which("pdftoppm") and HAS_POPPLER), reason="poppler not installed")
+def test_pdf_renders_with_poppler() -> None:
+    data, _, _ = downloaded(run_action("pdf", language="de"))
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf = Path(tmp, "export.pdf")
+        pdf.write_bytes(data)
+        command = ["pdftoppm", "-png", "-r", "50", "-f", "1", "-l", "1", str(pdf), f"{tmp}/page"]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0 and not result.stderr, result.stderr  # poppler reports damaged files
+        assert Path(tmp, "page-1.png").read_bytes().startswith(b"\x89PNG")
+        info = subprocess.run(["pdfinfo", str(pdf)], capture_output=True, text=True).stdout
+        text = pdf_text(pdf)
+    assert re.search(r"Page size:.*\(A4\)", info) and re.search(r"Title:\s+Quarterly report C#", info)
+    assert "Quarterly report C#" in text and "Erstellt mit dem KI-Assistenten" in text
+
 
 
 # --------------------------------------------------------------------------------- context guard --

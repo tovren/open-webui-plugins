@@ -2,10 +2,10 @@
 title: Response Export
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.1.0
+version: 1.2.0
 license: MIT
 required_open_webui_version: 0.11.4
-description: Adds four buttons below every assistant message - export as Word (.docx), export its tables as Excel (.xlsx), print / save as PDF, and open as an e-mail draft. Files are built in memory and handed straight to the browser; nothing is stored on the server.
+description: Adds four buttons below every assistant message - export as Word (.docx), export its tables as Excel (.xlsx), download as PDF, and open as an e-mail draft. Files are built in memory and handed straight to the browser; nothing is stored on the server.
 
 Buttons
 - Word (.docx) with headings, lists (one nesting level), tables, bold/italic/code, clickable links,
@@ -14,7 +14,9 @@ Buttons
 - Excel (.xlsx) with one sheet per Markdown table, a styled and frozen header row, auto filter,
   fitted column widths and real numbers (also German and Swiss formats such as "1.234,56 EUR",
   "12,5 %" or "CHF 1'234.50"); phone numbers such as "+49 711 123456" stay text.
-- PDF via the browser's print dialog (A4 layout, small footer), so no PDF library is needed.
+- PDF (.pdf) with the same content and design as the Word file (accent_color valve), page numbers
+  and an optional small footer. The plugin writes the PDF itself with the standard PDF fonts
+  (Helvetica, Courier), so no PDF library is needed.
 - E-mail via a mailto link; answers too long for a mailto link are downloaded as an .eml draft
   (marked "X-Unsent", so Outlook opens it as a new editable message).
 Reasoning and tool-call blocks are removed before exporting.
@@ -22,8 +24,8 @@ Reasoning and tool-call blocks are removed before exporting.
 Security & privacy
 - No network access, no shell, nothing is written to disk or stored on the server. Only the
   standard library plus python-docx and openpyxl (both bundled with Open WebUI) are used.
-- The browser receives the generated file (base64), a mailto link or the print HTML, wrapped in
-  a fixed JavaScript snippet run via the "execute" event. All dynamic values are JSON-encoded.
+- The browser receives the generated file (base64) or a mailto link, wrapped in a fixed JavaScript
+  snippet run via the "execute" event. All dynamic values are JSON-encoded.
 - With language 'auto' or an empty timezone, a fixed snippet first reads the interface language
   and time zone of the browser; nothing else is read from the page.
 - The page's Content-Security-Policy must allow 'unsafe-eval' for the "execute" event to work. If
@@ -31,9 +33,8 @@ Security & privacy
 - The word_template valve reads one Word file from the server (at most 20 MB); its text is removed,
   only header, footer, page size and margins are kept.
 - Raw HTML in the response is always escaped, links are limited to http, https, mailto and tel
-  (in Word to http, https and mailto), and images are never loaded (they become links). The
-  print page also carries its own strict CSP. Spreadsheet cells are written as text or numbers,
-  never as formulas.
+  in the e-mail and to http, https and mailto in Word and PDF, and images are never loaded (they
+  become links). Spreadsheet cells are written as text or numbers, never as formulas.
 """
 
 import asyncio
@@ -44,7 +45,9 @@ import io
 import json
 import logging
 import re
+import unicodedata
 import zipfile
+import zlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, tzinfo
@@ -81,8 +84,9 @@ EventCallback = Callable[[dict[str, Any]], Awaitable[Any]]
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 EML_MIME = "message/rfc822"
+PDF_MIME = "application/pdf"
 
-BODY_FONT = "Calibri"  # print page and e-mail; Word uses the font valve
+BODY_FONT = "Calibri"  # e-mail, and the default of the font valve (Word)
 BODY_FONT_SIZE = Pt(11)
 CODE_FONT = "Consolas"
 CODE_FONT_SIZE = Pt(9.5)
@@ -125,24 +129,6 @@ MAILTO_FIELDS = {"subject", "body", "cc", "bcc"}  # others, e.g. "attach", are a
 BROWSER_TIMEOUT_S = (
     30  # Open WebUI waits for the browser without a limit unless WEBSOCKET_EVENT_CALLER_TIMEOUT
 )
-PRINT_FRAME_LIFETIME_MS = 60_000
-PRINT_CSP = "default-src 'none'; style-src 'unsafe-inline'"
-PRINT_CSS = f"""
-@page {{ size: A4; margin: 2cm 2cm 2.2cm 2cm; }}
-body {{ font-family: {BODY_FONT}, Carlito, Arial, sans-serif; font-size: {BODY_FONT_SIZE.pt:g}pt; line-height: 1.4; color: #000; }}
-h1 {{ font-size: 18pt; margin: 0 0 10pt; }}
-h2 {{ font-size: 14pt; margin: 14pt 0 6pt; }}
-h3, h4, h5, h6 {{ font-size: 12pt; margin: 12pt 0 4pt; }}
-table {{ border-collapse: collapse; margin: 8pt 0; width: auto; }}
-th, td {{ border: 1px solid #888; padding: 4pt 6pt; vertical-align: top; }}
-th {{ background: #{HEADER_FILL}; }}
-tr {{ page-break-inside: avoid; }}
-pre {{ background: #f4f4f4; padding: 6pt; white-space: pre-wrap; font-size: {CODE_FONT_SIZE.pt:g}pt; }}
-code {{ font-family: {CODE_FONT}, monospace; }}
-blockquote {{ border-left: 3pt solid #bbb; margin: 6pt 0; padding-left: 8pt; color: #333; }}
-hr {{ border: 0; border-top: 1px solid #ccc; }}
-.footer {{ margin-top: 18pt; padding-top: 4pt; border-top: 1px solid #ccc; font-size: 8.5pt; color: #666; }}
-"""
 EMAIL_HTML = (  # format template with a {body} placeholder
     '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>'
     f'<div style="font-family:{BODY_FONT},Arial,sans-serif;font-size:{BODY_FONT_SIZE.pt:g}pt">{{body}}</div>'
@@ -171,6 +157,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "default_subject": "Draft",
         "sheet_name": "Table {n}",
         "print_footer": "Created with the AI assistant on {date}. Please check the content before use.",
+        "page_number": "Page {page} of {pages}",
         "date_format": "%Y-%m-%d",
         "paper": "letter",
     },
@@ -193,6 +180,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "default_subject": "Entwurf",
         "sheet_name": "Tabelle {n}",
         "print_footer": "Erstellt mit dem KI-Assistenten am {date} – Inhalte bitte prüfen.",
+        "page_number": "Seite {page} von {pages}",
         "date_format": "%d.%m.%Y",
         "paper": "a4",
     },
@@ -223,8 +211,11 @@ ACTIONS = {
     ),
     "pdf": (
         "PDF",
-        _svg_icon(
-            '<path d="M7 9V3h10v6"/><rect x="3" y="9" width="18" height="8" rx="2"/><path d="M7 14h10v7H7z"/>'
+        _svg_icon(  # a document with the letters PDF below it
+            '<path d="M5 11V5a2 2 0 0 1 2-2h7l5 5v3"/><path d="M14 3v5h5"/>'
+            '<path d="M4.5 21v-6.5h1.75a1.75 1.75 0 0 1 0 3.5H4.5"/>'
+            '<path d="M10.25 14.5v6.5h1a2.25 2.25 0 0 0 2.25-2.25v-2a2.25 2.25 0 0 0-2.25-2.25z"/>'
+            '<path d="M19.5 14.5h-3v6.5M16.5 17.75h2.5"/>'
         ),
     ),
     "email": (
@@ -1246,22 +1237,648 @@ def build_eml(subject: str, blocks: list[Block], body_text: str) -> bytes:
 
 
 # ------------------------------------------------------------------------------------------------- PDF --
+# The plugin writes the PDF itself, so no PDF library is needed: the standard fonts every PDF viewer has
+# (Helvetica and Courier, not embedded, WinAnsiEncoding = cp1252), text wrapped by the fonts' real glyph
+# widths. Paper, margins, colours, spacing and link rules are those of the Word export.
+
+CM = 72 / 2.54  # points
+PDF_PAPER = {"a4": (595.28, 841.89), "letter": (612.0, 792.0)}
+PDF_SIDE_MARGIN, PDF_TOP_MARGIN, PDF_BOTTOM_MARGIN = 2.5 * CM, 2.5 * CM, 2.2 * CM  # as in Word
+PDF_FOOTER_Y = 1.25 * CM  # baseline of the page footer
+PDF_LEADING = 1.35  # line height / font size of text
+PDF_BODY_SIZE = 10.5
+PDF_HEADINGS = {  # level -> font size, italic, in the accent colour, space before and after (as in Word)
+    1: (16, False, True, 20, 6),
+    2: (13, False, False, 14, 4),
+    3: (11, False, True, 10, 2),
+    4: (10.5, True, False, 8, 2),
+}
+PDF_LIST_INDENT = 18  # per level, as Word's list styles
+PDF_QUOTE_INDENT, PDF_QUOTE_BAR = 12, 2.25
+PDF_CODE_SIZE, PDF_CODE_LEADING, PDF_CODE_PAD, PDF_CODE_FILL = 9, 1.3, 6, "F4F4F4"
+PDF_TABLE_SIZE, PDF_TABLE_SIZE_SMALL, PDF_TABLE_LEADING = 10, 8.5, 1.25  # small: more than 6 columns
+PDF_CELL_PAD_X, PDF_CELL_PAD_Y = 5.4, 3
+PDF_FOOTER_SIZE = 8
+PDF_FONTS = {  # (bold, italic, code) -> standard font
+    (False, False, False): "Helvetica",
+    (True, False, False): "Helvetica-Bold",
+    (False, True, False): "Helvetica-Oblique",
+    (True, True, False): "Helvetica-BoldOblique",
+    (False, False, True): "Courier",
+    (True, False, True): "Courier-Bold",
+    (False, True, True): "Courier-Oblique",
+    (True, True, True): "Courier-BoldOblique",
+}
+PDF_FONT_IDS = {name: f"F{n}" for n, name in enumerate(PDF_FONTS.values(), start=1)}
+
+# Advance widths in 1/1000 em of the cp1252 characters 32-255, 16 per line, from Adobe's font metrics
+# (AFM). The oblique fonts have the widths of the upright ones; Courier is 600 throughout.
+HELVETICA_WIDTHS = """
+    278 278 355 556 556 889 667 191 333 333 389 584 278 333 278 278
+    556 556 556 556 556 556 556 556 556 556 278 278 584 584 584 556
+    1015 667 667 722 722 667 611 778 722 278 500 667 556 833 722 778
+    667 778 722 667 611 722 667 944 667 667 611 278 278 278 469 556
+    333 556 556 500 556 556 278 556 556 222 222 500 222 833 556 556
+    556 556 333 500 278 556 500 722 500 500 500 334 260 334 584 0
+    556 0 222 556 333 1000 556 556 333 1000 667 333 1000 0 611 0
+    0 222 222 333 333 350 556 1000 333 1000 500 333 944 0 500 667
+    278 333 556 556 556 556 260 556 333 737 370 556 584 333 737 333
+    400 584 333 333 333 556 537 278 333 333 365 556 834 834 834 611
+    667 667 667 667 667 667 1000 722 667 667 667 667 278 278 278 278
+    722 722 778 778 778 778 778 584 778 722 722 722 722 667 667 611
+    556 556 556 556 556 556 889 500 556 556 556 556 278 278 278 278
+    556 556 556 556 556 556 556 584 611 556 556 556 556 500 556 500
+"""
+HELVETICA_BOLD_WIDTHS = """
+    278 333 474 556 556 889 722 238 333 333 389 584 278 333 278 278
+    556 556 556 556 556 556 556 556 556 556 333 333 584 584 584 611
+    975 722 722 722 722 667 611 778 722 278 556 722 611 833 722 778
+    667 778 722 667 611 722 667 944 667 667 611 333 278 333 584 556
+    333 556 611 556 611 556 333 611 611 278 278 556 278 889 611 611
+    611 611 389 556 333 611 556 778 556 556 500 389 280 389 584 0
+    556 0 278 556 500 1000 556 556 333 1000 667 333 1000 0 611 0
+    0 278 278 500 500 350 556 1000 333 1000 556 333 944 0 500 667
+    278 333 556 556 556 556 280 556 333 737 370 556 584 333 737 333
+    400 584 333 333 333 611 556 278 333 333 365 556 834 834 834 611
+    722 722 722 722 722 722 1000 722 667 667 667 667 278 278 278 278
+    722 722 778 778 778 778 778 584 778 722 722 722 722 667 667 611
+    556 556 556 556 556 556 889 556 556 556 556 556 278 278 278 278
+    611 611 611 611 611 611 611 584 611 611 611 611 611 556 611 556
+"""
 
 
-def build_print_html(blocks: list[Block], title: str, footer: str, language: str) -> str:
-    """Standalone A4 print page; the browser uses <title> as the suggested PDF file name."""
-    footer_html = f'<div class="footer">{html.escape(footer)}</div>' if footer else ""
-    return (
-        f'<!DOCTYPE html><html lang="{html.escape(language)}"><head><meta charset="utf-8">'
-        f'<meta http-equiv="Content-Security-Policy" content="{PRINT_CSP}">'
-        f"<title>{html.escape(title)}</title><style>{PRINT_CSS}</style></head>"
-        f"<body>{blocks_to_html(blocks)}{footer_html}</body></html>"
+def _font_widths(table: str) -> tuple[int, ...]:
+    widths = (0,) * 32 + tuple(map(int, table.split()))
+    assert len(widths) == 256
+    return widths
+
+
+PDF_WIDTHS = {
+    **dict.fromkeys(("Helvetica", "Helvetica-Oblique"), _font_widths(HELVETICA_WIDTHS)),
+    **dict.fromkeys(("Helvetica-Bold", "Helvetica-BoldOblique"), _font_widths(HELVETICA_BOLD_WIDTHS)),
+    **dict.fromkeys((name for name in PDF_FONTS.values() if name.startswith("Courier")), (600,) * 256),
+}
+
+# Characters the standard fonts lack (they cover cp1252 only): common ones get a stand-in, emoji are
+# dropped, other characters lose their accents ("č" -> "c") or become "?".
+PDF_REPLACEMENTS = {
+    "\t": " ", "\u00ad": "", "\u00a0": "\u00a0", "\u2007": "\u00a0", "\u202f": "\u00a0",  # no-break spaces
+    "\u2010": "-", "\u2011": "-", "\u2012": "–", "\u2015": "—", "\u2212": "-", "\u2043": "-",  # dashes
+    "′": "'", "″": '"', "⁄": "/", "∕": "/", "∗": "*", "∙": "·", "⋅": "·",
+    "←": "<-", "→": "->", "↔": "<->", "⇐": "<=", "⇒": "=>", "⇔": "<=>",
+    "➡": "->", "➔": "->", "➜": "->", "⬅": "<-",
+    "≤": "<=", "≥": ">=", "≠": "!=", "≈": "~", "≡": "=",
+    "✓": "+", "✔": "+", "✅": "+", "✗": "-", "✘": "-", "❌": "-",
+    "☐": "[ ]", "☑": "[x]", "☒": "[x]", "★": "*", "☆": "*", "⚠": "!",
+    "●": "•", "▪": "•", "■": "•", "‣": "•", "○": "o", "◦": "o", "□": "[ ]",
+    "⌀": "Ø", "μ": "µ", "Ł": "L", "ł": "l", "Đ": "D", "đ": "d", "ı": "i",
+}  # fmt: skip
+EMOJI_RANGES = ((0x1F000, 0x1FAFF), (0x2600, 0x27BF), (0x2B00, 0x2BFF), (0x2300, 0x23FF))
+MAX_CACHED_CHARS = 10_000
+
+
+def _cp1252(char: str) -> bool:
+    try:
+        char.encode("cp1252")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _pdf_char(char: str) -> str:
+    """The stand-in of one character in the standard fonts (see PDF_REPLACEMENTS)."""
+    if char in PDF_REPLACEMENTS:
+        return PDF_REPLACEMENTS[char]
+    category = unicodedata.category(char)
+    if char == "\n":
+        return char
+    if category in ("Cc", "Cf", "Mn", "Me") or any(low <= ord(char) <= high for low, high in EMOJI_RANGES):
+        return ""  # control and format characters (zero-width space ...), variation selectors, emoji
+    if category.startswith("Z"):
+        return " "
+    if _cp1252(char):
+        return char
+    folded = "".join(
+        PDF_REPLACEMENTS.get(part, part if _cp1252(part) and not unicodedata.combining(part) else "")
+        for part in unicodedata.normalize("NFKD", char)
     )
+    return folded or "?"
+
+
+class _PdfChars(dict[int, str]):
+    """str.translate table that works out each character once."""
+
+    def __missing__(self, code: int) -> str:
+        value = _pdf_char(chr(code))
+        if len(self) < MAX_CACHED_CHARS:
+            self[code] = value
+        return value
+
+
+PDF_CHARS = _PdfChars()
+
+
+def pdf_safe_text(text: str) -> str:
+    """Text the standard fonts can show: only cp1252 characters, '\\n' kept, tabs as spaces."""
+    return unicodedata.normalize("NFC", text).translate(PDF_CHARS)
+
+
+def text_width(font: str, size: float, text: str) -> float:
+    """Width in points of text (cp1252 characters only) in a standard font."""
+    widths = PDF_WIDTHS[font]
+    return sum(widths[code] for code in text.encode("cp1252")) * size / 1000
+
+
+@dataclass(frozen=True)
+class PdfStyle:
+    font: str
+    size: float
+    color: str
+    url: str | None = None  # a link: underlined, clickable
+    strike: bool = False
+
+
+@dataclass
+class PdfWord:
+    """Text between two spaces, possibly in several styles; `space` is the space in front of it."""
+
+    parts: list[tuple[PdfStyle, str]] = field(default_factory=list)
+    width: float = 0.0
+    space: tuple[PdfStyle, str] | None = None
+    space_width: float = 0.0
+
+
+@dataclass
+class PdfLine:
+    parts: list[tuple[PdfStyle, str]]
+    width: float = 0.0
+
+
+SPACE_RE = re.compile(r"(\n| +)")
+
+
+def pdf_words(runs: list[Run], size: float, color: str, link_color: str) -> list[PdfWord | None]:
+    """Split runs into words for line wrapping; None is a line break. Links as in Word: http, https and
+    plain mailto links are clickable, other targets stay text as 'text (url)'."""
+    words: list[PdfWord | None] = []
+    word: PdfWord | None = None
+    space: tuple[PdfStyle, str] | None = None
+    for run in runs:
+        link = run.url.strip() if run.url and is_word_link(run.url) else None
+        font = PDF_FONTS[run.bold, run.italic, run.code]
+        style = PdfStyle(font, size, link_color if link else color, link, run.strike)
+        for token in SPACE_RE.split(pdf_safe_text(run.text if link else _run_text(run, with_url=True))):
+            if token == "\n":
+                words.append(None)
+                word = space = None
+            elif token.startswith(" "):
+                word, space = None, space or (style, " ")
+            elif token:
+                if word is None:
+                    space_width = text_width(space[0].font, size, " ") if space else 0.0
+                    word = PdfWord(space=space, space_width=space_width)
+                    words.append(word)
+                    space = None
+                word.parts.append((style, token))
+                word.width += text_width(font, size, token)
+    return words
+
+
+def _pdf_line(parts: list[tuple[PdfStyle, str]]) -> PdfLine:
+    merged: list[tuple[PdfStyle, str]] = []
+    for style, text in parts:  # neighbours in the same style become one piece of text
+        if merged and merged[-1][0] == style:
+            merged[-1] = (style, merged[-1][1] + text)
+        else:
+            merged.append((style, text))
+    return PdfLine(merged, sum(text_width(style.font, style.size, text) for style, text in merged))
+
+
+def wrap_words(words: list[PdfWord | None], width: float) -> list[PdfLine]:
+    """Fill lines up to `width` points; a word longer than a line is broken between characters."""
+    lines: list[list[tuple[PdfStyle, str]]] = [[]]
+    used, width = 0.0, width + 0.01  # rounding: a cell as wide as its text keeps it on one line
+    for word in words:
+        if word is None:
+            lines.append([])
+            used = 0.0
+            continue
+        space = word.space_width if lines[-1] and word.space else 0.0
+        if lines[-1] and used + space + word.width <= width:
+            if word.space:
+                lines[-1].append(word.space)
+            lines[-1].extend(word.parts)
+            used += space + word.width
+            continue
+        if lines[-1]:
+            lines.append([])
+        if word.width <= width:
+            lines[-1].extend(word.parts)
+            used = word.width
+            continue
+        used = 0.0
+        for style, text in word.parts:
+            widths, start = PDF_WIDTHS[style.font], 0
+            for i, code in enumerate(text.encode("cp1252")):
+                char_width = widths[code] * style.size / 1000
+                if used + char_width > width and used > 0:  # at least one character per line
+                    if i > start:
+                        lines[-1].append((style, text[start:i]))
+                    lines.append([])
+                    used, start = 0.0, i
+                used += char_width
+            lines[-1].append((style, text[start:]))
+    return [_pdf_line(parts) for parts in lines]
+
+
+def _numeric_column(rows: list[list[str]], column: int) -> bool:
+    """True if every filled cell below the header is a number, as the Excel export reads them."""
+    values = [text for row in rows[1:] if (text := to_plain(row[column]))]
+    return bool(values) and all(not isinstance(parse_number(text)[0], str) for text in values)
+
+
+def _pdf_literal(text: str) -> bytes:
+    """A PDF string of cp1252 text."""
+    data = text.encode("cp1252")
+    return b"(" + data.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)") + b")"
+
+
+def _pdf_unicode(text: str) -> bytes:
+    """A PDF text string in UTF-16 (document information such as the title)."""
+    text = "".join(char for char in text if unicodedata.category(char) != "Cc")
+    return b"<FEFF" + text.encode("utf-16-be", "replace").hex().upper().encode() + b">"
+
+
+def _pdf_date(moment: datetime) -> bytes:
+    offset = moment.utcoffset()
+    zone = ""
+    if offset is not None:
+        minutes = int(offset.total_seconds() // 60)
+        sign, hours, minutes = "+" if minutes >= 0 else "-", abs(minutes) // 60, abs(minutes) % 60
+        zone = f"{sign}{hours:02d}'{minutes:02d}'" if hours or minutes else "Z"
+    return _pdf_literal(moment.strftime("D:%Y%m%d%H%M%S") + zone)
+
+
+def _rgb(color: str) -> str:
+    return " ".join(f"{value / 255:.3f}".rstrip("0").rstrip(".") or "0" for value in bytes.fromhex(color))
+
+
+class PdfWriter:
+    """Lay out parsed blocks on pages and write them as a PDF: headings in the design of the Word export,
+    wrapped text, lists, quotes, code blocks, tables whose header row is repeated on every page, clickable
+    links, and a footer with the page number and an optional note."""
+
+    def __init__(
+        self,
+        design: Design = DEFAULT_DESIGN,
+        paper: str = "letter",
+        footer: str = "",
+        page_label: str = "Page {page} of {pages}",
+    ) -> None:
+        self.design, self.footer, self.page_label = design, footer, page_label
+        self.page_width, self.page_height = PDF_PAPER[paper]
+        self.left, self.right = PDF_SIDE_MARGIN, self.page_width - PDF_SIDE_MARGIN
+        self.top, self.bottom = self.page_height - PDF_TOP_MARGIN, PDF_BOTTOM_MARGIN
+        self.pages: list[list[bytes]] = []  # content stream operators per page
+        self.links: list[list[list[Any]]] = []  # [x1, y1, x2, y2, url] per page
+        self.fonts: set[str] = set()
+        self.y = self.after = 0.0  # top of the free space; space still owed after the last block
+        self._new_page()
+
+    def render(self, blocks: list[Block], title: str = "", language: str = "en",
+               created: datetime | None = None) -> bytes:  # fmt: skip
+        for block in blocks:
+            match block:
+                case Heading(level, text):
+                    size, italic, accent, before, after = PDF_HEADINGS[min(level, MAX_DOCX_HEADING_LEVEL)]
+                    color = self.design.accent if accent else TEXT_COLOR
+                    runs = [Run(to_plain(text), bold=True, italic=italic)]  # as in Word: no links in headings
+                    keep = 2 * PDF_BODY_SIZE * PDF_LEADING  # with the first lines of the following text
+                    self._paragraph(runs, size=size, color=color, before=before, after=after, keep=keep)
+                case Paragraph(text):
+                    self._paragraph(parse_inline(text))
+                case List():
+                    self._list(block, level=0, x=0)
+                    self.after = 6
+                case Quote(lines):
+                    if text := "\n".join(lines).strip():
+                        runs = parse_inline(text, Run("", italic=True))
+                        self._paragraph(runs, color=MUTED_COLOR, indent=PDF_QUOTE_INDENT, before=6, after=10,
+                                        bar=self.design.accent)  # fmt: skip
+                case CodeBlock(code):
+                    self._code(code)
+                case Table():
+                    self._table(block)
+                case Rule():
+                    self._start(8, 1)
+                    self._stroke(self.left, self.right, self.y, 0.75, RULE_COLOR)
+                    self.after = 8
+        for number, (ops, links) in enumerate(zip(self.pages, self.links, strict=True), start=1):
+            self.ops, self.page_links = ops, links
+            self._footer(number, len(self.pages))
+        return self._document(title, language, created or datetime.now())
+
+    # --- layout
+
+    def _new_page(self) -> None:
+        self.ops: list[bytes] = []
+        self.page_links: list[list[Any]] = []
+        self.pages.append(self.ops)
+        self.links.append(self.page_links)
+        self.y = self.top
+
+    def _start(self, before: float, needed: float = 0.0) -> None:
+        """Space before a block (the larger of it and the previous block's space after; none at the top of
+        a page), and a new page if the first `needed` points of the block do not fit."""
+        gap = 0.0 if self.y >= self.top else max(before, self.after)
+        needed = min(needed, self.top - self.bottom)
+        if self.y - gap - needed < self.bottom and self.y < self.top:
+            self._new_page()
+            gap = 0.0
+        self.y -= gap
+        self.after = 0.0
+
+    def _need(self, height: float) -> None:
+        """A new page if `height` points do not fit on this one."""
+        if self.y - height < self.bottom - 0.01 and self.y < self.top:
+            self._new_page()
+
+    def _paragraph(self, runs: list[Run], *, size: float = PDF_BODY_SIZE, color: str = TEXT_COLOR,
+                   indent: float = 0.0, before: float = 0.0, after: float = 6.0, keep: float = 0.0,
+                   marker: tuple[float, str, str] | None = None, bar: str | None = None) -> None:  # fmt: skip
+        """Wrapped text. `marker` is (x, text, colour) of a list bullet or number in front of the first line,
+        `bar` the colour of a quote's line on the left, `keep` the room needed after the first line."""
+        height = size * PDF_LEADING
+        lines = wrap_words(pdf_words(runs, size, color, self.design.accent), self.right - self.left - indent)
+        self._start(before, height + keep)
+        room = int((self.y - self.bottom) / height + 1e-6)  # lines that fit on this page
+        if 0 < room < len(lines) and self.y < self.top:  # no single line at the bottom or top of a page
+            if len(lines) - room == 1:
+                room = room - 1 if room > 2 else 0
+            if room == 1:
+                room = 0
+            if not room:
+                self._new_page()
+        for n, line in enumerate(lines):
+            if n == room and n:
+                self._new_page()
+            self._need(height)
+            if n == 0 and marker:
+                x, text, marker_color = marker
+                bullet = PdfLine([(PdfStyle("Helvetica", size, marker_color), text)])
+                self._draw(bullet, self.left + x, self.y, height, size)
+            if bar:
+                self._fill(self.left, self.y - height, PDF_QUOTE_BAR, height, bar)
+            self._draw(line, self.left + indent, self.y, height, size)
+            self.y -= height
+        self.after = after
+
+    def _list(self, block: List, level: int, x: float) -> None:
+        """Bullets (• and – in the accent colour) and numbers as in Word; each list counts from its start."""
+        count = range(block.start, block.start + len(block.items))
+        markers = [f"{n}." for n in count] if block.ordered else ["–" if level else "•"] * len(block.items)
+        color = TEXT_COLOR if block.ordered else self.design.accent
+        hang = max(PDF_LIST_INDENT, max(text_width("Helvetica", PDF_BODY_SIZE, m) for m in markers) + 6)
+        for item, marker in zip(block.items, markers, strict=True):
+            self._paragraph(parse_inline(item.text), indent=x + hang, after=3, marker=(x, marker, color))
+            for sublist in item.sublists:
+                self._list(sublist, level=1, x=x + hang)
+
+    def _code(self, code: str) -> None:
+        """Courier on a light background, whitespace kept, long lines broken."""
+        size, pad = PDF_CODE_SIZE, PDF_CODE_PAD
+        height, style = size * PDF_CODE_LEADING, PdfStyle("Courier", size, TEXT_COLOR)
+        per_line = max(1, int((self.right - self.left - 2 * pad) / (0.6 * size)))
+        lines = [
+            raw[i : i + per_line]
+            for raw in pdf_safe_text(code.expandtabs(4)).split("\n")
+            for i in range(0, max(len(raw), 1), per_line)
+        ]
+        self._start(8, min(len(lines), 2) * height + 2 * pad)
+        done = 0
+        while done < len(lines):
+            room = int((self.y - self.bottom - 2 * pad) / height)
+            if room < 1 and self.y < self.top:
+                self._new_page()
+                continue
+            chunk = lines[done : done + max(room, 1)]
+            box = len(chunk) * height + 2 * pad
+            self._fill(self.left, self.y - box, self.right - self.left, box, PDF_CODE_FILL)
+            for n, text in enumerate(chunk):
+                self._draw(PdfLine([(style, text)]), self.left + pad, self.y - pad - n * height, height, size)
+            self.y -= box
+            done += len(chunk)
+        self.after = 8
+
+    def _table(self, table: Table) -> None:
+        """Header row in the accent colour with white bold text, every second row tinted, thin lines between
+        rows; number columns right-aligned. A row is only split if it is taller than a page."""
+        size = PDF_TABLE_SIZE if len(table.aligns) <= 6 else PDF_TABLE_SIZE_SMALL
+        height, accent = size * PDF_TABLE_LEADING, self.design.accent
+        aligns = [
+            align or ("right" if _numeric_column(table.rows, column) else "left")
+            for column, align in enumerate(table.aligns)
+        ]
+        words = [
+            [pdf_words(parse_inline(text, Run("", bold=r == 0)), size, *colors) for text in row]
+            for r, row in enumerate(table.rows)
+            for colors in [(WHITE, WHITE) if r == 0 else (TEXT_COLOR, accent)]  # text and links
+        ]
+        widths = self._column_widths(words)
+        rows = [
+            [wrap_words(cell, width - 2 * PDF_CELL_PAD_X) for cell, width in zip(row, widths, strict=True)]
+            for row in words
+        ]
+        heights = [max(map(len, row)) * height + 2 * PDF_CELL_PAD_Y for row in rows]
+        header = rows[0] if heights[0] < (self.top - self.bottom) / 3 else None  # repeated on each page
+        first = min(heights[1], 3 * height + 2 * PDF_CELL_PAD_Y) if len(heights) > 1 else 0.0
+        self._start(6, heights[0] + first)  # the header row not alone at the bottom of a page
+        for r, row in enumerate(rows):
+            fill = accent if r == 0 else self.design.band if r % 2 == 0 else None
+            self._table_row(row, widths, aligns, size, fill, header if r else None)
+        self._stroke(self.left, self.left + sum(widths), self.y, 1, accent)
+        self.after = 10
+
+    def _column_widths(self, cells: list[list[list[PdfWord | None]]]) -> list[float]:
+        """Widths from the content within the text width: each column at least its longest word (up to
+        30 % of the width) or, if its cells are short, their whole text; the rest is shared by how long the
+        cells' lines are."""
+        available, pad = self.right - self.left, 2 * PDF_CELL_PAD_X
+        low, high = [pad] * len(cells[0]), [pad] * len(cells[0])
+        for row in cells:
+            for column, words in enumerate(row):
+                line = 0.0
+                for word in [*words, None]:
+                    if word is None:
+                        high[column] = max(high[column], line + pad)
+                        line = 0.0
+                    else:
+                        line += (word.space_width if line else 0.0) + word.width
+                        low[column] = max(low[column], min(word.width + pad, 0.3 * available))
+        low = [b if b <= 0.2 * available else a for a, b in zip(low, high, strict=True)]  # short: one line
+        if sum(high) <= available:  # the table spans the text width, like in Word
+            return [width * available / sum(high) for width in high]
+        if sum(low) >= available:
+            return [width * available / sum(low) for width in low]
+        share = (available - sum(low)) / (sum(high) - sum(low))
+        return [a + (b - a) * share for a, b in zip(low, high, strict=True)]
+
+    def _table_row(self, row: list[list[PdfLine]], widths: list[float], aligns: list[str], size: float,
+                   fill: str | None, header: list[list[PdfLine]] | None) -> None:  # fmt: skip
+        """One row; on a new page the header row comes first."""
+        height, pad = size * PDF_TABLE_LEADING, PDF_CELL_PAD_Y
+        header_height = max(map(len, header)) * height + 2 * pad if header else 0.0
+        total, start, fresh = max(map(len, row)), 0, False
+        while start < total:
+            room, rest = int((self.y - self.bottom - 2 * pad) / height + 1e-6), total - start
+            if room < rest and not fresh:
+                fresh_room = int((self.top - self.bottom - header_height - 2 * pad) / height)
+                if rest <= fresh_room or room < min(3, rest):  # split a row only if it is taller than a page
+                    self._new_page()
+                    if header:
+                        lines = max(map(len, header))
+                        self._row_part(header, widths, aligns, size, self.design.accent, 0, lines)
+                    fresh = True
+                    continue
+            count = max(1, min(room, rest))
+            self._row_part(row, widths, aligns, size, fill, start, count)
+            start, fresh = start + count, False
+
+    def _row_part(self, row: list[list[PdfLine]], widths: list[float], aligns: list[str], size: float,
+                  fill: str | None, start: int, count: int) -> None:  # fmt: skip
+        """Lines start ... start + count of the cells of a row."""
+        height = size * PDF_TABLE_LEADING
+        box = count * height + 2 * PDF_CELL_PAD_Y
+        if fill:
+            self._fill(self.left, self.y - box, sum(widths), box, fill)
+        x = self.left
+        for lines, width, align in zip(row, widths, aligns, strict=True):
+            for n, line in enumerate(lines[start : start + count]):
+                top = self.y - PDF_CELL_PAD_Y - n * height
+                self._draw(line, x + PDF_CELL_PAD_X, top, height, size, width - 2 * PDF_CELL_PAD_X, align)
+            x += width
+        self.y -= box
+        self._stroke(self.left, x, self.y, 0.5, RULE_COLOR)
+
+    def _footer(self, number: int, total: int) -> None:
+        style = PdfStyle("Helvetica", PDF_FOOTER_SIZE, MUTED_COLOR)
+        label = pdf_safe_text(self.page_label.format(page=number, pages=total))
+        width = text_width(style.font, style.size, label)
+        self._show(self.right - width, PDF_FOOTER_Y, style, label)
+        if self.footer:
+            note = wrap_words(pdf_words([Run(self.footer)], style.size, style.color, style.color),
+                              self.right - self.left - width - 18)[0]  # fmt: skip
+            self._draw(note, self.left, PDF_FOOTER_Y + 0.718 * style.size, 0.925 * style.size, style.size)
+
+    # --- drawing
+
+    def _draw(self, line: PdfLine, x: float, top: float, height: float, size: float, width: float = 0.0,
+              align: str = "left") -> None:  # fmt: skip
+        """A line of text whose box starts at `top`; centred or right-aligned within `width`."""
+        baseline = top - (height - 0.925 * size) / 2 - 0.718 * size  # Helvetica: ascent 0.718, descent 0.207
+        if align in ("center", "right"):
+            x += (width - line.width) / (2 if align == "center" else 1)
+        for style, text in line.parts:
+            advance = text_width(style.font, style.size, text)
+            if text.strip():
+                self._show(x, baseline, style, text)
+            if style.url:
+                self._fill(x, baseline - 0.12 * style.size, advance, 0.06 * style.size, style.color)
+                box = [x, baseline - 0.25 * style.size, x + advance, baseline + 0.85 * style.size, style.url]
+                last = self.page_links[-1] if self.page_links else None
+                if last and last[4] == style.url and abs(last[2] - x) < 0.01 and abs(last[1] - box[1]) < 0.01:
+                    last[2] = box[2]  # the next piece of the same link on this line
+                else:
+                    self.page_links.append(box)
+            if style.strike:
+                self._fill(x, baseline + 0.28 * style.size, advance, 0.06 * style.size, style.color)
+            x += advance
+
+    def _show(self, x: float, baseline: float, style: PdfStyle, text: str) -> None:
+        self.fonts.add(style.font)
+        self.ops.append(
+            f"BT /{PDF_FONT_IDS[style.font]} {style.size:g} Tf {_rgb(style.color)} rg "
+            f"{x:.2f} {baseline:.2f} Td ".encode()
+            + _pdf_literal(text)
+            + b" Tj ET"
+        )
+
+    def _fill(self, x: float, y: float, width: float, height: float, color: str) -> None:
+        self.ops.append(f"{_rgb(color)} rg {x:.2f} {y:.2f} {width:.2f} {height:.2f} re f".encode())
+
+    def _stroke(self, x1: float, x2: float, y: float, width: float, color: str) -> None:
+        self.ops.append(f"{_rgb(color)} RG {width:g} w {x1:.2f} {y:.2f} m {x2:.2f} {y:.2f} l S".encode())
+
+    # --- file
+
+    def _document(self, title: str, language: str, created: datetime) -> bytes:
+        objects: list[bytes] = [b"", b"", b""]  # catalog, page tree and document information come last
+
+        def add(obj: bytes) -> int:
+            objects.append(obj)
+            return len(objects)
+
+        font = b"<< /Type /Font /Subtype /Type1 /BaseFont /%s /Encoding /WinAnsiEncoding >>"
+        fonts = b" ".join(
+            b"/%s %d 0 R" % (PDF_FONT_IDS[name].encode(), add(font % name.encode()))
+            for name in sorted(self.fonts)
+        )
+        resources = add(b"<< /Font << %s >> /ProcSet [/PDF /Text] >>" % fonts)
+        media_box = f"[0 0 {self.page_width:g} {self.page_height:g}]".encode()
+        kids = []
+        for ops, links in zip(self.pages, self.links, strict=True):
+            stream = zlib.compress(b"\n".join(ops))
+            contents = add(
+                b"<< /Length %d /Filter /FlateDecode >>\nstream\n%s\nendstream" % (len(stream), stream)
+            )
+            annotations = [
+                add(
+                    f"<< /Type /Annot /Subtype /Link /Rect [{x1:.2f} {y1:.2f} {x2:.2f} {y2:.2f}] "
+                    f"/Border [0 0 0] /A << /Type /Action /S /URI /URI ".encode()
+                    + _pdf_literal(quote(url, safe="!#$%&'()*+,-./:;=?@[]~_"))
+                    + b" >> >>"
+                )
+                for x1, y1, x2, y2, url in links
+            ]
+            annots = b" /Annots [%s]" % b" ".join(b"%d 0 R" % a for a in annotations) if annotations else b""
+            kids.append(add(
+                b"<< /Type /Page /Parent 2 0 R /MediaBox %s /Resources %d 0 R /Contents %d 0 R%s >>"
+                % (media_box, resources, contents, annots)
+            ))  # fmt: skip
+        objects[0] = (
+            b"<< /Type /Catalog /Pages 2 0 R /Lang %s /ViewerPreferences << /DisplayDocTitle true >> >>"
+            % _pdf_literal(language)
+        )
+        objects[1] = b"<< /Type /Pages /Kids [%s] /Count %d >>" % (
+            b" ".join(b"%d 0 R" % kid for kid in kids),
+            len(kids),
+        )
+        objects[2] = b"<< /Title %s /Producer (Response Export for Open WebUI) /CreationDate %s >>" % (
+            _pdf_unicode(title),
+            _pdf_date(created),
+        )
+        out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        offsets = []
+        for number, obj in enumerate(objects, start=1):
+            offsets.append(len(out))
+            out += b"%d 0 obj\n%s\nendobj\n" % (number, obj)
+        xref = len(out)
+        out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+        out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+        out += b"trailer\n<< /Size %d /Root 1 0 R /Info 3 0 R >>\n" % (len(objects) + 1)
+        out += b"startxref\n%d\n%%%%EOF\n" % xref
+        return bytes(out)
+
+
+def markdown_to_pdf(blocks: list[Block], design: Design = DEFAULT_DESIGN, paper: str = "letter",
+                    footer: str = "", page_label: str = "Page {page} of {pages}", title: str = "",
+                    language: str = "en", created: datetime | None = None) -> bytes:  # fmt: skip
+    return PdfWriter(design, paper, footer, page_label).render(blocks, title, language, created)
 
 
 # ------------------------------------------------------------------------------------- browser snippets --
-# The snippets run inside an async function in the user's browser. They must return quickly:
-# the server waits for the result with a timeout, hence print() is scheduled with setTimeout.
+# The snippets run inside an async function in the user's browser. They must return quickly: the server
+# waits for the result with a timeout.
 
 
 def _click_link_js(href: str, filename: str | None = None) -> str:
@@ -1288,21 +1905,6 @@ return true;
 
 def open_url_js(url: str) -> str:
     return f"""{_click_link_js(json.dumps(url))}
-return true;
-"""
-
-
-def print_js(page_html: str) -> str:
-    return f"""
-const frame = document.createElement('iframe');
-frame.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;';
-document.body.appendChild(frame);
-frame.onload = () => setTimeout(() => {{
-  frame.contentWindow.focus();
-  frame.contentWindow.print();
-  setTimeout(() => frame.remove(), {PRINT_FRAME_LIFETIME_MS});
-}}, 100);
-frame.srcdoc = {json.dumps(page_html)};
 return true;
 """
 
@@ -1392,13 +1994,13 @@ class Action:
     class Valves(BaseModel):
         language: Literal["auto", "en", "de"] = Field(
             default="auto",
-            description="Language of the messages, default file names, the print footer and the Word paper "
-            "size (en: Letter, de: A4). auto = the user's interface language (English if there is no "
-            "translation).",
+            description="Language of the messages, default file names, the PDF footer and the paper size of "
+            "Word and PDF files (en: Letter, de: A4). auto = the user's interface language (English if there "
+            "is no translation).",
         )
         timezone: str = Field(
             default="",
-            description="IANA time zone for file name timestamps and the print footer date, "
+            description="IANA time zone for file name timestamps and the date in the PDF footer, "
             "e.g. 'Europe/Berlin'. Empty or unknown = the time zone of the user's browser.",
         )
         max_mailto_length: int = Field(
@@ -1413,23 +2015,25 @@ class Action:
         )
         print_footer: bool = Field(
             default=True,
-            description="Add a small 'created with the AI assistant' note with the date to printed pages.",
+            description="Add a small 'created with the AI assistant' note with the date to the footer of "
+            "PDF pages (the page number is always there).",
         )
         accent_color: str = Field(
             default=DEFAULT_ACCENT,
-            description="Accent colour of Word documents (headings, table header rows, links) as a hex value "
-            "without '#', e.g. 1F4E79. Same as the valve of Office Documents.",
+            description="Accent colour of Word and PDF files (headings, table header rows, links) as a hex "
+            "value without '#', e.g. 1F4E79. Same as the valve of Office Documents.",
         )
         font: str = Field(
             default=BODY_FONT,
             description="Font of Word documents, e.g. Calibri, Arial or Aptos. It has to be installed where "
-            "the files are opened; otherwise Office shows a similar one.",
+            "the files are opened; otherwise Office shows a similar one. PDF files always use the standard "
+            "PDF fonts Helvetica and Courier.",
         )
         word_template: str = Field(
             default="",
             description="Optional Word file (.docx or .dotx) on the Open WebUI server, e.g. a letterhead: "
             "Word documents get its header, footer, page size and margins, e.g. "
-            "/app/backend/data/templates/letterhead.dotx.",
+            "/app/backend/data/templates/letterhead.dotx. Not used for PDF files.",
         )
 
     def __init__(self) -> None:
@@ -1517,8 +2121,15 @@ class Action:
             footer = export.texts["print_footer"].format(
                 date=export.now().strftime(export.texts["date_format"])
             )
-        page = build_print_html(blocks, self._file_stem(blocks, export), footer, export.language)
-        await export.browser.run_js(print_js(page))
+        texts, design = export.texts, self._design()
+        title = document_title(blocks) or texts["default_title"]
+
+        def build() -> bytes:
+            return markdown_to_pdf(blocks, design, texts["paper"], footer, texts["page_number"], title,
+                                   export.language, export.now())  # fmt: skip
+
+        data = await asyncio.to_thread(build)
+        await export.browser.download(data, f"{self._file_stem(blocks, export)}.pdf", PDF_MIME)
 
     async def _export_email(self, content: str, export: Export) -> None:
         texts, browser = export.texts, export.browser

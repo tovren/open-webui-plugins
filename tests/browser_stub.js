@@ -2,7 +2,7 @@
 // Usage: node browser_stub.js < snippet.js   -> prints a JSON report of what the snippet did.
 // The snippet is wrapped exactly like Open WebUI's "execute" event handler does it.
 
-const report = { returned: null, clicks: [], blobs: [], printed: false, frameRemoved: false, srcdoc: null };
+const report = { returned: null, clicks: [], blobs: [] };
 
 function element(tag) {
   const el = {
@@ -11,16 +11,8 @@ function element(tag) {
     click() {
       report.clicks.push({ href: el.href, download: el.download });
     },
-    remove() {
-      if (tag === 'iframe') report.frameRemoved = true;
-    },
+    remove() {},
   };
-  if (tag === 'iframe') {
-    el.contentWindow = { focus() {}, print() { report.printed = true; } };
-    Object.defineProperty(el, 'srcdoc', {
-      set(value) { report.srcdoc = value; setTimeout(() => el.onload && el.onload(), 0); },
-    });
-  }
   return el;
 }
 
@@ -35,7 +27,7 @@ URL.createObjectURL = (blob) => {
   report.blobs.push({ size: blob.size, type: blob.type });
   return createObjectURL(blob);
 };
-// Shorten timers so the 60 s frame cleanup does not keep the test waiting.
+// Shorten timers so the cleanup of the download URL (after 10 s) does not keep the test waiting.
 const realSetTimeout = setTimeout;
 globalThis.setTimeout = (fn, ms) => realSetTimeout(fn, Math.min(ms, 50));
 
