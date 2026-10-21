@@ -18,7 +18,7 @@ Helvetica and Courier, which every PDF viewer has (see [Notes and limitations](#
 
 ![The four export buttons below an answer](images/buttons.png)
 
-![The exported Word document and Excel sheet](images/exported-files.png)
+![The exported Word document, Excel sheet and PDF file](images/exported-files.png)
 
 ## Install
 
