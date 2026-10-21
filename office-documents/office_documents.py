@@ -2,7 +2,7 @@
 title: Office Documents
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 0.2.0
+version: 0.2.1
 license: MIT
 required_open_webui_version: 0.11.4
 description: Lets the model create Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files. The model only supplies the content as structured JSON; fixed code builds the file, so no model-written code is ever run. The file is attached to the answer, where it can be previewed and downloaded.
@@ -3123,8 +3123,7 @@ class PptxWriter:
         if series_count == 1 and categories <= 8:
             plot.has_data_labels = True
             labels = plot.data_labels
-            labels.font.size = PptxPt(12)
-            labels.number_format_is_linked = True
+            labels.font.size = PptxPt(12)  # no numFmt: without formatCode PowerPoint repairs the file
             labels.position = XL_LABEL_POSITION.ABOVE if kind == "line" else XL_LABEL_POSITION.OUTSIDE_END
 
     # -- helpers --

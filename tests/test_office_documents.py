@@ -818,6 +818,17 @@ def test_powerpoint_structure() -> None:
     assert [s.name for s in pie.plots[0].series] == ["Sales"]
 
 
+
+def test_powerpoint_chart_xml_opens_in_powerpoint() -> None:
+    # a <c:numFmt> without formatCode makes PowerPoint repair the file and drop the chart
+    chart = {"categories": ["Q1", "Q2"], "series": [{"name": "s", "values": [1, 2]}]}
+    slides = [{"layout": "chart", "title": t, "chart": {**chart, "type": t}} for t in ("column", "bar", "line", "pie")]
+    data, _ = od.build_pptx("D", od.parse_argument(od.SLIDES, slides, "slides"))
+    with zipfile.ZipFile(io.BytesIO(data)) as deck:
+        charts = [deck.read(n).decode() for n in deck.namelist() if n.startswith("ppt/charts/chart")]
+    assert len(charts) == 4 and all("<c:dLbls>" in xml for xml in charts)
+    assert not [f for xml in charts for f in re.findall(r"<c:numFmt [^>]*>", xml) if "formatCode=" not in f]
+
 def test_powerpoint_invalid_input() -> None:
     slides = [
         {"layout": "bullets", "title": "", "bullets": []},
