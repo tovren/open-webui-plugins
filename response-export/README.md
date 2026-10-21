@@ -4,13 +4,13 @@ An Open WebUI **action** that adds four buttons below every assistant message:
 
 | Button | Result |
 |---|---|
-| **Word (.docx)** | Word document with headings, bullet and numbered lists (one nesting level, numbering restarts for each list), tables with a bold header row, bold/italic/strikethrough/inline code, links shown as `text (url)`, code blocks and quotes |
-| **Excel (.xlsx)** | One worksheet per Markdown table. The header row is bold, shaded and frozen, with an auto filter and fitted column widths. Numbers become real numbers, including German formats (`1.234,56`, `12,5 %`, `1.234,56 €`), `$`/`£` amounts and the codes `EUR`, `USD` and `GBP` |
+| **Word (.docx)** | Word document with headings, bullet and numbered lists (one nesting level, numbering restarts for each list), tables with a header row in the accent colour, bold/italic/strikethrough/inline code, clickable links, code blocks, quotes and horizontal rules. Same design as the Word files of Office Documents (`accent_color`, `font`), optionally on a company template such as a letterhead (`word_template`) |
+| **Excel (.xlsx)** | One worksheet per Markdown table. The header row is bold, shaded and frozen, with an auto filter and fitted column widths. Numbers become real numbers, including German and Swiss formats (`1.234,56`, `12,5 %`, `1.234,56 €`, `CHF 1'234.50`), `$`/`£` amounts and the codes `EUR`, `USD`, `GBP` and `CHF`. Phone numbers such as `+49 711 123456` stay text |
 | **PDF** | Opens the browser's print dialog with a clean A4 layout and a small footer. Choose "Save as PDF". The suggested file name is the first heading plus a timestamp |
 | **E-Mail** | Opens the default mail program through a `mailto:` link. A `Subject:`/`Betreff:` line becomes the subject, and any preamble before it ("Here is a draft:") is dropped. If the answer is too long for a `mailto:` link, an `.eml` draft with plain-text and HTML parts is downloaded instead. Outlook opens it as a new, editable message |
 
-Reasoning and tool-call blocks (`<details>…</details>`, `<think>…</think>`) are removed before
-exporting. File names use the first heading of the answer plus a timestamp, e.g.
+Reasoning and tool-call blocks (`<details>…</details>`, `<think>…</think>`, also nested ones) are
+removed before exporting. File names use the first heading of the answer plus a timestamp, e.g.
 `Quarterly report 2026-10-12 1405.docx`.
 
 ![The four export buttons below an answer](images/buttons.png)
@@ -26,11 +26,24 @@ enable it globally or per model, see [Installation](../README.md#installation).
 
 | Valve | Default | Description |
 |---|---|---|
-| `language` | `en` | Language of the buttons, messages, default file names and print footer (`en` or `de`) |
-| `timezone` | _(empty)_ | IANA time zone for file name timestamps and the footer date, e.g. `Europe/Berlin`. Empty means server time, which is often UTC in Docker |
+| `language` | `auto` | Language of the messages, default file names, print footer and Word paper size (`en`: Letter, `de`: A4): `auto` (the user's interface language, English if there is no translation), `en` or `de` |
+| `timezone` | _(empty)_ | IANA time zone for file name timestamps and the footer date, e.g. `Europe/Berlin`. Empty means the time zone of the user's browser. An unknown name counts as empty |
 | `max_mailto_length` | `1900` | Longest `mailto:` link handed to the mail program (Outlook on Windows handles about 2000 characters). Longer answers are downloaded as `.eml` |
 | `always_eml` | `false` | Always download a formatted `.eml` draft instead of a plain-text `mailto:` link |
 | `print_footer` | `true` | Add the "Created with the AI assistant on …" footer to printed pages |
+| `accent_color` | `1F4E79` | Accent colour of Word documents (headings, table header rows, links), as a hex value without `#` |
+| `font` | `Calibri` | Font of Word documents, e.g. a company font such as `Arial` or `Aptos`. It has to be installed where the files are opened; otherwise Office shows a similar one |
+| `word_template` | _(empty)_ | Path of a Word file (`.docx` or `.dotx`) on the Open WebUI server, e.g. a letterhead: Word documents get its header, footer, page size and margins |
+
+`accent_color`, `font` and `word_template` have the same names and meaning as in
+[Office Documents](../office-documents/#word-template), so set them to the same values to get the same
+look from both plugins. With a template, its text is removed; the content keeps the design and uses
+the styles *Body Text*, *Heading 1–4*, *Quote* and the list styles, which are replaced in the document.
+If the file cannot be read (missing, not a Word file, larger than 20 MB), the document is made without
+it and Open WebUI's log says why.
+
+`language = auto` and an empty `timezone` are read from the browser with a small extra request when a
+button is clicked.
 
 ## Security & privacy
 
@@ -39,12 +52,16 @@ enable it globally or per model, see [Installation](../README.md#installation).
 - The browser receives the generated file (base64), the `mailto:` link or the print page, wrapped in
   a fixed JavaScript snippet delivered through Open WebUI's `execute` event. All dynamic values are
   JSON-encoded.
+- The `word_template` valve reads one file from the server (at most 20 MB). Only an administrator can
+  set it.
 - **CSP requirement:** the `execute` event runs code with `new Function(...)`. If your reverse
   proxy sets a `Content-Security-Policy`, it must allow `'unsafe-eval'`, otherwise the buttons do
-  nothing. Open WebUI sets no CSP by default.
+  nothing. Open WebUI sets no CSP by default. If the browser does not run the snippet or does not
+  answer within 30 seconds, an error message with this hint is shown.
 - The print page runs in a hidden same-origin iframe, so model output is never trusted as HTML:
   - raw HTML in the answer is always escaped;
-  - links are only created for `http`, `https`, `mailto` and `tel`;
+  - links are only created for `http`, `https`, `mailto` and `tel` (in Word for `http`, `https` and
+    `mailto`; other link targets stay text as `text (url)`);
   - images are not loaded and are shown as links instead, so there are no tracking pixels;
   - the page carries its own strict CSP (`default-src 'none'`).
 - Excel cells are written as text or numbers, never as formulas, so a cell such as `=HYPERLINK(...)`
@@ -62,3 +79,5 @@ enable it globally or per model, see [Installation](../README.md#installation).
 - **Button labels** are language-neutral ("Word (.docx)", "Excel (.xlsx)", "PDF", "E-Mail"): Open WebUI
   builds the button list without loading the valves, so translated labels would only switch after the
   first click. Messages, file names and the print footer follow the `language` valve.
+- **Without a sub-action** (e.g. when the action is called through the API with the function's own
+  ID), the answer is exported as Word.

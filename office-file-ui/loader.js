@@ -1,4 +1,4 @@
-// Office File UI for Open WebUI (tested with 0.11.4)
+// Office File UI for Open WebUI (tested with 0.11.4 and 0.12.1)
 //
 // Open WebUI loads /static/loader.js on every page. For files attached to an answer of the assistant
 // (e.g. by the Office Documents tool) this script
@@ -17,6 +17,9 @@
 	const PREVIEW_ONLY = /\.(docx|xlsx|pptx)$/i;
 	const MARK = 'data-office-file-ui';
 	const CHIP = 'button.h-8.rounded-xl'; // FileItem with small=true
+	const RUN_INTERVAL_MS = 150; // page changes are handled at most this often (streaming changes it constantly)
+	const RELOAD_DELAYS_MS = [2000, 8000, 32000]; // reloads of the chat for a chip without a known file
+	const FAILED_LOAD_DELAY_MS = 30000; // after a failed reload, which does not use up one of them
 	const GERMAN = (localStorage.locale || navigator.language || '').toLowerCase().startsWith('de');
 	const LABEL = GERMAN ? 'Herunterladen' : 'Download';
 	const FAILED = GERMAN ? 'Herunterladen fehlgeschlagen' : 'Download failed';
@@ -67,6 +70,9 @@
 
 	// The chips carry no file id in the page, so it is looked up in the saved chat.
 	let chatCache = { id: null, messages: {}, loading: null, loadedAt: 0 };
+	// chips without a known file, by message, name and position: reloads so far and when the next one is due
+	let misses = new Map();
+	let retryTimer = null;
 
 	const currentChatId = () => {
 		const match = location.pathname.match(/^\/c\/([^/]+)/);
@@ -78,11 +84,13 @@
 		chatCache.loading = (async () => {
 			try {
 				const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, { headers: authHeaders() });
-				if (!response.ok) return;
+				if (!response.ok) return false;
 				const chat = await response.json();
 				chatCache = { id: chatId, messages: chat?.chat?.history?.messages ?? {}, loading: null, loadedAt: Date.now() };
+				return true;
 			} catch (error) {
 				console.warn('office-file-ui: loading the chat failed', error);
+				return false;
 			} finally {
 				chatCache.loading = null;
 			}
@@ -176,8 +184,11 @@
 
 	const decorateAnswerFiles = () => {
 		const chatId = currentChatId();
-		if (chatId && chatCache.id !== chatId) chatCache = { id: chatId, messages: {}, loading: null, loadedAt: 0 };
-		let missing = false;
+		if (chatId && chatCache.id !== chatId) {
+			chatCache = { id: chatId, messages: {}, loading: null, loadedAt: 0 };
+			misses = new Map();
+		}
+		const missing = [];
 		for (const answer of document.querySelectorAll('.chat-assistant')) {
 			const chips = [...answer.querySelectorAll(CHIP)];
 			if (!chips.length) continue;
@@ -192,7 +203,7 @@
 				const file = files.filter((f) => decode(f.name ?? '') === name)[index];
 				let icon = chip.querySelector(`[${MARK}="download"]`);
 				if (!file) {
-					missing = true;
+					missing.push(`${messageId}\n${name}\n${index}`);
 					icon?.remove();
 					continue;
 				}
@@ -205,10 +216,39 @@
 				if (chip.dataset.officeFileId !== file.id) chip.dataset.officeFileId = file.id;
 			}
 		}
-		// a chip without a known file: the chat was saved after the last load, so load it again (at most every 2 s)
-		if (missing && !chatCache.loading && Date.now() - chatCache.loadedAt > 2000) {
-			loadChat(chatId).then(schedule);
+		// A chip without a known file: the chat was probably saved after the last load, so load it again, a few
+		// times per chip with growing pauses. A chip whose file never shows up must not reload the chat forever.
+		if (!missing.length || chatCache.loading) return;
+		const now = Date.now();
+		const due = missing.filter((key) => {
+			const miss = misses.get(key) ?? { tries: 0, at: chatCache.loadedAt + RELOAD_DELAYS_MS[0] };
+			misses.set(key, miss);
+			return miss.tries < RELOAD_DELAYS_MS.length && now >= miss.at;
+		});
+		if (!due.length) {
+			const next = Math.min(
+				...missing.map((key) => misses.get(key)).filter((miss) => miss.tries < RELOAD_DELAYS_MS.length).map((miss) => miss.at)
+			);
+			clearTimeout(retryTimer); // the page may not change again before the next reload is due
+			if (Number.isFinite(next)) retryTimer = setTimeout(schedule, next - now);
+			return;
 		}
+		for (const key of due) {
+			const miss = misses.get(key);
+			miss.tries += 1;
+			miss.at = now + (RELOAD_DELAYS_MS[miss.tries] ?? 0);
+		}
+		loadChat(chatId).then((loaded) => {
+			if (!loaded) {
+				for (const key of due) {
+					const miss = misses.get(key);
+					if (!miss) continue; // another chat by now
+					miss.tries -= 1; // a failed request (network, 5xx) is no try; ask again in a while
+					miss.at = Date.now() + FAILED_LOAD_DELAY_MS;
+				}
+			}
+			schedule();
+		});
 	};
 
 	// Open WebUI puts the files of an answer above its text. Show them below it: the box around status,
@@ -256,6 +296,18 @@
 		if (!keepCount && separator?.nodeType === Node.TEXT_NODE && separator.textContent) separator.textContent = '';
 	};
 
+	// Index of the selected tab of a two-tab bar: Open WebUI greys out the others with "border-transparent".
+	const selectedTab = (bar) => {
+		const selected = [...bar.children].map((tab) => !tab.classList.contains('border-transparent'));
+		return selected.filter(Boolean).length === 1 ? selected.indexOf(true) : -1;
+	};
+
+	// The bar is hidden only while "Preview" (the second tab) is selected; otherwise it stays usable.
+	const syncTabs = (bar) => {
+		const display = selectedTab(bar) === 1 ? 'none' : '';
+		if (bar.style.display !== display) bar.style.display = display;
+	};
+
 	const adjustFileView = () => {
 		for (const modal of document.querySelectorAll('.modal[role="dialog"]')) {
 			const title = modal.querySelector('a.line-clamp-1');
@@ -270,16 +322,18 @@
 			}
 			if (modal.getAttribute(MARK) !== 'answer-file') continue;
 
-			// "Content" | "Preview" bar: the first bar of exactly two tab buttons
+			// "Content" | "Preview" bar: the first bar of exactly two tab buttons. "Content" is selected when the
+			// view opens; click "Preview" and hide the bar only while "Preview" is really the selected tab, so the
+			// bar stays usable if Open WebUI changes or reorders its tabs.
 			if (PREVIEW_ONLY.test(name)) {
 				const bar = [...modal.querySelectorAll('div.border-b')].find(
 					(div) => div.children.length === 2 && [...div.children].every((c) => c.matches('button[type="button"]'))
 				);
-				if (bar && !bar.hasAttribute(MARK)) {
+				if (bar && !bar.hasAttribute(MARK) && selectedTab(bar) === 0) {
 					bar.setAttribute(MARK, 'tabs');
 					bar.children[1].click(); // "Preview"
-					bar.style.display = 'none';
-				}
+					requestAnimationFrame(() => syncTabs(bar)); // Open WebUI updates the tabs before the next frame
+				} else if (bar?.getAttribute(MARK) === 'tabs') syncTabs(bar);
 				hideExtractedTextInfo(modal, /\.xlsx$/i.test(name));
 			}
 
@@ -299,16 +353,22 @@
 
 	// ------------------------------------------------------------------------------- driver --
 
-	let queued = false;
+	// Runs once per frame at most and, while the page keeps changing (e.g. a streaming answer), at most every
+	// RUN_INTERVAL_MS: every run scans all answers of the chat.
+	let timer = null;
+	let lastRun = -Infinity;
 	function schedule() {
-		if (queued) return;
-		queued = true;
-		queueMicrotask(() => {
-			queued = false;
-			adjustFileView();
-			placeFilesBelowText();
-			decorateAnswerFiles();
-		});
+		if (timer !== null) return;
+		const wait = Math.max(0, lastRun + RUN_INTERVAL_MS - performance.now());
+		timer = setTimeout(() => requestAnimationFrame(run), wait);
+	}
+
+	function run() {
+		timer = null;
+		lastRun = performance.now();
+		adjustFileView();
+		placeFilesBelowText();
+		decorateAnswerFiles();
 	}
 
 	const start = () => {

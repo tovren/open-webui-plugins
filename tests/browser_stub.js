@@ -25,6 +25,11 @@ function element(tag) {
 }
 
 globalThis.document = { createElement: element, body: { appendChild() {} } };
+// Open WebUI keeps the interface language in localStorage.locale.
+Object.defineProperty(globalThis, 'localStorage', {
+  value: { getItem: (key) => (key === 'locale' ? 'de-CH' : null) },
+  configurable: true,
+});
 const createObjectURL = URL.createObjectURL;
 URL.createObjectURL = (blob) => {
   report.blobs.push({ size: blob.size, type: blob.type });

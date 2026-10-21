@@ -5,8 +5,9 @@ Run from anywhere (Python 3.11+):
     python -I -m pytest -q path/to/tests
 
 Optional checks run automatically when the tools are installed: Node.js (executes the generated
-browser snippets), a Chromium-based browser (renders the print page to PDF) and LibreOffice
-(converts the .docx to PDF); pdftotext/pdfinfo (poppler) are needed for the last two.
+browser snippets and office-file-ui/loader.js against small DOM stubs), a Chromium-based browser
+(renders the print page to PDF) and LibreOffice (converts the .docx to PDF); pdftotext/pdfinfo
+(poppler) are needed for the last two.
 """
 
 import ast
@@ -23,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -107,18 +109,23 @@ echo "<b>hi</b>"
 
 
 class Recorder:
-    """Collects the events an action/filter sends to Open WebUI."""
+    """Collects the events an action/filter sends to Open WebUI; answers like the browser would."""
 
-    def __init__(self) -> None:
+    def __init__(self, locale: str = "en-US", timezone: str = "Europe/Berlin", result: Any = True) -> None:
         self.events: list[dict[str, Any]] = []
         self.calls: list[dict[str, Any]] = []
+        self.probes = 0  # requests for the browser's language and time zone
+        self.locale, self.timezone, self.result = locale, timezone, result
 
     async def emit(self, event: dict[str, Any]) -> None:
         self.events.append(event)
 
-    async def call(self, event: dict[str, Any]) -> bool:
+    async def call(self, event: dict[str, Any]) -> Any:
+        if event["data"]["code"] == rx.BROWSER_SETTINGS_JS:
+            self.probes += 1
+            return [self.locale, self.timezone]
         self.calls.append(event)
-        return True
+        return self.result
 
     def notifications(self) -> list[tuple[str, str]]:
         return [(e["data"]["type"], e["data"]["content"]) for e in self.events if e["type"] == "notification"]
@@ -146,11 +153,12 @@ def run_action(
     content: Any = SAMPLE,
     with_call: bool = True,
     body: dict[str, Any] | None = None,
+    recorder: Recorder | None = None,
     **valves: Any,
 ) -> Recorder:
     action = rx.Action()
     action.valves = action.Valves(**valves)
-    recorder = Recorder()
+    recorder = recorder or Recorder()
     body = body or {
         "id": "m2",
         "messages": [
@@ -236,20 +244,24 @@ def test_docx_structure() -> None:
     assert ("List Bullet 2", "sub a") in paragraphs
     assert ("Quote", "A quote") in paragraphs and ("Quote", "second line") in paragraphs
     intro = next(p for p in doc.paragraphs if p.text.startswith("Intro"))
-    assert intro.text == (
-        "Intro line one\ncontinues bold nested and code and docs (https://example.org/a_(b)).\nSteps:"
-    )
+    assert intro.text == "Intro line one\ncontinues bold nested and code and docs.\nSteps:"
     assert [r.text for r in intro.runs if r.bold] == ["bold ", "nested"]
     assert [r.text for r in intro.runs if r.italic] == ["nested"]
     assert [r.text for r in intro.runs if r.font.name == "Consolas"] == ["code"]
+    (link,) = intro.hyperlinks  # a real hyperlink, not "docs (url)"
+    assert link.text == "docs" and link.address == "https://example.org/a_(b)"
+    assert link.runs[0].font.underline and str(link.runs[0].font.color.rgb) == rx.DEFAULT_ACCENT
     code_run = next(p for p in doc.paragraphs if p.text.startswith("# not")).runs[0]
     assert code_run.font.name == "Consolas"
     assert "<script>alert(1)</script> bad (javascript:alert(1))" in all_text  # plain text, harmless
+    assert not any(p.hyperlinks for p in doc.paragraphs if p.text.startswith("<script>"))
 
     table = doc.tables[0]
-    assert table.style.name == "Table Grid"
     assert [c.text for c in table.rows[0].cells] == ["Item", "Amount", "Share"]
     assert all(run.bold for cell in table.rows[0].cells for run in cell.paragraphs[0].runs)
+    header_fill = table.rows[0].cells[0]._tc.xpath("./w:tcPr/w:shd/@w:fill")
+    assert header_fill == [rx.DEFAULT_ACCENT]
+    assert table._tbl.xpath("./w:tblPr/w:tblBorders/w:bottom/@w:color") == [rx.DEFAULT_ACCENT]
     assert [c.text for c in table.rows[1].cells] == ["A | B", "1.234,56 €", "-3,2 %"]
     assert [c.text for c in table.rows[2].cells] == ["ragged", "", ""]
     assert [c.text for c in table.rows[3].cells] == ["C", "2.000", "1,5"]
@@ -307,6 +319,16 @@ def test_docx_list_starting_number_is_kept() -> None:
         ("12.10.2026", "12.10.2026", None),
         ("1.234,567.8", "1.234,567.8", None),
         ("+49 30 123456", "+49 30 123456", None),
+        ("+49 711 123", "+49 711 123", None),  # phone numbers, not 49711123
+        ("+1 234", "+1 234", None),
+        ("+41\u00a079 123 456", "+41\u00a079 123 456", None),
+        ("+5", 5, None),
+        ("+1.234,56", 1234.56, None),
+        ("+1 000 €", 1000.0, '#,##0.00 "€"'),
+        ("1 234", 1234, None),
+        ("CHF 1'234.50", 1234.5, '"CHF" #,##0.00'),
+        ("1’234.50 CHF", 1234.5, '"CHF" #,##0.00'),  # Swiss thousands separator U+2019
+        ("CHF -12", -12.0, '"CHF" #,##0.00'),
         ("1234567890123456", "1234567890123456", None),
         ("=SUM(A1:A2)", "=SUM(A1:A2)", None),
         ("%", "%", None),
@@ -505,7 +527,7 @@ def test_empty_message_warns(content: Any) -> None:
 
 
 def test_export_error_shows_toast(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-    def broken(_blocks: Any) -> bytes:
+    def broken(*_args: Any) -> bytes:
         raise ValueError("boom")
 
     monkeypatch.setattr(rx, "markdown_to_docx", broken)
@@ -516,7 +538,9 @@ def test_export_error_shows_toast(monkeypatch: pytest.MonkeyPatch, caplog: pytes
 
 def test_missing_event_call_shows_toast() -> None:
     recorder = run_action("pdf", with_call=False)
-    assert recorder.notifications() == [("error", rx.TRANSLATIONS["en"]["export_failed"])]
+    assert recorder.notifications() == [("error", rx.TRANSLATIONS["en"]["browser_failed"])]
+    recorder = run_action("pdf", with_call=False, language="de", timezone="Europe/Berlin")
+    assert recorder.notifications() == [("error", rx.TRANSLATIONS["de"]["browser_failed"])]
 
 
 def test_table_edge_cases() -> None:
@@ -536,12 +560,223 @@ def test_filename_helpers() -> None:
     )
 
 
-def test_timezone_valve() -> None:
+def export_context(recorder: Recorder | None = None, **valves: Any) -> Any:
     action = rx.Action()
-    action.valves = action.Valves(timezone="Not/AZone")
-    assert isinstance(action._now(), datetime)
-    action.valves = action.Valves(timezone="Asia/Tokyo")
-    assert action._now().utcoffset().total_seconds() == 9 * 3600
+    action.valves = action.Valves(**valves)
+    recorder = recorder or Recorder()
+    return asyncio.run(action._export_context(rx.Browser(recorder.emit, recorder.call))), recorder
+
+
+def test_timezone_valve() -> None:
+    export, recorder = export_context(timezone=" Asia/Tokyo ", language="de")
+    assert export.now().utcoffset().total_seconds() == 9 * 3600 and recorder.probes == 0
+    export, recorder = export_context(timezone="Not/AZone", language="de")  # unknown: the browser's zone
+    assert export.now().utcoffset() == datetime.now(ZoneInfo("Europe/Berlin")).utcoffset() and recorder.probes == 1
+    # empty: the browser's time zone, asked together with the language
+    export, recorder = export_context(Recorder(timezone="America/New_York"), language="de")
+    assert str(export.timezone) == "America/New_York" and recorder.probes == 1
+    export, _ = export_context(Recorder(timezone="Not/AZone"), language="de")
+    assert export.timezone is None and isinstance(export.now(), datetime)  # server time
+
+
+@pytest.mark.parametrize(
+    ("locale", "language"),
+    [("de-DE", "de"), ("de", "de"), ("de_CH", "de"), ("en-GB", "en"), ("fr-FR", "en"), ("", "en")],
+)
+def test_language_auto_follows_the_browser(locale: str, language: str) -> None:
+    export, recorder = export_context(Recorder(locale=locale), timezone="UTC")
+    assert export.language == language and export.texts is rx.TRANSLATIONS[language] and recorder.probes == 1
+    assert rx.Action.Valves().language == "auto"
+
+
+def test_language_auto_in_exports() -> None:
+    data, filename, _ = downloaded(run_action("xlsx", recorder=Recorder(locale="de-DE")))
+    assert load_workbook(io.BytesIO(data)).sheetnames == ["Tabelle 1"]
+    recorder = run_action("xlsx", "# Just text", recorder=Recorder(locale="de-DE"))
+    assert recorder.notifications() == [("warning", rx.TRANSLATIONS["de"]["no_tables"])]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"error": "Client session disconnected."},  # Open WebUI's answer for a closed tab
+        {"error": "Event call timed out. The browser tab may be inactive or closed."},
+        None,
+        False,
+    ],
+)
+def test_browser_errors_show_a_message(answer: Any, caplog: pytest.LogCaptureFixture) -> None:
+    recorder = run_action("docx", recorder=Recorder(result=answer), language="de", timezone="UTC")
+    assert len(recorder.calls) == 1
+    assert recorder.notifications() == [("error", rx.TRANSLATIONS["de"]["browser_failed"])]
+    assert "Content-Security-Policy" in rx.TRANSLATIONS["de"]["browser_failed"]
+    assert "Content Security Policy" in rx.TRANSLATIONS["en"]["browser_failed"]
+    assert "did not run it" in caplog.text
+
+
+def test_browser_that_never_answers_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A snippet that throws in the browser (e.g. CSP blocks new Function) never calls back."""
+    monkeypatch.setattr(rx, "BROWSER_TIMEOUT_S", 0.05)
+    recorder = Recorder()
+
+    async def hanging(event: dict[str, Any]) -> Any:
+        await asyncio.sleep(10)
+
+    action = rx.Action()
+    asyncio.run(
+        action.action({"messages": [{"role": "assistant", "content": "x"}]}, "docx", recorder.emit, hanging)
+    )
+    assert recorder.notifications() == [("error", rx.TRANSLATIONS["en"]["browser_failed"])]
+
+
+def test_browser_settings_error_stops_early() -> None:
+    recorder = Recorder()
+
+    async def disconnected(event: dict[str, Any]) -> Any:
+        recorder.calls.append(event)
+        return {"error": "Client session disconnected."}
+
+    asyncio.run(rx.Action().action({"messages": []}, "pdf", recorder.emit, disconnected))
+    assert len(recorder.calls) == 1 and recorder.calls[0]["data"]["code"] == rx.BROWSER_SETTINGS_JS
+    assert recorder.notifications() == [("error", rx.TRANSLATIONS["en"]["browser_failed"])]
+
+
+@pytest.mark.parametrize("action_id", ["response_export", "", None])
+def test_without_sub_action_exports_word(action_id: str | None) -> None:
+    """Open WebUI passes the function ID as __id__ when there is no sub-action."""
+    _, filename, mime = downloaded(run_action(action_id))
+    assert mime == rx.DOCX_MIME and filename.endswith(".docx")
+
+
+def test_nested_details_are_removed() -> None:
+    text = (
+        '<details type="tool_calls"><summary>Tool</summary>outer <details type="reasoning">inner'
+        "</details> tail</details>Answer <think>a <think>b</think> c</think>end"
+    )
+    assert rx.clean_markdown(text) == "Answer end"
+    assert rx.clean_markdown("<details>open without end\nText") == "<details>open without end\nText"
+
+
+def test_docx_rule_is_a_line() -> None:
+    data, _, _ = downloaded(run_action("docx", "Above\n\n---\n\nBelow"))
+    doc = Document(io.BytesIO(data))
+    texts = [p.text for p in doc.paragraphs]
+    rule = doc.paragraphs[texts.index("Above") + 1]
+    assert rule.text == "" and texts.index("Below") == texts.index("Above") + 2
+    assert rule._p.xpath("./w:pPr/w:pBdr/w:bottom/@w:val") == ["single"]
+
+
+def test_docx_links_only_for_safe_targets() -> None:
+    content = (
+        "[web](http://a.example) [mail](mailto:x@example.org?subject=Hi) "
+        "[attach](mailto:x@example.org?attach=/etc/passwd) [phone](tel:+49711) [file](file:///etc/passwd) <https://b.example>"
+    )
+    doc = Document(io.BytesIO(downloaded(run_action("docx", content))[0]))
+    paragraph = doc.paragraphs[0]
+    assert [(link.text, link.address) for link in paragraph.hyperlinks] == [
+        ("web", "http://a.example"),
+        ("mail", "mailto:x@example.org?subject=Hi"),
+        ("https://b.example", "https://b.example"),
+    ]
+    text = paragraph.text
+    assert "attach (mailto:x@example.org?attach=/etc/passwd)" in text and "phone (tel:+49711)" in text
+    assert "file (file:///etc/passwd)" in text
+
+
+def test_docx_design_valves() -> None:
+    data, _, _ = downloaded(run_action("docx", accent_color="#c00000", font="Arial", language="de"))
+    doc = Document(io.BytesIO(data))
+    assert doc.styles["Normal"].font.name == "Arial"
+    assert (
+        str(doc.styles["Heading 1"].font.color.rgb) == "C00000"
+        and doc.styles["Heading 1"].font.name == "Arial"
+    )
+    assert doc.tables[0].rows[0].cells[0]._tc.xpath("./w:tcPr/w:shd/@w:fill") == ["C00000"]
+    section = doc.sections[0]
+    assert (
+        round(section.page_width.cm, 1) == 21.0 and round(section.page_height.cm, 1) == 29.7
+    )  # A4 for German
+    # invalid values fall back to the defaults, like in Office Documents
+    data, _, _ = downloaded(run_action("docx", accent_color="red", font="<b>"))
+    doc = Document(io.BytesIO(data))
+    assert doc.styles["Normal"].font.name == "Calibri"
+    assert str(doc.styles["Heading 1"].font.color.rgb) == rx.DEFAULT_ACCENT
+    assert round(doc.sections[0].page_width.cm, 2) == 21.59  # Letter for English
+    for name in ("accent_color", "font", "word_template"):
+        assert rx.Action.Valves.model_fields[name].default == od_valve_default(name)
+
+
+def od_valve_default(name: str) -> Any:
+    """Default of a valve of Office Documents, read from its source (it needs python-pptx to import)."""
+    tree = ast.parse(plugin_path("office_documents.py").read_text(encoding="utf-8"))
+    constants = {
+        target.id: node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.AnnAssign)
+            and getattr(node.target, "id", None) == name
+            and isinstance(node.value, ast.Call)  # name: str = Field(default=...)
+        ):
+            default = next(k.value for k in node.value.keywords if k.arg == "default")
+            return ast.literal_eval(constants.get(getattr(default, "id", ""), default))
+    raise KeyError(name)
+
+
+def make_template(tmp: Path, suffix: str = ".docx") -> Path:
+    template = Document()
+    template.sections[0].header.paragraphs[0].text = "Example Ltd letterhead"
+    template.sections[0].footer.paragraphs[0].text = "Example Ltd, Main Street 1"
+    template.sections[0].left_margin = template.sections[0].right_margin = rx.Cm(4)
+    template.add_paragraph("Template body text that must not appear")
+    template.core_properties.author = "Template author"
+    path = tmp / f"letterhead{suffix}"
+    template.save(path)
+    if suffix == ".dotx":  # same package with the template content type
+        data = path.read_bytes()
+        with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(path, "w") as target:
+            for item in source.infolist():
+                content = source.read(item)
+                if item.filename == "[Content_Types].xml":
+                    content = content.replace(rx.DOCX_CT.WML_DOCUMENT_MAIN.encode(), rx.DOTX_MAIN)
+                target.writestr(item, content)
+    return path
+
+
+@pytest.mark.parametrize("suffix", [".docx", ".dotx"])
+def test_docx_word_template(tmp_path: Path, suffix: str) -> None:
+    path = make_template(tmp_path, suffix)
+    data, _, _ = downloaded(run_action("docx", word_template=str(path)))
+    doc = Document(io.BytesIO(data))
+    section = doc.sections[0]
+    assert section.header.paragraphs[0].text == "Example Ltd letterhead"
+    assert section.footer.paragraphs[0].text == "Example Ltd, Main Street 1"
+    assert round(section.left_margin.cm, 1) == 4.0
+    texts = [p.text for p in doc.paragraphs]
+    assert "Template body text that must not appear" not in texts
+    assert (
+        "Quarterly report C#" in texts
+        and doc.paragraphs[
+            texts.index("Intro line one\ncontinues bold nested and code and docs.\nSteps:")
+        ].style.name
+        == "Body Text"
+    )
+    assert doc.core_properties.author == "" and doc.core_properties.title == "Quarterly report C#"
+    numbered = [p for p in doc.paragraphs if p.style.name == "List Number"]
+    assert [p.text for p in numbered] == ["First continued", "Second", "Third", "Restart", "Again"]
+    assert doc.tables[0].rows[0].cells[0]._tc.xpath("./w:tcPr/w:shd/@w:fill") == [rx.DEFAULT_ACCENT]
+
+
+def test_docx_unreadable_template_is_skipped(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    (tmp_path / "broken.docx").write_bytes(b"not a zip file")
+    for path in (tmp_path / "missing.dotx", tmp_path / "broken.docx"):
+        data, _, _ = downloaded(run_action("docx", word_template=str(path)))
+        assert "Quarterly report C#" in [p.text for p in Document(io.BytesIO(data)).paragraphs]
+        assert str(path) in caplog.text
 
 
 # ------------------------------------------------------------------- browser snippets (Node.js) --
@@ -571,10 +806,64 @@ def test_js_mailto_runs() -> None:
 
 
 @node
+def test_js_browser_settings_runs() -> None:
+    report = run_in_node(rx.BROWSER_SETTINGS_JS)
+    locale, timezone = report["returned"]
+    assert locale == "de-CH" and timezone and rx.zone(timezone) is not None
+
+
+@node
 def test_js_print_runs() -> None:
     report = run_in_node(run_action("pdf").code())
     assert report["returned"] is True and report["printed"] is True and report["frameRemoved"] is True
     assert report["srcdoc"].startswith("<!DOCTYPE html>")
+
+
+LOADER_JS = REPO / "office-file-ui" / "loader.js"
+LOADER_STUB_JS = Path(__file__).resolve().parent / "loader_stub.js"
+
+
+def run_loader(scenario: str) -> dict[str, Any]:
+    """Runs loader.js against a small DOM stub with a virtual clock (see loader_stub.js)."""
+    result = subprocess.run(
+        ["node", str(LOADER_STUB_JS), scenario], capture_output=True, text=True, timeout=60, check=True
+    )
+    return json.loads(result.stdout)
+
+
+@node
+def test_loader_js_syntax() -> None:
+    subprocess.run(
+        ["node", "--check", str(LOADER_JS)], capture_output=True, text=True, timeout=30, check=True
+    )
+
+
+@node
+def test_loader_reloads_the_chat_only_a_few_times() -> None:
+    """A chip without a matching file in the saved chat, while an answer streams for two minutes."""
+    report = run_loader("missing-file")
+    assert report["fetches"] == 3 and report["icon"] is None
+    assert report["scans"] <= 120 / 0.15 + 5  # page changes every 100 ms, handled at most every 150 ms
+    report = run_loader("found-file")
+    assert report["fetches"] == 1 and report["icon"] == "f1"
+    report = run_loader("flaky-server")  # failed requests do not use up the three tries
+    assert report["fetches"] == 4 and report["icon"] == "f1"
+
+
+@node
+@pytest.mark.parametrize(
+    ("scenario", "clicks", "display", "selected"),
+    [
+        ("tabs", 1, "none", 1),  # Preview selected: the bar is hidden
+        ("tabs-no-switch", 1, "", 0),  # the click did not switch: the bar stays
+        ("tabs-reordered", 0, "", 1),  # an unexpected first state: nothing is clicked or hidden
+    ],
+)
+def test_loader_tab_switch(scenario: str, clicks: int, display: str, selected: int) -> None:
+    report = run_loader(scenario)
+    assert (report["clicks"], report["barDisplay"], report["selected"]) == (clicks, display, selected)
+    if scenario == "tabs":
+        assert report["barDisplayAfterReset"] == ""  # back on "Content": the bar is shown again
 
 
 # ------------------------------------------------------------------------ optional rendering checks --
@@ -720,6 +1009,109 @@ def test_guard_counts_parts_images_and_tools() -> None:
     assert cg.estimate_tokens(body, 3.5, 300) == expected
 
 
+def test_guard_counts_reasoning_sent_back() -> None:
+    reasoning = "r" * 35000
+    for field in ("reasoning_content", "reasoning", "thinking"):  # llama.cpp, other providers, Ollama
+        body = {"model": "m", "messages": [{"role": "assistant", "content": "ok", field: reasoning}]}
+        assert cg.estimate_tokens(body, 3.5, 300) == -(-(2 + 35000 + cg.MESSAGE_OVERHEAD_CHARS) * 10 // 35)
+    body = {"model": "m", "messages": [{"role": "assistant", "content": "ok", "reasoning_content": None}]}
+    assert cg.estimate_tokens(body, 3.5, 300) == 6
+    with pytest.raises(cg.ContextLimitError):
+        run_guard(
+            make_filter(cg, context_tokens=10000, answer_reserve_tokens=2000),
+            {
+                "model": "m",
+                "messages": [{"role": "assistant", "content": "", "reasoning_content": reasoning}],
+            },
+        )
+
+
+MODEL_PROMPT = "You are the e-mail assistant of Example Ltd.\nAlways sign with the company name." * 100
+
+
+@pytest.mark.parametrize("key", ["system_prompt", "base_system_prompt"])  # Open WebUI 0.11.4, 0.12.x
+def test_guard_counts_the_model_system_prompt(key: str) -> None:
+    """Open WebUI adds the model's system prompt only after the request hook (in the router)."""
+    chat_prompt = "Answer briefly.\nUse bullet points."
+    user = {"role": "user", "content": "Hi"}
+    # metadata = "model prompt\nsystem message", set before the hook
+    cases = [
+        ([user], MODEL_PROMPT, len(MODEL_PROMPT) + 1),  # no system message yet
+        (
+            [{"role": "system", "content": chat_prompt}, user],
+            f"{MODEL_PROMPT}\n{chat_prompt}",
+            len(MODEL_PROMPT) + 1,
+        ),
+        # RAG context appended to the system message (RAG_SYSTEM_CONTEXT)
+        (
+            [{"role": "system", "content": f"{chat_prompt}\n<context>doc</context>"}, user],
+            f"{MODEL_PROMPT}\n{chat_prompt}",
+            len(MODEL_PROMPT) + 1,
+        ),
+        # tool-call rounds: the body already contains the model prompt
+        (
+            [{"role": "system", "content": f"{MODEL_PROMPT}\n{chat_prompt}"}, user],
+            f"{MODEL_PROMPT}\n{chat_prompt}",
+            0,
+        ),
+        # no model prompt: metadata holds only the system message
+        ([{"role": "system", "content": chat_prompt}, user], chat_prompt, 0),
+        (
+            [{"role": "system", "content": [{"type": "text", "text": chat_prompt}]}, user],
+            f"{MODEL_PROMPT}\n{chat_prompt}",
+            len(MODEL_PROMPT) + 1,
+        ),
+        ([user], None, 0),
+    ]
+    for messages, prompt, expected in cases:
+        assert cg.missing_system_prompt_chars(messages, {key: prompt}) == expected, (messages, prompt)
+    assert cg.missing_system_prompt_chars([user], None) == 0
+    body = {"model": "m", "messages": [user]}
+    assert cg.estimate_tokens(body, 3.5, 300, {key: MODEL_PROMPT}) - cg.estimate_tokens(
+        body, 3.5, 300
+    ) == pytest.approx((len(MODEL_PROMPT) + 1) / 3.5, abs=1)
+    # blocked only because of the model's prompt
+    flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=8000)
+    run_guard(flt, body_with_chars(1000))
+    with pytest.raises(cg.ContextLimitError):
+        run_guard(flt, body_with_chars(1000), {key: MODEL_PROMPT})
+
+
+def test_guard_workspace_model_uses_base_model_size() -> None:
+    flt = make_filter(
+        cg,
+        context_tokens=100000,
+        answer_reserve_tokens=100,
+        model_context_tokens="qwen3-8b=1000, emails=50000",
+    )
+    assistant = {"id": "support", "info": {"base_model_id": "qwen3-8b"}}
+    body = body_with_chars(10000, model="support")  # in the hook, body["model"] is the workspace model's ID
+    with pytest.raises(cg.ContextLimitError):
+        asyncio.run(flt.request(body, __model__=assistant))
+    # an own entry of the workspace model wins over its base model
+    assert asyncio.run(
+        flt.request(
+            body_with_chars(10000, model="emails"),
+            __model__={"id": "emails", "info": {"base_model_id": "qwen3-8b"}},
+        )
+    )
+    assert asyncio.run(flt.request(body_with_chars(10000, model="other"), __model__={"info": None}))
+    assert cg.model_ids({"model": "a"}, {"id": "a", "info": {"base_model_id": "b"}}) == ["a", "b"]
+
+
+@pytest.mark.parametrize(
+    ("locale", "text"),
+    [("de-DE", "ca. 101 %"), ("en-GB", "about 101%"), ("fr", "about 101%"), (None, "about 101%")],
+)
+def test_guard_language_auto(locale: str | None, text: str) -> None:
+    flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=2000)
+    assert flt.valves.language == "auto"
+    metadata = {"variables": {"{{USER_LANGUAGE}}": locale}} if locale else {}
+    with pytest.raises(cg.ContextLimitError) as error:
+        run_guard(flt, body_with_chars(8001 * 35 // 10), metadata)
+    assert text in str(error.value)
+
+
 def test_guard_per_model_override_and_misconfiguration(caplog: pytest.LogCaptureFixture) -> None:
     flt = make_filter(
         cg,
@@ -804,7 +1196,7 @@ def test_note_english() -> None:
     assert note.splitlines() == [
         "[Company context]",
         "You are the internal AI assistant of Example Ltd.",
-        "Today is Monday, 12 October 2026.",
+        "Today is Monday, 12 October 2026 (calendar week 42).",
         (
             "Always answer in English unless the user writes in another language "
             "or explicitly asks for a different one."
@@ -827,7 +1219,7 @@ def test_note_german_informal_with_rules() -> None:
     assert note.splitlines()[:3] == [
         "[Firmen-Kontext]",
         "Du bist der interne KI-Assistent der Firma Musterfirma GmbH.",
-        "Heute ist Montag, 12. Oktober 2026.",
+        "Heute ist Montag, 12. Oktober 2026 (Kalenderwoche 42).",
     ]
     assert "Antworte immer auf Deutsch, außer" in note
     assert "„du“" in note and "Du-Form" in note
@@ -841,8 +1233,13 @@ def test_note_without_company_and_custom_response_language() -> None:
     assert "Always answer in French unless" in note
 
 
-def run_inlet(flt: Any, body: dict[str, Any]) -> dict[str, Any]:
-    return asyncio.run(flt.inlet(body, __user__={"name": "Ada"}))
+def run_inlet(flt: Any, body: dict[str, Any], metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    return asyncio.run(flt.inlet(body, __user__={"name": "Ada"}, __metadata__=metadata))
+
+
+def browser_variables(language: str = "en-US", timezone: str = "Europe/Berlin") -> dict[str, Any]:
+    """__metadata__ of a chat request: Open WebUI's frontend sends these variables (0.11.4 and 0.12.1)."""
+    return {"variables": {"{{USER_LANGUAGE}}": language, "{{CURRENT_TIMEZONE}}": timezone}}
 
 
 def test_inlet_adds_system_message_and_is_idempotent() -> None:
@@ -851,7 +1248,11 @@ def test_inlet_adds_system_message_and_is_idempotent() -> None:
     body = run_inlet(flt, body)
     assert [m["role"] for m in body["messages"]] == ["system", "user"]
     assert body["messages"][0]["content"].count("[Company context]") == 1
-    assert re.search(r"^Today is \w+, \d{1,2} \w+ \d{4}\.$", body["messages"][0]["content"], re.MULTILINE)
+    assert re.search(
+        r"^Today is \w+, \d{1,2} \w+ \d{4} \(calendar week \d{1,2}\)\.$",
+        body["messages"][0]["content"],
+        re.MULTILINE,
+    )
 
 
 def test_inlet_prepends_to_existing_system_prompt() -> None:
@@ -874,10 +1275,85 @@ def test_inlet_handles_list_system_content_and_missing_messages() -> None:
     assert run_inlet(flt, {})["messages"][0]["role"] == "system"
 
 
-def test_invalid_timezone_falls_back(caplog: pytest.LogCaptureFixture) -> None:
-    body = run_inlet(make_filter(cc, timezone="Mars/Olympus"), {"messages": []})
-    assert "Today is" in body["messages"][0]["content"]
-    assert "Mars/Olympus" in caplog.text
+def test_unknown_timezone_falls_back_to_the_browser() -> None:
+    flt = make_filter(cc, timezone="Mars/Olympus")  # loading a stored typo must not fail every chat
+    now = flt._now({"variables": {"{{CURRENT_TIMEZONE}}": "Asia/Tokyo"}})
+    assert now.utcoffset().total_seconds() == 9 * 3600
+    flt = make_filter(cc, timezone="Europe/" + "x" * 300)  # depending on the system, ZoneInfo raises OSError here
+    assert flt._now({"variables": {"{{CURRENT_TIMEZONE}}": "y" * 300}}).tzinfo is None
+    assert rx.zone("Europe/" + "x" * 300) is None
+    assert cc.Filter.Valves().timezone == "" and cc.Filter.Valves().language == "auto"
+
+
+def test_date_in_the_browser_time_zone() -> None:
+    flt = make_filter(cc)
+    tokyo, honolulu = (
+        flt._now(browser_variables(timezone="Asia/Tokyo")),
+        flt._now(browser_variables(timezone="Pacific/Honolulu")),
+    )
+    assert (
+        tokyo.utcoffset().total_seconds() == 9 * 3600 and honolulu.utcoffset().total_seconds() == -10 * 3600
+    )
+    # the valve wins over the browser; an unknown or missing browser zone means server time
+    assert make_filter(cc, timezone="Asia/Tokyo")._now(
+        browser_variables(timezone="Pacific/Honolulu")
+    ).tzinfo == ZoneInfo("Asia/Tokyo")
+    for metadata in (
+        browser_variables(timezone="Not/AZone"),
+        browser_variables(timezone="../../etc/passwd"),
+        {},
+        None,
+        {"variables": None},
+    ):
+        assert flt._now(metadata).tzinfo is None
+
+
+def test_note_date_follows_the_browser_time_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 23:30 UTC on Sunday 11 October: already Monday in Berlin, still Sunday in New York
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            moment = datetime(2026, 10, 11, 23, 30, tzinfo=ZoneInfo("UTC"))
+            return moment.astimezone(tz) if tz else moment.replace(tzinfo=None)
+
+    monkeypatch.setattr(cc, "datetime", FixedDatetime)
+    flt = make_filter(cc)
+    berlin = run_inlet(flt, {"messages": []}, browser_variables(timezone="Europe/Berlin"))["messages"][0][
+        "content"
+    ]
+    new_york = run_inlet(flt, {"messages": []}, browser_variables(timezone="America/New_York"))["messages"][
+        0
+    ]["content"]
+    assert "Today is Monday, 12 October 2026 (calendar week 42)." in berlin
+    assert "Today is Sunday, 11 October 2026 (calendar week 41)." in new_york
+
+
+@pytest.mark.parametrize(
+    ("day", "week"), [(datetime(2027, 1, 1), 53), (datetime(2025, 12, 29), 1), (datetime(2026, 10, 21), 43)]
+)
+def test_note_calendar_week_is_iso(day: datetime, week: int) -> None:
+    assert f"(calendar week {week})." in make_filter(cc, language="en").build_note(None, day)
+    assert f"(Kalenderwoche {week})." in make_filter(cc, language="de").build_note(None, day)
+
+
+@pytest.mark.parametrize(
+    ("locale", "marker"),
+    [
+        ("de-DE", "[Firmen-Kontext]"),
+        ("de", "[Firmen-Kontext]"),
+        ("en-US", "[Company context]"),
+        ("fr-FR", "[Company context]"),
+    ],
+)
+def test_note_language_auto(locale: str, marker: str) -> None:
+    body = run_inlet(make_filter(cc), {"messages": []}, browser_variables(language=locale))
+    assert body["messages"][0]["content"].startswith(marker + "\n")
+    # explicit values still win; without the variable (API request) the note is English
+    body = run_inlet(make_filter(cc, language="de"), {"messages": []}, browser_variables(language="en-US"))
+    assert body["messages"][0]["content"].startswith("[Firmen-Kontext]")
+    assert run_inlet(make_filter(cc), {"messages": []})["messages"][0]["content"].startswith(
+        "[Company context]"
+    )
 
 
 # ------------------------------------------------------------------------------ reasoning toggle --

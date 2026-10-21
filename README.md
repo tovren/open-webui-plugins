@@ -12,8 +12,9 @@ folder with a README:
 | [Reasoning Toggle](reasoning-toggle/) | Filter (toggle) | Adds a button to the chat input that lets local reasoning models (vLLM, llama-server) think before they answer |
 | [Office File UI](office-file-ui/) | Browser script | Optional: shows files attached to an answer as chips below the text and opens Office files in the preview |
 
-Response Export, Context Guard, Company Context and Office Documents are in English by default and
-include a German translation (`language` valve); Reasoning Toggle shows no texts of its own. All of
+Response Export, Context Guard, Company Context and Office Documents include English and German
+texts (`language` valve); Response Export, Context Guard and Company Context follow the user's
+interface language by default (`auto`). Reasoning Toggle shows no texts of its own. All of
 them use only the Python standard library and libraries that already ship with Open WebUI, so nothing
 has to be installed.
 
@@ -37,8 +38,9 @@ Office Documents is a tool, not a function: install it under **Workspace → Too
 valves with the gear icon there and enable it per model (see its [setup](office-documents/#setup)).
 Office File UI is not a plugin at all; see its [README](office-file-ui/) for how to install it.
 
-Recommended order when using both filters: Company Context `priority = 0`, Context Guard
-`priority = 100`, so the guard also counts the added note.
+Context Guard always counts the note of Company Context, whatever their priorities: Open WebUI runs
+all `inlet` hooks (Company Context) before any `request` hook (Context Guard). The priority only
+orders several filters on the same hook.
 
 ## Compatibility
 
@@ -69,7 +71,8 @@ parser). Its tests for attaching files to a chat replace Open WebUI's internals 
 
 Optional checks run when the tools are installed:
 
-- **Node.js** runs the generated browser snippets against a small DOM stub.
+- **Node.js** runs the generated browser snippets and the Office File UI script against small DOM
+  stubs.
 - **A headless Chromium** renders the print page to a PDF (`chrome-headless-shell`, or set
   `PRINT_TEST_BROWSER`).
 - **LibreOffice** converts the Word file to PDF to check list numbering, and renders the Word, Excel

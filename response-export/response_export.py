@@ -2,16 +2,18 @@
 title: Response Export
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.0.0
+version: 1.1.0
 license: MIT
 required_open_webui_version: 0.11.4
 description: Adds four buttons below every assistant message - export as Word (.docx), export its tables as Excel (.xlsx), print / save as PDF, and open as an e-mail draft. Files are built in memory and handed straight to the browser; nothing is stored on the server.
 
 Buttons
-- Word (.docx) with headings, lists (one nesting level), tables, bold/italic/code/links, code blocks
-  and quotes.
+- Word (.docx) with headings, lists (one nesting level), tables, bold/italic/code, clickable links,
+  code blocks, quotes and horizontal rules, in the design of Office Documents (accent_color and
+  font valves) and optionally on a company template such as a letterhead (word_template valve).
 - Excel (.xlsx) with one sheet per Markdown table, a styled and frozen header row, auto filter,
-  fitted column widths and real numbers (also German formats such as "1.234,56 EUR" or "12,5 %").
+  fitted column widths and real numbers (also German and Swiss formats such as "1.234,56 EUR",
+  "12,5 %" or "CHF 1'234.50"); phone numbers such as "+49 711 123456" stay text.
 - PDF via the browser's print dialog (A4 layout, small footer), so no PDF library is needed.
 - E-mail via a mailto link; answers too long for a mailto link are downloaded as an .eml draft
   (marked "X-Unsent", so Outlook opens it as a new editable message).
@@ -22,30 +24,45 @@ Security & privacy
   standard library plus python-docx and openpyxl (both bundled with Open WebUI) are used.
 - The browser receives the generated file (base64), a mailto link or the print HTML, wrapped in
   a fixed JavaScript snippet run via the "execute" event. All dynamic values are JSON-encoded.
-- The page's Content-Security-Policy must allow 'unsafe-eval' for the "execute" event to work.
-- Raw HTML in the response is always escaped, links are limited to http, https, mailto and tel,
-  and images are never loaded (they become links). The print page also carries its own strict
-  CSP. Spreadsheet cells are written as text or numbers, never as formulas.
+- With language 'auto' or an empty timezone, a fixed snippet first reads the interface language
+  and time zone of the browser; nothing else is read from the page.
+- The page's Content-Security-Policy must allow 'unsafe-eval' for the "execute" event to work. If
+  the browser does not run the snippet (or does not answer within 30 seconds), an error is shown.
+- The word_template valve reads one Word file from the server (at most 20 MB); its text is removed,
+  only header, footer, page size and margins are kept.
+- Raw HTML in the response is always escaped, links are limited to http, https, mailto and tel
+  (in Word to http, https and mailto), and images are never loaded (they become links). The
+  print page also carries its own strict CSP. Spreadsheet cells are written as text or numbers,
+  never as formulas.
 """
 
 import asyncio
 import base64
+import copy
 import html
 import io
 import json
 import logging
 import re
+import zipfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, tzinfo
 from email.message import EmailMessage
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Pt
+from docx.opc.constants import CONTENT_TYPE as DOCX_CT
+from docx.opc.constants import RELATIONSHIP_TYPE
+from docx.oxml import OxmlElement
+from docx.oxml.ns import nsdecls, qn
+from docx.oxml.parser import parse_xml
+from docx.parts.numbering import NumberingPart
+from docx.shared import Cm, Pt, RGBColor
 from docx.text.paragraph import Paragraph as DocxParagraph
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -65,7 +82,7 @@ DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.docu
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 EML_MIME = "message/rfc822"
 
-BODY_FONT = "Calibri"
+BODY_FONT = "Calibri"  # print page and e-mail; Word uses the font valve
 BODY_FONT_SIZE = Pt(11)
 CODE_FONT = "Consolas"
 CODE_FONT_SIZE = Pt(9.5)
@@ -90,6 +107,7 @@ MAX_EXACT_DIGITS = 15  # Excel keeps 15 significant digits; longer numbers stay 
 EURO_FORMAT = '#,##0.00 "€"'
 DOLLAR_FORMAT = '"$"#,##0.00'
 POUND_FORMAT = '"£"#,##0.00'
+FRANC_FORMAT = '"CHF" #,##0.00'
 CURRENCY_FORMATS = {  # symbol or ISO code before or after the amount -> Excel number format
     "€": EURO_FORMAT,
     "EUR": EURO_FORMAT,
@@ -97,10 +115,16 @@ CURRENCY_FORMATS = {  # symbol or ISO code before or after the amount -> Excel n
     "USD": DOLLAR_FORMAT,
     "£": POUND_FORMAT,
     "GBP": POUND_FORMAT,
+    "CHF": FRANC_FORMAT,
 }
 
 MAX_FILENAME_CHARS = 60
 SAFE_LINK_PREFIXES = ("http://", "https://", "mailto:", "tel:")
+WORD_LINK_PREFIXES = ("http://", "https://", "mailto:")  # as in Office Documents
+MAILTO_FIELDS = {"subject", "body", "cc", "bcc"}  # others, e.g. "attach", are acted on by some mail clients
+BROWSER_TIMEOUT_S = (
+    30  # Open WebUI waits for the browser without a limit unless WEBSOCKET_EVENT_CALLER_TIMEOUT
+)
 PRINT_FRAME_LIFETIME_MS = 60_000
 PRINT_CSP = "default-src 'none'; style-src 'unsafe-inline'"
 PRINT_CSS = f"""
@@ -137,12 +161,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "(.eml) was downloaded. Open the file to edit and send it - Outlook shows it as a new message."
         ),
         "export_failed": "The export failed. Please try again or contact your administrator.",
+        "browser_failed": (
+            "Your browser did not run the export. Please reload the page and try again. If it keeps "
+            "failing, contact your administrator: the page's Content Security Policy has to allow "
+            "'unsafe-eval' for Open WebUI's code events."
+        ),
         "default_title": "AI response",
         "email_draft_name": "E-mail draft",
         "default_subject": "Draft",
         "sheet_name": "Table {n}",
         "print_footer": "Created with the AI assistant on {date}. Please check the content before use.",
         "date_format": "%Y-%m-%d",
+        "paper": "letter",
     },
     "de": {
         "empty_message": "Diese Antwort ist leer, es gibt nichts zu exportieren.",
@@ -153,12 +183,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "neue E-Mail."
         ),
         "export_failed": "Der Export ist fehlgeschlagen. Bitte erneut versuchen oder an die IT wenden.",
+        "browser_failed": (
+            "Der Browser hat den Export nicht ausgeführt. Bitte die Seite neu laden und erneut versuchen. "
+            "Klappt es weiterhin nicht, bitte an die IT wenden: Die Content-Security-Policy der Seite muss "
+            "'unsafe-eval' für die Code-Events von Open WebUI erlauben."
+        ),
         "default_title": "KI-Antwort",
         "email_draft_name": "E-Mail-Entwurf",
         "default_subject": "Entwurf",
         "sheet_name": "Tabelle {n}",
         "print_footer": "Erstellt mit dem KI-Assistenten am {date} – Inhalte bitte prüfen.",
         "date_format": "%d.%m.%Y",
+        "paper": "a4",
     },
 }
 
@@ -177,8 +213,8 @@ ACTIONS = {
     "docx": (
         "Word (.docx)",
         _svg_icon(
-        '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>'
-        '<path d="M8.5 12l1.2 5 1.3-3.5 1.3 3.5 1.2-5"/>'
+            '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>'
+            '<path d="M8.5 12l1.2 5 1.3-3.5 1.3 3.5 1.2-5"/>'
         ),
     ),
     "xlsx": (
@@ -199,7 +235,8 @@ ACTIONS = {
 
 # ---------------------------------------------------------------------------------- message content --
 
-HIDDEN_BLOCK_RE = re.compile(r"<(details|think)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+# innermost block first (no opening tag of the same kind inside), so nested <details> are removed completely
+HIDDEN_BLOCK_RE = re.compile(r"<(details|think)\b[^>]*>(?:(?!<\1\b).)*?</\1>", re.DOTALL | re.IGNORECASE)
 XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 
 
@@ -226,8 +263,11 @@ def message_text(message: dict[str, Any]) -> str:
 
 
 def clean_markdown(text: str) -> str:
-    """Drop reasoning/tool-call blocks and characters that are invalid in XML (docx/xlsx)."""
-    return XML_ILLEGAL_RE.sub("", HIDDEN_BLOCK_RE.sub("", text)).strip()
+    """Drop reasoning/tool-call blocks (also nested ones) and characters invalid in XML (docx/xlsx)."""
+    count = 1
+    while count:
+        text, count = HIDDEN_BLOCK_RE.subn("", text)
+    return XML_ILLEGAL_RE.sub("", text).strip()
 
 
 # ----------------------------------------------------------------------------------- inline markdown --
@@ -314,6 +354,17 @@ def to_plain(text: str, with_urls: bool = False) -> str:
 
 def is_safe_url(url: str) -> bool:
     return url.strip().lower().startswith(SAFE_LINK_PREFIXES)
+
+
+def is_word_link(url: str) -> bool:
+    """Links Word gets as real hyperlinks (like Office Documents): http, https and plain mailto links."""
+    url = url.strip()
+    if not url.lower().startswith(WORD_LINK_PREFIXES):
+        return False
+    if url.lower().startswith("mailto:") and "?" in url:
+        fields = [part.split("=", 1)[0].lower() for part in url.split("?", 1)[1].split("&") if part]
+        return all(field in MAILTO_FIELDS for field in fields)
+    return True
 
 
 # ------------------------------------------------------------------------------------ block markdown --
@@ -518,62 +569,396 @@ def safe_filename(text: str, fallback: str) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ Word --
+# Same design, valves (accent_color, font, word_template) and link rules as the Word files of Office
+# Documents, copied from it, so both plugins give the same result.
+
+DEFAULT_ACCENT = "1F4E79"
+WHITE, BLACK = "FFFFFF", "000000"
+TEXT_COLOR = "262626"
+MUTED_COLOR = "6B6B6B"
+RULE_COLOR = "D9D9D9"  # thin lines
+FONT_NAME_RE = re.compile(r"[^\W_][\w .-]{0,40}")  # 'Calibri', 'Segoe UI', 'Source Sans 3'
+THEME_FONTS_RE = (
+    r'(<a:(?:major|minor)Font>\s*<a:latin typeface=")[^"]*(")'  # headings and body text of a theme
+)
 
 
-def _add_runs(paragraph: DocxParagraph, runs: list[Run]) -> None:
-    for run in runs:
-        docx_run = paragraph.add_run(_run_text(run, with_url=True))
-        if run.bold:
-            docx_run.bold = True
-        if run.italic:
-            docx_run.italic = True
-        if run.strike:
-            docx_run.font.strike = True
-        if run.code:
-            docx_run.font.name = CODE_FONT
+def mix(color: str, other: str, share: float) -> str:
+    """`color` with `share` (0 to 1) of `other` mixed in, as RRGGBB."""
+    return "".join(
+        f"{round(a + (b - a) * share):02X}"
+        for a, b in zip(bytes.fromhex(color), bytes.fromhex(other), strict=True)
+    )
+
+
+@dataclass(frozen=True)
+class Design:
+    """Accent colour (accent_color valve) and font (font valve) of the Word file."""
+
+    accent: str = DEFAULT_ACCENT
+    font: str = BODY_FONT
+
+    @property
+    def band(self) -> str:  # every second table row
+        return mix(self.accent, WHITE, 0.93)
+
+
+DEFAULT_DESIGN = Design()
+
+# Word wants the children of w:pPr and w:tblPr in a fixed order; new ones go before these.
+PPR_AFTER_BORDERS = (
+    "w:shd", "w:tabs", "w:suppressAutoHyphens", "w:kinsoku", "w:wordWrap", "w:overflowPunct",
+    "w:topLinePunct", "w:autoSpaceDE", "w:autoSpaceDN", "w:bidi", "w:adjustRightInd", "w:snapToGrid",
+    "w:spacing", "w:ind", "w:contextualSpacing", "w:mirrorIndents", "w:suppressOverlap", "w:jc",
+    "w:textDirection", "w:textAlignment", "w:textboxTightWrap", "w:outlineLvl", "w:divId", "w:cnfStyle",
+    "w:rPr", "w:sectPr", "w:pPrChange",
+)  # fmt: skip
+TBLPR_AFTER_BORDERS = (
+    "w:shd",
+    "w:tblLayout",
+    "w:tblCellMar",
+    "w:tblLook",
+    "w:tblCaption",
+    "w:tblDescription",
+)
+TBLPR_AFTER_CELL_MARGINS = ("w:tblLook", "w:tblCaption", "w:tblDescription")
+THEME_FONT_ATTRS = ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme")
+PAPER_SIZES = {"a4": (Cm(21), Cm(29.7)), "letter": (Cm(21.59), Cm(27.94))}
+
+MAX_TEMPLATE_BYTES = 20_000_000
+# With a template, its styles for these are replaced: they get the design. The content uses Body Text, not the
+# template's Normal style, which its header and footer build on.
+LIST_STYLES = ("List Bullet", "List Bullet 2", "List Number", "List Number 2")
+TEMPLATE_STYLES = ("Body Text", "Heading 1", "Heading 2", "Heading 3", "Heading 4", "Quote", *LIST_STYLES)
+# Settings of a template that would follow every document: a mail merge (Word asks to run its SQL
+# command), write protection, and the path of the template it was made from (Word looks for it, e.g. on a
+# network share).
+TEMPLATE_SETTINGS_REMOVED = ("w:attachedTemplate", "w:mailMerge", "w:documentProtection", "w:writeProtection")
+DOTX_MAIN = b"application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml"
+
+
+def read_word_template(path: str) -> bytes | None:
+    """The Word file of the word_template valve, a .dotx turned into a .docx; None if there is none or it
+    cannot be read (logged: the documents are made without it)."""
+    path = path.strip()
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as file:
+            data = file.read(MAX_TEMPLATE_BYTES + 1)
+        if len(data) > MAX_TEMPLATE_BYTES:
+            raise ValueError(f"the file is larger than {MAX_TEMPLATE_BYTES // 1_000_000} MB")
+        with zipfile.ZipFile(io.BytesIO(data)) as package:
+            if sum(item.file_size for item in package.infolist()) > 5 * MAX_TEMPLATE_BYTES:
+                raise ValueError("the file is too large unpacked")
+            types = package.read("[Content_Types].xml")
+            if DOTX_MAIN not in types:
+                return data
+            buffer = io.BytesIO()  # python-docx opens documents only
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as document:
+                for item in package.infolist():
+                    content = package.read(item)
+                    if item.filename == "[Content_Types].xml":
+                        content = content.replace(DOTX_MAIN, DOCX_CT.WML_DOCUMENT_MAIN.encode())
+                    document.writestr(item, content)
+            return buffer.getvalue()
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as e:
+        log.warning("The Word template %r cannot be used, documents are made without it: %s", path, e)
+        return None
+
+
+def _set_style(style: Any, size: float, color: str, bold: bool = False, italic: bool = False,
+               before: float | None = None, after: float | None = None,
+               font: str = BODY_FONT) -> None:  # fmt: skip
+    """Font, colour and spacing of a built-in style; its theme font and colour are removed, they would win."""
+    style.font.name = font
+    for attr in THEME_FONT_ATTRS:
+        style.element.rPr.rFonts.attrib.pop(qn(attr), None)
+    style.font.size, style.font.bold, style.font.italic = Pt(size), bold, italic
+    style.font.color.rgb = RGBColor.from_string(color)
+    for attr in ("w:themeShade", "w:themeTint"):
+        style.element.rPr.color.attrib.pop(qn(attr), None)
+    if before is not None:
+        style.paragraph_format.space_before = Pt(before)
+    if after is not None:
+        style.paragraph_format.space_after = Pt(after)
+
+
+def _set_borders(
+    parent: Any, tag: str, successors: tuple[str, ...], sides: list[tuple[str, int, str]]
+) -> None:
+    """Replace the w:pBdr of a paragraph (or style) or the w:tblBorders of a table. Sides in schema order
+    (top, left, bottom, right, insideH, insideV), size in eighths of a point, 0 for no line."""
+    old = parent.find(qn(tag))
+    if old is not None:
+        parent.remove(old)
+    borders = OxmlElement(tag)
+    for side, size, color in sides:
+        edge = OxmlElement(f"w:{side}")
+        edge.set(qn("w:val"), "single" if size else "nil")
+        if size:
+            edge.set(qn("w:sz"), str(size))
+            edge.set(qn("w:space"), "4" if tag == "w:pBdr" else "0")
+            edge.set(qn("w:color"), color)
+        borders.append(edge)
+    parent.insert_element_before(borders, *successors)
+
+
+def _set_cell_margins(table: Any, top: int, bottom: int) -> None:
+    """Cell margins in twips; left and right stay at Word's 108."""
+    margins = OxmlElement("w:tblCellMar")
+    for side, value in (("top", top), ("left", 108), ("bottom", bottom), ("right", 108)):
+        edge = OxmlElement(f"w:{side}")
+        edge.set(qn("w:w"), str(value))
+        edge.set(qn("w:type"), "dxa")
+        margins.append(edge)
+    table._tbl.tblPr.insert_element_before(margins, *TBLPR_AFTER_CELL_MARGINS)
+
+
+def _set_cell_shading(cell: Any, fill: str) -> None:
+    shading = OxmlElement("w:shd")
+    shading.set(qn("w:val"), "clear")
+    shading.set(qn("w:color"), "auto")
+    shading.set(qn("w:fill"), fill)
+    cell._tc.get_or_add_tcPr().append(shading)
 
 
 class DocxWriter:
-    """Render parsed blocks into a Word document."""
+    """Render parsed blocks into a Word document: headings in the accent colour, tables with an accent
+    header row, real hyperlinks, optionally on a company template (header, footer, page size, margins)."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        design: Design = DEFAULT_DESIGN,
+        template: bytes | None = None,
+        paper: str = "letter",
+        title: str = "",
+    ) -> None:
+        self.design, self.paper, self.title = design, paper, title
+        self.template = False
+        if template:
+            try:
+                self.doc, self.template = Document(io.BytesIO(template)), True
+                self._take_template()
+                self._styles()
+                return
+            except Exception:
+                log.warning(
+                    "The Word template cannot be used, the document is made without it", exc_info=True
+                )
+                self.template = False
         self.doc = Document()
-        normal_font = self.doc.styles["Normal"].font
-        normal_font.name = BODY_FONT
-        normal_font.size = BODY_FONT_SIZE
+        self._styles()
+
+    @property
+    def body_style(self) -> str | None:
+        return "Body Text" if self.template else None  # None: Normal
 
     def render(self, blocks: list[Block]) -> bytes:
+        self._page_setup()
         for block in blocks:
             match block:
                 case Heading(level, text):
                     self.doc.add_heading(to_plain(text), level=min(level, MAX_DOCX_HEADING_LEVEL))
                 case Paragraph(text):
-                    _add_runs(self.doc.add_paragraph(), parse_inline(text))
+                    self._add_runs(self.doc.add_paragraph(style=self.body_style), parse_inline(text))
                 case List():
                     self._list(block, level=0)
                 case Quote(lines):
                     for line in filter(str.strip, lines):
-                        _add_runs(self.doc.add_paragraph(style="Quote"), parse_inline(line))
+                        self._add_runs(self.doc.add_paragraph(style="Quote"), parse_inline(line))
                 case CodeBlock(code):
-                    run = self.doc.add_paragraph().add_run(code)
+                    run = self.doc.add_paragraph(style=self.body_style).add_run(code)
                     run.font.name = CODE_FONT
                     run.font.size = CODE_FONT_SIZE
                 case Table():
                     self._table(block)
+                case Rule():  # a thin line: an empty paragraph with a bottom border
+                    pPr = self.doc.add_paragraph(style=self.body_style)._p.get_or_add_pPr()
+                    _set_borders(pPr, "w:pBdr", PPR_AFTER_BORDERS, [("bottom", 6, RULE_COLOR)])
         buffer = io.BytesIO()
         self.doc.save(buffer)
         return buffer.getvalue()
+
+    def _take_template(self) -> None:
+        """Keep the template's header, footer, page size and margins; remove its content and give the content
+        styles the design (TEMPLATE_STYLES)."""
+        body = self.doc.element.body
+        last = body.get_or_add_sectPr()  # the last section's settings, with its header and footer
+        for tag in (
+            "w:headerReference",
+            "w:footerReference",
+        ):  # a section without its own takes the previous one's
+            for earlier in reversed(body.xpath("./w:p/w:pPr/w:sectPr")):
+                for reference in earlier.findall(qn(tag)):
+                    if not any(
+                        own.get(qn("w:type")) == reference.get(qn("w:type")) for own in last.findall(qn(tag))
+                    ):
+                        last.insert(0, copy.deepcopy(reference))
+        for child in list(body):
+            if child is not last:
+                body.remove(child)
+        default = Document()
+        styles = self.doc.styles.element
+        # The template's default character style, which Word names after its language
+        default_font = next(
+            (style.styleId for style in styles.findall(qn("w:style"))
+             if style.get(qn("w:type")) == "character" and style.get(qn("w:default")) in ("1", "true")),
+            None,
+        )  # fmt: skip
+        renamed = {"Normal": "BodyText", "DefaultParagraphFont": default_font}
+        for name in TEMPLATE_STYLES:
+            style = default.styles[name].element
+            link = style.find(qn("w:link"))
+            linked = default.styles.element.get_by_id(link.get(qn("w:val"))) if link is not None else None
+            for new in (style, linked) if linked is not None else (style,):
+                for old in styles.findall(qn("w:style")):
+                    if (
+                        old.name_val or ""
+                    ).casefold() == new.name_val.casefold() or old.styleId == new.styleId:
+                        old_link = old.find(qn("w:link"))  # e.g. "Überschrift 1 Zchn" of "Überschrift 1"
+                        old_linked = (
+                            styles.get_by_id(old_link.get(qn("w:val"))) if old_link is not None else None
+                        )
+                        if old_linked is not None:
+                            styles.remove(old_linked)
+                        if old.getparent() is not None:
+                            styles.remove(old)
+                new = copy.deepcopy(new)
+                for tag in ("w:basedOn", "w:next"):
+                    reference = new.find(qn(tag))
+                    if reference is None or reference.get(qn("w:val")) not in renamed:
+                        continue
+                    if new.styleId == "BodyText" or not renamed[reference.get(qn("w:val"))]:
+                        new.remove(reference)  # nothing of the template's Normal
+                    else:
+                        reference.set(qn("w:val"), renamed[reference.get(qn("w:val"))])
+                styles.append(new)
+        self._take_numbering(default)
+        try:
+            settings_part = self.doc.part.part_related_by(RELATIONSHIP_TYPE.SETTINGS)
+        except KeyError:
+            settings_part = None  # a file without settings
+        for tag in TEMPLATE_SETTINGS_REMOVED if settings_part is not None else ():
+            for element in settings_part.element.findall(qn(tag)):
+                settings_part.element.remove(element)
+                for node in element.iter():
+                    if node.get(qn("r:id")):
+                        settings_part.drop_rel(node.get(qn("r:id")))
+        core = self.doc.core_properties  # the template's author, title ... are not the document's
+        core.author = core.last_modified_by = core.subject = core.keywords = core.comments = core.category = (
+            ""
+        )
+        core.title = self.title
+
+    def _take_numbering(self, default: Any) -> None:
+        """The list styles now point to the default template's numbering: copy it in, with new numbers."""
+        source = default.part.numbering_part.element
+        try:
+            numbering = self.doc.part.part_related_by(RELATIONSHIP_TYPE.NUMBERING).element
+        except KeyError:
+            package, numbering = self.doc.part.package, parse_xml(f"<w:numbering {nsdecls('w')}/>")
+            partname = package.next_partname("/word/numbering%d.xml")
+            self.doc.part.relate_to(
+                NumberingPart(partname, DOCX_CT.WML_NUMBERING, numbering, package),
+                RELATIONSHIP_TYPE.NUMBERING,
+            )
+        abstract_ids = [int(a.get(qn("w:abstractNumId"))) for a in numbering.findall(qn("w:abstractNum"))]
+        for abstract_id, name in enumerate(LIST_STYLES, start=max(abstract_ids, default=-1) + 1):
+            num_id = self.doc.styles[name].element.pPr.numPr.numId
+            used = source.num_having_numId(num_id.val).abstractNumId.val
+            abstract = copy.deepcopy(source.xpath(f"w:abstractNum[@w:abstractNumId='{used}']")[0])
+            abstract.set(qn("w:abstractNumId"), str(abstract_id))
+            for nsid in abstract.findall(qn("w:nsid")):  # Word's list identity; the template may use the same
+                abstract.remove(nsid)
+            numbering.insert_element_before(abstract, "w:num", "w:numIdMacAtCleanup")
+            num_id.val = numbering.add_num(abstract_id).numId
+
+    def _styles(self) -> None:
+        """A calm, modern look: dark grey body text with some air, headings in the accent colour."""
+        styles, accent, font = self.doc.styles, self.design.accent, self.design.font
+        body = styles[self.body_style or "Normal"]
+        _set_style(body, 10.5, TEXT_COLOR, after=6, font=font)
+        body.paragraph_format.line_spacing = 1.15
+        _set_style(styles["Heading 1"], 16, accent, bold=True, before=20, after=6, font=font)
+        _set_style(styles["Heading 2"], 13, TEXT_COLOR, bold=True, before=14, after=4, font=font)
+        _set_style(styles["Heading 3"], 11, accent, bold=True, before=10, after=2, font=font)
+        _set_style(
+            styles["Heading 4"], 10.5, TEXT_COLOR, bold=True, italic=True, before=8, after=2, font=font
+        )
+        quote = styles["Quote"]
+        _set_style(quote, 10.5, MUTED_COLOR, italic=True, before=6, after=10, font=font)
+        quote.paragraph_format.left_indent = Cm(0.4)
+        _set_borders(quote.element.get_or_add_pPr(), "w:pBdr", PPR_AFTER_BORDERS, [("left", 18, accent)])
+        self._for_previews()
+
+    def _for_previews(self) -> None:
+        """Word takes fonts and colours from the paragraph styles. Other viewers also read the document
+        defaults, the theme fonts and the character styles linked to the paragraph styles, and they may have
+        no Symbol font for Word's bullets (boxes instead of dots). All get the design."""
+        font, styles = self.design.font, self.doc.styles
+        for fonts in (
+            styles.element.xpath("w:docDefaults/w:rPrDefault/w:rPr/w:rFonts") if not self.template else ()
+        ):
+            for attr in THEME_FONT_ATTRS:
+                fonts.attrib.pop(qn(attr), None)
+            for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+                fonts.set(qn(attr), font)
+        for part in (
+            self.doc.part.package.iter_parts() if not self.template else ()
+        ):  # the template's header and
+            if str(part.partname).startswith("/word/theme/"):  # footer may use its theme fonts
+                part._blob = re.sub(THEME_FONTS_RE.encode(), lambda m: m[1] + font.encode() + m[2], part.blob)
+        for style in styles:
+            link = style.element.find(qn("w:link"))
+            if style.type != WD_STYLE_TYPE.PARAGRAPH or link is None or style.element.rPr is None:
+                continue
+            linked = styles.element.get_by_id(link.get(qn("w:val")))
+            if linked is not None:  # e.g. "Heading 1 Char": same look as its paragraph style
+                for old in linked.findall(qn("w:rPr")):
+                    linked.remove(old)
+                linked.append(copy.deepcopy(style.element.rPr))
+        for level in self.doc.part.numbering_part.element.iter(qn("w:lvl")):
+            kind = level.find(qn("w:numFmt"))
+            if kind is None or kind.get(qn("w:val")) != "bullet":
+                continue
+            indent = level.find(f"{qn('w:pPr')}/{qn('w:ind')}")
+            sub_item = indent is not None and int(indent.get(qn("w:left"), "0")) > 720
+            level.find(qn("w:lvlText")).set(qn("w:val"), "–" if sub_item else "•")
+            for old in level.findall(qn("w:rPr")):
+                level.remove(old)
+            props = OxmlElement("w:rPr")
+            fonts = OxmlElement("w:rFonts")
+            fonts.set(qn("w:ascii"), font)
+            fonts.set(qn("w:hAnsi"), font)
+            color = OxmlElement("w:color")
+            color.set(qn("w:val"), self.design.accent)
+            props.append(fonts)
+            props.append(color)
+            level.append(props)
+
+    def _page_setup(self) -> None:
+        """Paper and margins; a template keeps its own."""
+        section = self.doc.sections[0]
+        width, height = PAPER_SIZES[self.paper]
+        page = {"page_width": width, "page_height": height, "left_margin": Cm(2.5), "right_margin": Cm(2.5),
+                "top_margin": Cm(2.5), "bottom_margin": Cm(2.2), "header_distance": Cm(1.25),
+                "footer_distance": Cm(1.25)}  # fmt: skip
+        for name, value in page.items():
+            if not self.template or getattr(section, name) is None:  # what a template lacks
+                setattr(section, name, value)
 
     def _list(self, block: List, level: int) -> None:
         style = (ORDERED_LIST_STYLES if block.ordered else BULLET_LIST_STYLES)[level]
         num_id: int | None = None
         for item in block.items:
             paragraph = self.doc.add_paragraph(style=style)
+            paragraph.paragraph_format.space_after = Pt(3)
             if block.ordered:
                 if num_id is None:  # each list gets its own numbering, so the next one restarts
                     num_id = self._new_numbering(paragraph.style, block.start)
                 paragraph._p.get_or_add_pPr().get_or_add_numPr().get_or_add_numId().val = num_id
-            _add_runs(paragraph, parse_inline(item.text))
+            self._add_runs(paragraph, parse_inline(item.text))
             for sublist in item.sublists:
                 self._list(sublist, level=1)
 
@@ -590,27 +975,69 @@ class DocxWriter:
         return num.numId
 
     def _table(self, table: Table) -> None:
+        """Header row in the accent colour, every second row lightly tinted, thin lines between rows only."""
         doc_table = self.doc.add_table(rows=len(table.rows), cols=len(table.aligns))
-        doc_table.style = "Table Grid"
+        lines = [("top", 0, ""), ("left", 0, ""), ("bottom", 8, self.design.accent), ("right", 0, ""),
+                 ("insideH", 4, RULE_COLOR), ("insideV", 0, "")]  # fmt: skip
+        _set_borders(doc_table._tbl.tblPr, "w:tblBorders", TBLPR_AFTER_BORDERS, lines)
+        _set_cell_margins(doc_table, top=50, bottom=50)
         for row_index, (doc_row, row) in enumerate(zip(doc_table.rows, table.rows, strict=True)):
+            if row_index == 0:  # repeat the header row on every page
+                header_flag = OxmlElement("w:tblHeader")
+                header_flag.set(qn("w:val"), "true")
+                doc_row._tr.get_or_add_trPr().append(header_flag)
+            fill = self.design.accent if row_index == 0 else self.design.band if row_index % 2 == 0 else None
             for cell, text, align in zip(doc_row.cells, row, table.aligns, strict=True):
                 paragraph = cell.paragraphs[0]
+                if self.template:
+                    paragraph.style = self.body_style
                 paragraph.alignment = DOCX_ALIGNMENT.get(align or "")
-                _add_runs(paragraph, parse_inline(text, Run("", bold=row_index == 0)))
-        self.doc.add_paragraph()
+                paragraph.paragraph_format.space_after = Pt(0)
+                paragraph.paragraph_format.line_spacing = 1.0
+                runs = parse_inline(text, Run("", bold=row_index == 0))
+                self._add_runs(paragraph, runs, WHITE if row_index == 0 else None)
+                if fill:
+                    _set_cell_shading(cell, fill)
+        self.doc.add_paragraph(style=self.body_style).paragraph_format.space_after = Pt(4)
+
+    def _add_runs(self, paragraph: DocxParagraph, runs: list[Run], color: str | None = None) -> None:
+        for run in runs:
+            link = run.url if run.url and is_word_link(run.url) else None
+            docx_run = paragraph.add_run(run.text if link else _run_text(run, with_url=True))
+            docx_run.bold = run.bold or None
+            docx_run.italic = run.italic or None
+            if color:
+                docx_run.font.color.rgb = RGBColor.from_string(color)
+            if run.strike:
+                docx_run.font.strike = True
+            if run.code:
+                docx_run.font.name = CODE_FONT
+            if link:
+                self._make_link(paragraph, docx_run, link.strip(), color or self.design.accent)
+
+    @staticmethod
+    def _make_link(paragraph: DocxParagraph, docx_run: Any, url: str, color: str) -> None:
+        docx_run.font.underline = True
+        docx_run.font.color.rgb = RGBColor.from_string(color)
+        link = OxmlElement("w:hyperlink")
+        link.set(qn("r:id"), paragraph.part.relate_to(url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True))
+        docx_run._r.addprevious(link)
+        link.append(docx_run._r)
 
 
-def markdown_to_docx(blocks: list[Block]) -> bytes:
-    return DocxWriter().render(blocks)
+def markdown_to_docx(
+    blocks: list[Block], design: Design = DEFAULT_DESIGN, template: bytes | None = None, paper: str = "letter"
+) -> bytes:
+    return DocxWriter(design, template, paper, document_title(blocks)).render(blocks)
 
 
 # ----------------------------------------------------------------------------------------------- Excel --
 
 CURRENCY_RE = "|".join(map(re.escape, CURRENCY_FORMATS))
-NUMBER_RE = re.compile(  # thousands separators: . , ' space, no-break space, narrow no-break space
+NUMBER_RE = re.compile(  # thousands separators: . , ' ’ space, no-break space, narrow no-break space
     rf"(?P<prefix>{CURRENCY_RE})?\s*"
     r"(?P<sign>[-+]?)"
-    r"(?P<int>\d{1,3}(?:(?P<group>[.,' \u00a0\u202f])\d{3}(?:(?P=group)\d{3})*)?|\d+)"
+    r"(?P<int>\d{1,3}(?:(?P<group>[.,'\u2019 \u00a0\u202f])\d{3}(?:(?P=group)\d{3})*)?|\d+)"
     r"(?:(?!(?P=group))(?P<decimal>[.,])(?P<fraction>\d+))?"  # decimal mark differs from the separator
     rf"\s*(?P<suffix>%|{CURRENCY_RE})?"
 )
@@ -620,12 +1047,15 @@ def parse_number(text: str) -> tuple[str | int | float, str | None]:
     """Convert '1.234,56 €', '1.234,56 EUR', '-3,2 %', '1,234.5' etc. to (number, Excel number format).
 
     A dot or comma followed by exactly three digits is read as a thousands separator, so
-    "2.000" is 2000 and "1,234" is 1234. Values that do not look like a plain number, and
-    integers with leading zeros (postcodes, IDs), are returned unchanged as (text, None).
+    "2.000" is 2000 and "1,234" is 1234. Values that do not look like a plain number, integers
+    with leading zeros (postcodes, IDs) and phone numbers ("+49 711 123", "+1 234") are returned
+    unchanged as (text, None).
     """
     match = NUMBER_RE.fullmatch(text.strip().replace("\u2212", "-"))  # Unicode minus sign
     if not match or (match["prefix"] and match["suffix"]):
         return text, None
+    if match["sign"] == "+" and (match["group"] or "").isspace() and not (match["prefix"] or match["suffix"]):
+        return text, None  # international phone number
     digits, fraction = re.sub(r"\D", "", match["int"]), match["fraction"] or ""
     if (len(digits) > 1 and digits.startswith("0")) or len(digits) + len(fraction) > MAX_EXACT_DIGITS:
         return text, None
@@ -877,7 +1307,29 @@ return true;
 """
 
 
+# The interface language (Open WebUI keeps it in localStorage.locale) and the time zone of the browser.
+BROWSER_SETTINGS_JS = """
+let locale = '';
+let zone = '';
+try { locale = localStorage.getItem('locale') || ''; } catch {}
+try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch {}
+return [String(locale || navigator.language || ''), String(zone)];
+"""
+
+
 # ---------------------------------------------------------------------------------------------- Action --
+
+
+class BrowserError(Exception):
+    """The browser did not run a snippet: blocked by the page's CSP, tab closed or disconnected, no answer."""
+
+
+def zone(name: str) -> tzinfo | None:
+    """The IANA time zone, None if the name is empty or unknown."""
+    try:
+        return ZoneInfo(name.strip()) if name.strip() else None
+    except (ZoneInfoNotFoundError, ValueError, OSError):  # OSError: on some systems for a name too long for a file
+        return None
 
 
 @dataclass
@@ -891,25 +1343,63 @@ class Browser:
         if self.emitter is not None:
             await self.emitter({"type": "notification", "data": {"type": level, "content": text}})
 
-    async def run_js(self, code: str) -> None:
+    async def call_js(self, code: str) -> Any:
+        """Run a snippet in the browser and return its result. A snippet that throws never calls back, a
+        disconnected session answers {'error': ...}: both raise BrowserError."""
         if self.caller is None:
-            raise RuntimeError("__event_call__ is not available, cannot run code in the browser")
-        await self.caller({"type": "execute", "data": {"code": code}})
+            raise BrowserError("__event_call__ is not available, cannot run code in the browser")
+        try:
+            result = await asyncio.wait_for(
+                self.caller({"type": "execute", "data": {"code": code}}), BROWSER_TIMEOUT_S
+            )
+        except TimeoutError as e:
+            raise BrowserError(f"the browser did not answer within {BROWSER_TIMEOUT_S} s") from e
+        if isinstance(result, dict) and "error" in result:
+            raise BrowserError(str(result["error"])[:200])
+        return result
+
+    async def run_js(self, code: str) -> None:
+        """Run one of the export snippets, which all return true."""
+        result = await self.call_js(code)
+        if result is not True:
+            raise BrowserError(f"unexpected result from the browser: {str(result)[:200]}")
 
     async def download(self, data: bytes, filename: str, mime: str) -> None:
         await self.run_js(download_js(data, filename, mime))
 
+    async def settings(self) -> tuple[str, str]:
+        """The interface language (e.g. 'de-DE') and time zone of the user's browser."""
+        result = await self.call_js(BROWSER_SETTINGS_JS)
+        if not (isinstance(result, list) and len(result) == 2):
+            raise BrowserError(f"unexpected result from the browser: {str(result)[:200]}")
+        return str(result[0] or ""), str(result[1] or "")
+
+
+@dataclass
+class Export:
+    """What an export needs besides the content: texts in the user's language, time zone and browser."""
+
+    texts: dict[str, str]
+    language: str
+    timezone: tzinfo | None
+    browser: Browser
+
+    def now(self) -> datetime:
+        return datetime.now(self.timezone)
+
 
 class Action:
     class Valves(BaseModel):
-        language: Literal["en", "de"] = Field(
-            default="en",
-            description="Language of the buttons, messages, default file names and the print footer.",
+        language: Literal["auto", "en", "de"] = Field(
+            default="auto",
+            description="Language of the messages, default file names, the print footer and the Word paper "
+            "size (en: Letter, de: A4). auto = the user's interface language (English if there is no "
+            "translation).",
         )
         timezone: str = Field(
             default="",
             description="IANA time zone for file name timestamps and the print footer date, "
-            "e.g. 'Europe/Berlin'. Empty = server time.",
+            "e.g. 'Europe/Berlin'. Empty or unknown = the time zone of the user's browser.",
         )
         max_mailto_length: int = Field(
             default=1900,
@@ -924,6 +1414,22 @@ class Action:
         print_footer: bool = Field(
             default=True,
             description="Add a small 'created with the AI assistant' note with the date to printed pages.",
+        )
+        accent_color: str = Field(
+            default=DEFAULT_ACCENT,
+            description="Accent colour of Word documents (headings, table header rows, links) as a hex value "
+            "without '#', e.g. 1F4E79. Same as the valve of Office Documents.",
+        )
+        font: str = Field(
+            default=BODY_FONT,
+            description="Font of Word documents, e.g. Calibri, Arial or Aptos. It has to be installed where "
+            "the files are opened; otherwise Office shows a similar one.",
+        )
+        word_template: str = Field(
+            default="",
+            description="Optional Word file (.docx or .dotx) on the Open WebUI server, e.g. a letterhead: "
+            "Word documents get its header, footer, page size and margins, e.g. "
+            "/app/backend/data/templates/letterhead.dotx.",
         )
 
     def __init__(self) -> None:
@@ -943,46 +1449,79 @@ class Action:
         __event_emitter__: EventCallback | None = None,
         __event_call__: EventCallback | None = None,
     ) -> None:
-        texts = TRANSLATIONS[self.valves.language]
         browser = Browser(__event_emitter__, __event_call__)
-        action_id = __id__ or "docx"
-        if action_id not in ACTIONS:
-            log.warning("Unknown response export action %r", action_id)
+        # Without a sub-action (e.g. an API call) Open WebUI passes the function's own ID: export to Word.
+        action_id = __id__ if __id__ in ACTIONS else "docx"
+        try:
+            export = await self._export_context(browser)
+        except BrowserError as e:
+            log.warning("Response export: the browser cannot run the export: %s", e)
+            language = self.valves.language if self.valves.language != "auto" else "en"
+            await browser.notify("error", TRANSLATIONS[language]["browser_failed"])
             return
-        exporter = getattr(self, f"_export_{action_id}")
         content = clean_markdown(message_text(find_message(body)))
         if not content:
-            await browser.notify("warning", texts["empty_message"])
+            await browser.notify("warning", export.texts["empty_message"])
             return
         try:
-            await exporter(content, texts, browser)
+            await getattr(self, f"_export_{action_id}")(content, export)
+        except BrowserError as e:
+            log.warning("Response export %r: the browser did not run it: %s", action_id, e)
+            await browser.notify("error", export.texts["browser_failed"])
         except Exception:
             log.exception("Response export %r failed", action_id)
-            await browser.notify("error", texts["export_failed"])
+            await browser.notify("error", export.texts["export_failed"])
 
-    async def _export_docx(self, content: str, texts: dict[str, str], browser: Browser) -> None:
+    async def _export_context(self, browser: Browser) -> Export:
+        """Language and time zone from the valves; 'auto' and an empty time zone come from the browser."""
+        language, timezone = self.valves.language, zone(self.valves.timezone)
+        if language == "auto" or timezone is None:
+            locale, browser_zone = await browser.settings()
+            if language == "auto":
+                code = locale.replace("_", "-").split("-")[0].strip().lower()
+                language = code if code in TRANSLATIONS else "en"
+            timezone = timezone or zone(browser_zone)
+        return Export(TRANSLATIONS[language], language, timezone, browser)
+
+    def _design(self) -> Design:
+        accent = self.valves.accent_color.strip().lstrip("#")
+        font = " ".join(self.valves.font.split())
+        return Design(
+            accent.upper() if re.fullmatch(r"[0-9A-Fa-f]{6}", accent) else DEFAULT_ACCENT,
+            font if FONT_NAME_RE.fullmatch(font) else BODY_FONT,
+        )
+
+    async def _export_docx(self, content: str, export: Export) -> None:
         blocks = parse_blocks(content)
-        data = await asyncio.to_thread(markdown_to_docx, blocks)
-        await browser.download(data, f"{self._file_stem(blocks, texts)}.docx", DOCX_MIME)
 
-    async def _export_xlsx(self, content: str, texts: dict[str, str], browser: Browser) -> None:
+        def build() -> bytes:
+            template = read_word_template(self.valves.word_template)
+            return markdown_to_docx(blocks, self._design(), template, export.texts["paper"])
+
+        data = await asyncio.to_thread(build)
+        await export.browser.download(data, f"{self._file_stem(blocks, export)}.docx", DOCX_MIME)
+
+    async def _export_xlsx(self, content: str, export: Export) -> None:
         blocks = parse_blocks(content)
         tables = [block for block in blocks if isinstance(block, Table)]
         if not tables:
-            await browser.notify("warning", texts["no_tables"])
+            await export.browser.notify("warning", export.texts["no_tables"])
             return
-        data = await asyncio.to_thread(tables_to_xlsx, tables, texts["sheet_name"])
-        await browser.download(data, f"{self._file_stem(blocks, texts)}.xlsx", XLSX_MIME)
+        data = await asyncio.to_thread(tables_to_xlsx, tables, export.texts["sheet_name"])
+        await export.browser.download(data, f"{self._file_stem(blocks, export)}.xlsx", XLSX_MIME)
 
-    async def _export_pdf(self, content: str, texts: dict[str, str], browser: Browser) -> None:
+    async def _export_pdf(self, content: str, export: Export) -> None:
         blocks = parse_blocks(content)
         footer = ""
         if self.valves.print_footer:
-            footer = texts["print_footer"].format(date=self._now().strftime(texts["date_format"]))
-        page = build_print_html(blocks, self._file_stem(blocks, texts), footer, self.valves.language)
-        await browser.run_js(print_js(page))
+            footer = export.texts["print_footer"].format(
+                date=export.now().strftime(export.texts["date_format"])
+            )
+        page = build_print_html(blocks, self._file_stem(blocks, export), footer, export.language)
+        await export.browser.run_js(print_js(page))
 
-    async def _export_email(self, content: str, texts: dict[str, str], browser: Browser) -> None:
+    async def _export_email(self, content: str, export: Export) -> None:
+        texts, browser = export.texts, export.browser
         subject, blocks = split_email(parse_blocks(content))
         subject = subject or document_title(blocks)
         body_text = blocks_to_text(blocks)
@@ -996,14 +1535,8 @@ class Action:
         if not self.valves.always_eml:
             await browser.notify("info", texts["eml_downloaded"])
 
-    def _file_stem(self, blocks: list[Block], texts: dict[str, str]) -> str:
+    @staticmethod
+    def _file_stem(blocks: list[Block], export: Export) -> str:
         """File name without extension: first heading (or a default) plus a timestamp."""
-        return f"{safe_filename(document_title(blocks), texts['default_title'])} {self._now():%Y-%m-%d %H%M}"
-
-    def _now(self) -> datetime:
-        if timezone := self.valves.timezone.strip():
-            try:
-                return datetime.now(ZoneInfo(timezone))
-            except (ZoneInfoNotFoundError, ValueError):
-                log.warning("Unknown time zone %r, using server time", self.valves.timezone)
-        return datetime.now()
+        title = safe_filename(document_title(blocks), export.texts["default_title"])
+        return f"{title} {export.now():%Y-%m-%d %H%M}"

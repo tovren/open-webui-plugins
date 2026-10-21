@@ -2,14 +2,15 @@
 title: Context Guard
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.1.0
+version: 1.2.0
 license: MIT
 required_open_webui_version: 0.11.4
 description: Estimates the prompt size right before each request is sent to the model - after document excerpts and tool results have been added - and shows a warning or stops with a clear, friendly message before the model's context window overflows.
 
 How it works
 - Runs on the "request" hook (new in Open WebUI 0.11), i.e. after file/RAG context has been
-  injected and again after every tool-call round, so everything the model will see is counted.
+  injected and again after every tool-call round. The model's system prompt, which Open WebUI only
+  adds after this hook, and earlier reasoning sent back to the model are counted too.
 - Shows a status hint above the answer once the prompt uses warn_percent of the usable context
   (context size minus the space reserved for the answer).
 - Stops the request with an explanation and practical next steps when the prompt would not fit.
@@ -17,7 +18,8 @@ How it works
   ("exceeds the available context size"), and Ollama silently drops the oldest part of the
   conversation, so the model quietly forgets earlier messages and documents.
 - The token count is an estimate (characters / chars_per_token plus a flat amount per image),
-  not a real tokenizer. Lower chars_per_token to be more cautious.
+  not a real tokenizer. Lower chars_per_token to be more cautious. Open WebUI's own estimate
+  (Context Compaction) uses 4 characters per token, so the guard's default of 3.5 counts higher.
 - Works together with Open WebUI's Context Compaction: compaction runs first, so the guard checks
   the shortened history. While compaction will summarize the chat before the limit, the hint to
   start a new chat is not shown. If the compaction threshold is not below the usable context, a
@@ -42,6 +44,7 @@ log = logging.getLogger(__name__)
 EventEmitter = Callable[[dict[str, Any]], Awaitable[Any]]
 
 MESSAGE_OVERHEAD_CHARS = 16  # role and chat-template tokens per message
+REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking")
 
 TRANSLATIONS: dict[str, dict[str, str]] = {
     "en": {
@@ -104,19 +107,76 @@ def _content_size(content: Any) -> tuple[int, int]:
     return chars, images
 
 
-def estimate_tokens(body: dict[str, Any], chars_per_token: float, tokens_per_image: int) -> int:
-    """Rough token estimate for messages, tool calls and tool definitions of a chat request."""
-    chars = images = 0
-    for message in body.get("messages") or []:
+def _text(content: Any) -> str:
+    if isinstance(content, list):
+        return "\n".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+    return content if isinstance(content, str) else ""
+
+
+def missing_system_prompt_chars(messages: list[Any], metadata: dict[str, Any] | None) -> int:
+    """Characters of the model's system prompt that Open WebUI adds only after the request hook.
+
+    Before the hook Open WebUI stores "model prompt\nsystem message" in the metadata (0.11:
+    system_prompt, 0.12: base_system_prompt); the router puts the model prompt in front of the
+    system message later. In tool-call rounds the body already contains it."""
+    metadata = metadata or {}
+    prompt = metadata.get("base_system_prompt") or metadata.get("system_prompt")
+    if not isinstance(prompt, str) or not prompt:
+        return 0
+    system = next((m for m in messages if isinstance(m, dict) and m.get("role") == "system"), None)
+    current = _text(system.get("content")) if system else ""
+    if current.startswith(prompt):
+        return 0
+    if current and prompt.endswith("\n" + current):
+        return len(prompt) - len(current)
+    # the system message starts with the part after one of the prompt's line breaks (RAG context added)
+    index = prompt.find("\n")
+    while index >= 0:
+        if current.startswith(prompt[index + 1 :]):
+            return index + 1
+        index = prompt.find("\n", index + 1)
+    return len(prompt) + 1
+
+
+def estimate_tokens(
+    body: dict[str, Any],
+    chars_per_token: float,
+    tokens_per_image: int,
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    """Rough token estimate for messages, reasoning, tool calls, tool definitions and the model's
+    system prompt of a chat request."""
+    messages = body.get("messages") or []
+    chars, images = missing_system_prompt_chars(messages, metadata), 0
+    for message in messages:
         if not isinstance(message, dict):
             continue
         message_chars, message_images = _content_size(message.get("content"))
         chars += message_chars + MESSAGE_OVERHEAD_CHARS
         images += message_images
+        # earlier reasoning sent back: llama.cpp reasoning_content, Ollama thinking
+        chars += sum(len(value) for key in REASONING_FIELDS if isinstance(value := message.get(key), str))
         chars += sum(_json_length(call) for call in message.get("tool_calls") or [])
     if body.get("tools"):
         chars += _json_length(body["tools"])
     return math.ceil(chars / chars_per_token) + images * tokens_per_image
+
+
+def model_ids(body: dict[str, Any], model: dict[str, Any] | None) -> list[str]:
+    """The requested model ID, then the base model of a workspace model (if any)."""
+    info = (model or {}).get("info") or {}
+    ids = [body.get("model"), (model or {}).get("id"), info.get("base_model_id")]
+    return [model_id for model_id in dict.fromkeys(ids) if isinstance(model_id, str) and model_id]
+
+
+def user_language(language: str, metadata: dict[str, Any] | None) -> str:
+    """The language valve; 'auto' takes the user's interface language, English if it has no translation."""
+    if language != "auto":
+        return language
+    variables = (metadata or {}).get("variables") or {}
+    locale = str(variables.get("{{USER_LANGUAGE}}") or "") if isinstance(variables, dict) else ""
+    code = locale.replace("_", "-").split("-")[0].strip().lower()
+    return code if code in TRANSLATIONS else "en"
 
 
 @lru_cache(maxsize=4)
@@ -171,11 +231,14 @@ class Filter:
     class Valves(BaseModel):
         priority: int = Field(
             default=100,
-            description="Filter order (lower runs first). Keep it high so that content added by other "
-            "filters is counted too.",
+            description="Filter order (lower runs first). Only matters among the request hooks of several "
+            "filters: keep it high so that changes of other request hooks are counted. Inlet hooks (e.g. "
+            "Company Context) always run before and are counted at any priority.",
         )
-        language: Literal["en", "de"] = Field(
-            default="en", description="Language of the warning and error messages."
+        language: Literal["auto", "en", "de"] = Field(
+            default="auto",
+            description="Language of the warning and error messages. auto = the user's interface language "
+            "(English if there is no translation).",
         )
         context_tokens: int = Field(
             default=32768,
@@ -186,7 +249,8 @@ class Filter:
         model_context_tokens: str = Field(
             default="",
             description="Optional per-model context sizes as comma-separated model_id=tokens pairs, "
-            "e.g. 'qwen3-32b=40960, llama3.1:8b=8192'. Other models use context_tokens.",
+            "e.g. 'qwen3-32b=40960, llama3.1:8b=8192'. A workspace model uses the size of its base model "
+            "unless it has its own entry. Other models use context_tokens.",
         )
         answer_reserve_tokens: int = Field(
             default=6000,
@@ -211,9 +275,11 @@ class Filter:
         self.valves = self.Valves()
         self._reported_thresholds: set[tuple[str, int, int]] = set()
 
-    def _context_tokens(self, model_id: str | None) -> int:
+    def _context_tokens(self, ids: list[str]) -> int:
         overrides = parse_model_overrides(self.valves.model_context_tokens)
-        return overrides.get(model_id or "", self.valves.context_tokens)
+        return next(
+            (overrides[model_id] for model_id in ids if model_id in overrides), self.valves.context_tokens
+        )
 
     def _report_threshold_too_high(self, model_id: str, threshold: int, usable: int) -> None:
         if (model_id, threshold, usable) in self._reported_thresholds:
@@ -234,21 +300,22 @@ class Filter:
         body: dict[str, Any],
         __event_emitter__: EventEmitter | None = None,
         __metadata__: dict[str, Any] | None = None,
+        __model__: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Check the final payload; warn via status event or abort with ContextLimitError."""
         model_id = body.get("model") or ""
-        usable = self._context_tokens(model_id) - self.valves.answer_reserve_tokens
+        usable = self._context_tokens(model_ids(body, __model__)) - self.valves.answer_reserve_tokens
         if usable <= 0:
             log.warning("Context Guard: answer_reserve_tokens >= context size, check is skipped")
             return body
-        used = estimate_tokens(body, self.valves.chars_per_token, self.valves.tokens_per_image)
+        used = estimate_tokens(body, self.valves.chars_per_token, self.valves.tokens_per_image, __metadata__)
         if used * 100 < self.valves.warn_percent * usable:
             return body
         threshold = await compaction_threshold(__metadata__)
         if threshold is not None and threshold >= usable:
             self._report_threshold_too_high(model_id, threshold, usable)
         percent = math.ceil(used * 100 / usable)
-        texts = TRANSLATIONS[self.valves.language]
+        texts = TRANSLATIONS[user_language(self.valves.language, __metadata__)]
         if used > usable:
             raise ContextLimitError(texts["blocked"].format(percent=percent))
         # Normal chat growth: compaction summarizes the chat before it reaches the limit.

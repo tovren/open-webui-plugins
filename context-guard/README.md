@@ -5,7 +5,9 @@ and warns or stops before the context window overflows.
 
 - Runs on the `request` hook (new in Open WebUI 0.11). It runs **after** document excerpts
   (RAG/files) have been injected and again after every tool-call round, so everything the model
-  will see is counted.
+  will see is counted: also the model's system prompt (Workspace → Models), which Open WebUI only
+  adds after this hook, and earlier reasoning that is sent back to the model (`reasoning_content`
+  for llama.cpp, `thinking` for Ollama).
 - Once the prompt uses `warn_percent` of the usable context, a status line appears above the
   answer. The usable context is the context size minus `answer_reserve_tokens`.
 - If the prompt would not fit, the request is stopped with a friendly explanation and next steps:
@@ -17,7 +19,9 @@ prompt, so the model quietly forgets earlier messages or documents.
 
 The token count is an **estimate** (characters ÷ `chars_per_token`, plus a flat amount per image
 and the JSON size of tool definitions and tool calls), not a real tokenizer. Lower
-`chars_per_token` to be more cautious.
+`chars_per_token` to be more cautious. Open WebUI's own estimate for Context Compaction uses 4
+characters per token (or the real token count of the last answer), so with the default of 3.5 the
+guard counts a little higher than Open WebUI does.
 
 ![Warning status line above the answer](images/warning.png)
 
@@ -33,10 +37,10 @@ enable it globally or per model, see [Installation](../README.md#installation). 
 
 | Valve | Default | Description |
 |---|---|---|
-| `priority` | `100` | Filter order (lower runs first). Keep it high so content added by other filters is counted |
-| `language` | `en` | Language of the warning and error messages (`en` or `de`) |
+| `priority` | `100` | Filter order (lower runs first). Only matters among the `request` hooks of several filters; keep it high so their changes are counted. Inlet hooks such as Company Context always run before and are counted at any priority |
+| `language` | `auto` | Language of the warning and error messages: `auto` (the user's interface language, English if there is no translation), `en` or `de` |
 | `context_tokens` | `32768` | Context size of your model: llama-server `--ctx-size`, vLLM `--max-model-len`, Ollama `num_ctx` |
-| `model_context_tokens` | _(empty)_ | Optional per-model sizes as `model_id=tokens` pairs, e.g. `qwen3-32b=40960, llama3.1:8b=8192`. Other models use `context_tokens` |
+| `model_context_tokens` | _(empty)_ | Optional per-model sizes as `model_id=tokens` pairs, e.g. `qwen3-32b=40960, llama3.1:8b=8192`. A workspace model (assistant) uses the size of its base model unless it has its own entry. Other models use `context_tokens` |
 | `answer_reserve_tokens` | `6000` | Tokens kept free for the answer, including reasoning |
 | `chars_per_token` | `3.5` | Characters per token for the estimate (English about 4, German about 3.5 to 4.3) |
 | `tokens_per_image` | `300` | Estimated tokens per attached image |
