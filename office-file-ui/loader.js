@@ -23,8 +23,8 @@
 	const GERMAN = (localStorage.locale || navigator.language || '').toLowerCase().startsWith('de');
 	const LABEL = GERMAN ? 'Herunterladen' : 'Download';
 	const FAILED = GERMAN ? 'Herunterladen fehlgeschlagen' : 'Download failed';
-	const DOWNLOAD_ICON =
-		'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="size-3.5" aria-hidden="true">' +
+	const downloadIcon = (size) =>
+		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="${size}" aria-hidden="true">` +
 		'<path d="M10.75 2.75a.75.75 0 0 0-1.5 0v8.614L6.295 8.235a.75.75 0 1 0-1.09 1.03l4.25 4.5a.75.75 0 0 0 1.09 0l4.25-4.5a.75.75 0 0 0-1.09-1.03l-2.955 3.129V2.75Z"/>' +
 		'<path d="M3.5 12.75a.75.75 0 0 0-1.5 0v2.5A2.75 2.75 0 0 0 4.75 18h10.5A2.75 2.75 0 0 0 18 15.25v-2.5a.75.75 0 0 0-1.5 0v2.5c0 .69-.56 1.25-1.25 1.25H4.75c-.69 0-1.25-.56-1.25-1.25v-2.5Z"/>' +
 		'</svg>';
@@ -69,12 +69,15 @@
 		}
 	};
 
+	const officeType = (name) => name.match(PREVIEW_ONLY)?.[1]?.toLowerCase();
+
 	const authHeaders = () => (localStorage.token ? { Authorization: `Bearer ${localStorage.token}` } : {});
 
 	// ------------------------------------------------------------------ file ids from the chat --
 
 	// The chips carry no file id in the page, so it is looked up in the saved chat.
-	let chatCache = { id: null, messages: {}, loading: null, loadedAt: 0 };
+	const chatState = (id, messages = {}, loadedAt = 0) => ({ id, messages, loading: null, loadedAt });
+	let chatCache = chatState(null);
 	// chips without a known file, by message, name and position: reloads so far and when the next one is due
 	let misses = new Map();
 	let retryTimer = null;
@@ -84,14 +87,13 @@
 		return match && !match[1].startsWith('local') ? decode(match[1]) : null;
 	};
 
-	const loadChat = async (chatId) => {
-		if (chatCache.loading) return chatCache.loading;
+	const loadChat = (chatId) => {
 		chatCache.loading = (async () => {
 			try {
 				const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, { headers: authHeaders() });
 				if (!response.ok) return false;
 				const chat = await response.json();
-				chatCache = { id: chatId, messages: chat?.chat?.history?.messages ?? {}, loading: null, loadedAt: Date.now() };
+				chatCache = chatState(chatId, chat?.chat?.history?.messages ?? {}, Date.now());
 				return true;
 			} catch (error) {
 				console.warn('office-file-ui: loading the chat failed', error);
@@ -171,7 +173,7 @@
 		control.className =
 			'shrink-0 -mr-1 p-1 rounded-lg text-gray-500 dark:text-gray-400 hover:text-gray-900 ' +
 			'dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/10 transition';
-		control.innerHTML = DOWNLOAD_ICON;
+		control.innerHTML = downloadIcon('size-3.5');
 		return control;
 	};
 
@@ -183,14 +185,14 @@
 		if (chip.getAttribute(MARK) !== 'chip') chip.setAttribute(MARK, 'chip');
 		const box = chip.parentElement;
 		if (box?.children.length === 1 && box.getAttribute(MARK) !== 'chip-box') box.setAttribute(MARK, 'chip-box');
-		const type = name.match(PREVIEW_ONLY)?.[1]?.toLowerCase();
+		const type = officeType(name);
 		if (type && chip.getAttribute(`${MARK}-type`) !== type) chip.setAttribute(`${MARK}-type`, type);
 	};
 
 	const decorateAnswerFiles = () => {
 		const chatId = currentChatId();
 		if (chatId && chatCache.id !== chatId) {
-			chatCache = { id: chatId, messages: {}, loading: null, loadedAt: 0 };
+			chatCache = chatState(chatId);
 			misses = new Map();
 		}
 		const missing = [];
@@ -238,19 +240,14 @@
 			if (Number.isFinite(next)) retryTimer = setTimeout(schedule, next - now);
 			return;
 		}
-		for (const key of due) {
-			const miss = misses.get(key);
-			miss.tries += 1;
-			miss.at = now + (RELOAD_DELAYS_MS[miss.tries] ?? 0);
-		}
 		loadChat(chatId).then((loaded) => {
-			if (!loaded) {
-				for (const key of due) {
-					const miss = misses.get(key);
-					if (!miss) continue; // another chat by now
-					miss.tries -= 1; // a failed request (network, 5xx) is no try; ask again in a while
-					miss.at = Date.now() + FAILED_LOAD_DELAY_MS;
-				}
+			for (const key of due) {
+				const miss = misses.get(key);
+				if (!miss) continue; // another chat by now
+				if (loaded) {
+					miss.tries += 1;
+					miss.at = now + (RELOAD_DELAYS_MS[miss.tries] ?? 0);
+				} else miss.at = Date.now() + FAILED_LOAD_DELAY_MS; // a failed request (network, 5xx) is no try
 			}
 			schedule();
 		});
@@ -330,7 +327,8 @@
 			// "Content" | "Preview" bar: the first bar of exactly two tab buttons. "Content" is selected when the
 			// view opens; click "Preview" and hide the bar only while "Preview" is really the selected tab, so the
 			// bar stays usable if Open WebUI changes or reorders its tabs.
-			if (PREVIEW_ONLY.test(name)) {
+			const type = officeType(name);
+			if (type) {
 				const bar = [...modal.querySelectorAll('div.border-b')].find(
 					(div) => div.children.length === 2 && [...div.children].every((c) => c.matches('button[type="button"]'))
 				);
@@ -339,7 +337,7 @@
 					bar.children[1].click(); // "Preview"
 					requestAnimationFrame(() => syncTabs(bar)); // Open WebUI updates the tabs before the next frame
 				} else if (bar?.getAttribute(MARK) === 'tabs') syncTabs(bar);
-				hideExtractedTextInfo(modal, /\.xlsx$/i.test(name));
+				hideExtractedTextInfo(modal, type === 'xlsx');
 			}
 
 			// download button next to the close button
@@ -349,7 +347,7 @@
 				button.dataset.fileId = modal.dataset.officeFileId;
 				button.dataset.fileName = name;
 				button.className = 'mr-2 text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white transition';
-				button.innerHTML = DOWNLOAD_ICON.replace('size-3.5', 'size-5');
+				button.innerHTML = downloadIcon('size-5');
 				header.lastElementChild.classList.add('flex', 'items-center');
 				header.lastElementChild.prepend(button);
 			}
