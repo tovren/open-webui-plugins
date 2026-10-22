@@ -284,6 +284,11 @@ class Schema(BaseModel):
         return data
 
 
+def blank(value: Any) -> bool:
+    """An empty cell: None, or a text of spaces only."""
+    return value is None or not str(value).strip()
+
+
 def has_content(value: Any) -> bool:
     if isinstance(value, str):
         return bool(value.strip())
@@ -1231,9 +1236,14 @@ def tidy_title(text: str) -> str:
     return title
 
 
+def _text_key(text: str) -> str:
+    """The letters and digits of a text without case, for comparing a title with a heading."""
+    return re.sub(r"\W+", "", to_plain(text)).casefold()
+
+
 def similar_text(a: str, b: str) -> bool:
     """One text contains the other, or they differ only slightly (a title repeated as a heading)."""
-    ka, kb = (re.sub(r"\W+", "", to_plain(t)).casefold() for t in (a, b))
+    ka, kb = _text_key(a), _text_key(b)
     if not ka or not kb:
         return False
     return (min(len(ka), len(kb)) >= 12 and (ka in kb or kb in ka)) or difflib.SequenceMatcher(
@@ -1242,10 +1252,7 @@ def similar_text(a: str, b: str) -> bool:
 
 
 def same_text(a: str, b: str) -> bool:
-    def key(text: str) -> str:
-        return re.sub(r"\W+", "", to_plain(text)).casefold()
-
-    return key(a) == key(b)
+    return _text_key(a) == _text_key(b)
 
 
 def split_level(item: str) -> tuple[int, str]:
@@ -1347,7 +1354,7 @@ def is_empty_block(block: WordBlock) -> bool:
     if block.type in ("bullets", "numbered"):
         return not any(item.strip() for item in block.items)
     if block.type == "table":
-        return not any(str(cell).strip() for row in block.rows for cell in row)
+        return all(blank(cell) for row in block.rows for cell in row)
     return False
 
 
@@ -1483,7 +1490,7 @@ MAX_TABLE_COLUMN_CHARS = 60
 
 def table_columns(rows: list[list[str]]) -> int:
     """Number of columns: the header's, or more if a row has more non-empty cells (trailing empty cells don't count)."""
-    used = [max((i + 1 for i, cell in enumerate(row) if str(cell).strip()), default=0) for row in rows]
+    used = [max((i + 1 for i, cell in enumerate(row) if not blank(cell)), default=0) for row in rows]
     return max(len(rows[0]), *used, 1)
 
 
@@ -1492,7 +1499,7 @@ def number_columns(rows: list[list[str]], columns: int) -> list[bool]:
     such as '-' aside); Word and slide tables align them right."""
     result = []
     for c in range(columns):
-        texts = [to_plain(str(row[c])) for row in rows[1:] if c < len(row) and str(row[c]).strip()]
+        texts = [to_plain(str(row[c])) for row in rows[1:] if c < len(row) and not blank(row[c])]
         texts = [text for text in texts if text.lower() not in PLACEHOLDERS]
         result.append(bool(texts) and all(parse_number_text(text) is not None for text in texts))
     return result
@@ -2576,7 +2583,7 @@ def convert_value(value: str | float | None, column_type: str, decimal_comma: bo
     JSON numbers stay numbers in text columns too, so sums and charts over them work. A time is the fraction of a
     day, as in Excel.
     """
-    if value is None or (isinstance(value, str) and not value.strip()):
+    if blank(value):
         return None, True
     if column_type == "text":
         if isinstance(value, float):
@@ -2811,7 +2818,7 @@ def operation_kind(operator: str, a: str, b: str, left: FormulaNode, right: Form
 
 def text_kind(values: list[Any]) -> str:
     """What a text column holds for formulas: Excel computes with numbers, dates and times written as text too."""
-    values = [v for v in values if v is not None and str(v).strip()]
+    values = [v for v in values if not blank(v)]
     if not values:
         return "unknown"
     if all(isinstance(v, int | float) or parse_number_text(str(v)) is not None for v in values):
@@ -2896,11 +2903,13 @@ class Book:
     def copies_column_formula(self, s: int, r: int, c: int) -> bool:
         """Whether the formula of a cell in a formula column is the column formula written out for a row: the same
         but for the row numbers ('=B2*C2', also '=B3*C3' in another row)."""
-        column = [t._replace(text="", row="") if t.kind == "cell" else t for t in self.parsed(self.columns[(s, c)])[0]]
-        cell = [t._replace(text="", row="") if t.kind == "cell" else t for t in self.parsed(self.cells[(s, r, c)])[0]]
-        return [(t.kind, t.text.upper(), t.sheet, t.column) for t in column] == [
-            (t.kind, t.text.upper(), t.sheet, t.column) for t in cell
-        ]
+
+        def pattern(formula: str) -> list[tuple[str, str, str, str]]:  # cells without their rows
+            return [
+                (t.kind, "" if t.kind == "cell" else t.text.upper(), t.sheet, t.column) for t in self.parsed(formula)[0]
+            ]
+
+        return pattern(self.columns[(s, c)]) == pattern(self.cells[(s, r, c)])
 
     def trailing_sum_rows(self, s: int) -> int:
         """How many rows at the end are sum rows (or empty rows between them): charts and the filter end above."""
@@ -2908,7 +2917,7 @@ class Book:
         for r in range(len(rows) - 1, 0, -1):
             if self.sum_row(s, r):
                 count = len(rows) - r
-            elif any(v is not None and str(v).strip() for v in rows[r]):
+            elif any(not blank(v) for v in rows[r]):
                 break
         return count
 
@@ -3235,7 +3244,7 @@ def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: se
     sheet, where, rows = book.sheets[s], book.where(s), book.sheets[s].rows
     formulas = {c: f for (t, c), f in book.columns.items() if t == s}
     problems: list[str] = []
-    filled = [any(row[c] is not None and str(row[c]).strip() for row in rows) for c in range(len(sheet.columns))]
+    filled = [any(not blank(row[c]) for row in rows) for c in range(len(sheet.columns))]
     for c, column in enumerate(sheet.columns):
         header = column.header.strip()
         name = f"{where}.columns[{c}] ('{header}')"
@@ -3248,8 +3257,7 @@ def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: se
             )
         uses = [what for what, given in (("the total", column.total != "none"), ("the formulas", (s, c) in used),
                                          ("the chart", (s, c) in charted)) if given]  # fmt: skip
-        values = [(r, row[c]) for r, row in enumerate(rows)
-                  if row[c] is not None and str(row[c]).strip() and (s, r, c) not in book.cells]  # fmt: skip
+        values = [(r, row[c]) for r, row in enumerate(rows) if not blank(row[c]) and (s, r, c) not in book.cells]
         texts = [(r, v) for r, v in values if not convert_value(v, column.type, book.decimal_comma)[1]]
         words = [(r, v) for r, v in texts if str(v).strip().lower() not in PLACEHOLDERS]
         if column.type in NUMBER_TYPES:
@@ -3394,20 +3402,6 @@ def _reference_problems(book: Book) -> list[str]:
     """Single cells of other sheets that are empty: models count the rows there wrong (row 1 is the header), and
     an empty cell silently counts as 0. Ranges may reach beyond the data, e.g. in SUMIF."""
     sheets = book.sheets
-
-    def filled(t: int, row: int, column: int) -> bool:
-        target = sheets[t]
-        if not 1 <= column <= len(target.columns):
-            return False
-        if row == 1:
-            return bool(target.columns[column - 1].header.strip())
-        if row == len(target.rows) + 2 and has_totals(target):  # the total row, with its label in column A
-            return target.columns[column - 1].total != "none" or column == 1
-        if not 2 <= row <= len(target.rows) + 1:
-            return False
-        value = target.rows[row - 2][column - 1]
-        return (t, column - 1) in book.columns or (value is not None and str(value).strip() != "")
-
     problems: list[str] = []
     for s, _, _, place, formula in book.formulas():
         tokens, tree = book.parsed(formula)
@@ -3415,10 +3409,10 @@ def _reference_problems(book: Book) -> list[str]:
         for i, token in enumerate(tokens):
             if token.kind != "cell" or i in in_ranges or not token.sheet or book.target(token, s)[0] == s:
                 continue
-            t, column = book.names.index(token.sheet), _column_number(token.column)
+            t, c = book.target(token, s)
             target, cell = sheets[t], f"'{token.sheet}'!{token.column}{token.row}"
             if token.row == "{row}":
-                if not any(filled(t, row, column) for row in range(2, len(target.rows) + 2)):
+                if not any(_cell_filled(book, t, row, c, inputs=False) for row in range(2, len(target.rows) + 2)):
                     problems.append(
                         f"{place}: {cell} is empty: '{token.sheet}' has no values in column {token.column} (it has "
                         f"the columns A to {get_column_letter(len(target.columns))})"
@@ -3428,7 +3422,7 @@ def _reference_problems(book: Book) -> list[str]:
                         f"{place}: {cell} is empty in the last rows: '{token.sheet}' has {len(target.rows)} "
                         f"data rows, this sheet {len(sheets[s].rows)}"
                     )
-            elif not filled(t, int(token.row), column):
+            elif not _cell_filled(book, t, int(token.row), c, inputs=False):
                 total = f", total row {len(target.rows) + 2}" if has_totals(target) else ""
                 problems.append(
                     f"{place}: {cell} is an empty cell. On '{token.sheet}', row 1 is the header and the data "
@@ -3499,16 +3493,17 @@ def _miscounted(book: Book, s: int, row: int, c: int) -> bool:
     r = row - 2
     if not 0 <= r < len(sheet.rows) or (s, c) in book.columns:
         return True
-    return not any(v is not None and str(v).strip() for v in sheet.rows[r]) and not book.sum_row(s, r)
+    return all(blank(v) for v in sheet.rows[r]) and not book.sum_row(s, r)
 
 
 def _row_of(token: FormulaToken, own_row: int) -> int:
     return own_row if token.row == "{row}" else int(token.row)
 
 
-def _cell_filled(book: Book, s: int, row: int, c: int) -> bool:
+def _cell_filled(book: Book, s: int, row: int, c: int, inputs: bool = True) -> bool:
     """Whether a cell of sheet s (row as in Excel, column from 0) holds something: the header, a value, a formula
-    of the cell, the column formula with values to compute with, or the total row the tool adds."""
+    of the cell, the column formula with values to compute with (any column formula with `inputs` False), or the
+    total row the tool adds."""
     sheet = book.sheets[s]
     if not 0 <= c < len(sheet.columns):
         return False
@@ -3522,9 +3517,8 @@ def _cell_filled(book: Book, s: int, row: int, c: int) -> bool:
     if (s, r, c) in book.cells:
         return True
     if (s, c) in book.columns:  # with no values in the columns it uses, the formula gives 0 (or an error)
-        return book.has_inputs(s, r, c)  # the writer leaves it out of a sum row only without inputs
-    value = sheet.rows[r][c]
-    return value is not None and str(value).strip() != ""
+        return not inputs or book.has_inputs(s, r, c)  # the writer leaves it out of a sum row only without inputs
+    return not blank(sheet.rows[r][c])
 
 
 def _row_labels(book: Book, s: int) -> str:
@@ -3534,8 +3528,9 @@ def _row_labels(book: Book, s: int) -> str:
     texts = [c for c, column in enumerate(sheet.columns) if column.type == "text" and (s, c) not in book.columns]
     count = {c: sum(isinstance(row[c], str) and bool(row[c].strip()) for row in sheet.rows) for c in texts}
     c = max(texts, key=lambda c: (count[c], -c)) if texts else 0
-    labels = [f"{r + 2}={to_plain(str(row[c]).strip())[:20]}" for r, row in enumerate(sheet.rows[:30])
-              if row[c] is not None and str(row[c]).strip()]  # fmt: skip
+    labels = [
+        f"{r + 2}={to_plain(str(row[c]).strip())[:20]}" for r, row in enumerate(sheet.rows[:30]) if not blank(row[c])
+    ]
     more = ", …" if len(sheet.rows) > 30 else ""
     return "rows: " + ", ".join(labels) + more if labels else "the rows have no labels"
 
@@ -3665,7 +3660,7 @@ def _total_row_problem(book: Book, s: int, formulas: dict[int, str]) -> str | No
     if not isinstance(label, str) or not TOTAL_ROW_LABEL_RE.fullmatch(to_plain(label).strip()):
         return None
     numbers = bool(formulas) or any(c.total != "none" or c.type in NUMBER_TYPES for c in sheet.columns[1:])
-    others = [v for c, v in enumerate(rows[-1]) if c > 0 and c not in formulas and v is not None and str(v).strip()]
+    others = [v for c, v in enumerate(rows[-1]) if c > 0 and c not in formulas and not blank(v)]
     totals = any(c.total != "none" for c in sheet.columns)
     last = len(rows) - 1
     own = all((s, last, c) in book.cells or not book.has_inputs(s, last, c) for c in formulas) and (
