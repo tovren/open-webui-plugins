@@ -143,10 +143,9 @@ def missing_system_prompt_chars(messages: list[Any], metadata: dict[str, Any] | 
     current = _text(system.get("content")) if system else ""
     if current.startswith(prompt):
         return 0
-    if current and prompt.endswith("\n" + current):
-        return len(prompt) - len(current)
-    # the system message starts with the part after one of the prompt's line breaks (RAG context added)
-    index = prompt.find("\n")
+    # the system message starts with the part after one of the prompt's line breaks (RAG context
+    # added); a part longer than the system message cannot match, so the search starts after them
+    index = prompt.find("\n", max(0, len(prompt) - len(current) - 1))
     while index >= 0:
         if current.startswith(prompt[index + 1 :]):
             return index + 1
