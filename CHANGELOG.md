@@ -2,6 +2,19 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
+## 2026-10-22, third update
+
+Response Export 1.2.2. The code of Context Guard, Reasoning Toggle and Office File UI was tidied up
+without a change in behavior; updating them is optional. Company Context and Office Documents are
+unchanged.
+
+### Response Export 1.2.2
+
+- Excel uses the same font as Word and PDF: a name in the `font` valve that is not a valid font name
+  (or has extra spaces) now gives Calibri there too, instead of being written into the file as it is.
+- Large files (a Word file on a template with images) download faster: the browser decodes them in a
+  plain loop instead of calling a function for every byte.
+
 ## 2026-10-22, second update
 
 Office Documents 0.3.2. The other plugins are unchanged.

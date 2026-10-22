@@ -2,7 +2,7 @@
 title: Response Export
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.2.1
+version: 1.2.2
 license: MIT
 required_open_webui_version: 0.11.4
 description: Adds four buttons below every assistant message - export as Word (.docx), export its tables as Excel (.xlsx), download as PDF, and open as an e-mail draft. Files are built in memory and handed straight to the browser; nothing is stored on the server.
@@ -347,6 +347,14 @@ def is_safe_url(url: str) -> bool:
     return url.strip().lower().startswith(SAFE_LINK_PREFIXES)
 
 
+def word_link(run: Run) -> tuple[str, str | None]:
+    """The text of a run and its link target if Word and PDF make it clickable, else the target stays in the
+    text as 'text (url)'."""
+    if run.url and is_word_link(run.url):
+        return run.text, run.url.strip()
+    return _run_text(run, with_url=True), None
+
+
 def is_word_link(url: str) -> bool:
     """Links Word gets as real hyperlinks (like Office Documents): http, https and plain mailto links."""
     url = url.strip()
@@ -457,28 +465,30 @@ def _parse_code(lines: list[str], i: int, fence: str) -> tuple[CodeBlock, int]:
     return CodeBlock("\n".join(code)), i + 1
 
 
+def _block_start(lines: list[str], i: int) -> tuple[str, Any]:
+    """The kind of block line i opens, in order of precedence ("- - -" is a rule, not a list item), and its
+    match: blank, fence, table, heading, rule, list, quote or paragraph."""
+    line = lines[i]
+    if not line.strip():
+        return "blank", None
+    if fence := FENCE_RE.match(line):
+        return "fence", fence
+    if (aligns := _table_alignments(lines, i)) is not None:
+        return "table", aligns
+    if heading := HEADING_RE.match(line):
+        return "heading", heading
+    if RULE_RE.match(line):
+        return "rule", None
+    if item := LIST_ITEM_RE.match(line):
+        return "list", item
+    if QUOTE_RE.match(line):
+        return "quote", None
+    return "paragraph", None
+
+
 def _starts_block(lines: list[str], i: int) -> bool:
     """True if line i is blank or opens a block, i.e. ends a running paragraph."""
-    line = lines[i]
-    return bool(
-        not line.strip()
-        or FENCE_RE.match(line)
-        or HEADING_RE.match(line)
-        or RULE_RE.match(line)
-        or LIST_ITEM_RE.match(line)
-        or QUOTE_RE.match(line)
-        or _table_alignments(lines, i) is not None
-    )
-
-
-def _list_line(lines: list[str], i: int) -> re.Match[str] | None:
-    """Match line i as a list item, unless a block that takes precedence starts there."""
-    line = lines[i]
-    if FENCE_RE.match(line) or HEADING_RE.match(line) or RULE_RE.match(line):
-        return None
-    if _table_alignments(lines, i) is not None:
-        return None
-    return LIST_ITEM_RE.match(line)
+    return _block_start(lines, i)[0] != "paragraph"
 
 
 def _add_list_item(lists: list[List], match: re.Match[str], text: str) -> None:
@@ -503,7 +513,10 @@ def _parse_lists(lines: list[str], i: int, match: re.Match[str]) -> tuple[list[L
         _add_list_item(lists, match, text)
         while i < len(lines) and not lines[i].strip():
             i += 1
-        if i >= len(lines) or not (match := _list_line(lines, i)):
+        if i >= len(lines):
+            return lists, i
+        kind, match = _block_start(lines, i)
+        if kind != "list":
             return lists, i
 
 
@@ -513,33 +526,33 @@ def parse_blocks(markdown_text: str) -> list[Block]:
     blocks: list[Block] = []
     i = 0
     while i < len(lines):
-        line = lines[i]
-        if not line.strip():
+        kind, match = _block_start(lines, i)
+        if kind == "blank":
             i += 1
-        elif fence := FENCE_RE.match(line):
-            code, i = _parse_code(lines, i, fence["fence"])
+        elif kind == "fence":
+            code, i = _parse_code(lines, i, match["fence"])
             blocks.append(code)
-        elif (aligns := _table_alignments(lines, i)) is not None:
-            table, i = _parse_table(lines, i, aligns)
+        elif kind == "table":
+            table, i = _parse_table(lines, i, match)
             blocks.append(table)
-        elif heading := HEADING_RE.match(line):
-            if heading["text"]:
-                blocks.append(Heading(len(heading["hashes"]), heading["text"]))
+        elif kind == "heading":
+            if match["text"]:
+                blocks.append(Heading(len(match["hashes"]), match["text"]))
             i += 1
-        elif RULE_RE.match(line):
+        elif kind == "rule":
             blocks.append(Rule())
             i += 1
-        elif item_match := LIST_ITEM_RE.match(line):
-            lists, i = _parse_lists(lines, i, item_match)
+        elif kind == "list":
+            lists, i = _parse_lists(lines, i, match)
             blocks.extend(lists)
-        elif QUOTE_RE.match(line):
+        elif kind == "quote":
             quote = Quote([])
             while i < len(lines) and (quote_match := QUOTE_RE.match(lines[i])):
                 quote.lines.append(quote_match["text"])
                 i += 1
             blocks.append(quote)
         else:
-            paragraph = [line.strip()]
+            paragraph = [lines[i].strip()]
             i += 1
             while i < len(lines) and not _starts_block(lines, i):
                 paragraph.append(lines[i].strip())
@@ -593,6 +606,10 @@ class Design:
     def band(self) -> str:  # every second table row
         return mix(self.accent, WHITE, 0.93)
 
+    def row_fill(self, index: int) -> str | None:
+        """Header row in the accent colour, every second row after it tinted."""
+        return self.accent if index == 0 else self.band if index % 2 == 0 else None
+
 
 DEFAULT_DESIGN = Design()
 
@@ -619,7 +636,7 @@ PAPER_SIZES = {"a4": (Cm(21), Cm(29.7)), "letter": (Cm(21.59), Cm(27.94))}
 MAX_TEMPLATE_BYTES = 20_000_000
 # With a template, its styles for these are replaced: they get the design. The content uses Body Text, not the
 # template's Normal style, which its header and footer build on.
-LIST_STYLES = ("List Bullet", "List Bullet 2", "List Number", "List Number 2")
+LIST_STYLES = (*BULLET_LIST_STYLES, *ORDERED_LIST_STYLES)
 TEMPLATE_STYLES = ("Body Text", "Heading 1", "Heading 2", "Heading 3", "Heading 4", "Quote", *LIST_STYLES)
 # Settings of a template that would follow every document: a mail merge (Word asks to run its SQL
 # command), write protection, and the path of the template it was made from (Word looks for it, e.g. on a
@@ -830,12 +847,13 @@ class DocxWriter:
             settings_part = self.doc.part.part_related_by(RELATIONSHIP_TYPE.SETTINGS)
         except KeyError:
             settings_part = None  # a file without settings
-        for tag in TEMPLATE_SETTINGS_REMOVED if settings_part is not None else ():
-            for element in settings_part.element.findall(qn(tag)):
-                settings_part.element.remove(element)
-                for node in element.iter():
-                    if node.get(qn("r:id")):
-                        settings_part.drop_rel(node.get(qn("r:id")))
+        if settings_part is not None:
+            for tag in TEMPLATE_SETTINGS_REMOVED:
+                for element in settings_part.element.findall(qn(tag)):
+                    settings_part.element.remove(element)
+                    for node in element.iter():
+                        if node.get(qn("r:id")):
+                            settings_part.drop_rel(node.get(qn("r:id")))
         core = self.doc.core_properties  # the template's author, title ... are not the document's
         core.author = core.last_modified_by = core.subject = core.keywords = core.comments = core.category = (
             ""
@@ -888,18 +906,16 @@ class DocxWriter:
         defaults, the theme fonts and the character styles linked to the paragraph styles, and they may have
         no Symbol font for Word's bullets (boxes instead of dots). All get the design."""
         font, styles = self.design.font, self.doc.styles
-        for fonts in (
-            styles.element.xpath("w:docDefaults/w:rPrDefault/w:rPr/w:rFonts") if not self.template else ()
-        ):
-            for attr in THEME_FONT_ATTRS:
-                fonts.attrib.pop(qn(attr), None)
-            for attr in ("w:ascii", "w:hAnsi", "w:cs"):
-                fonts.set(qn(attr), font)
-        for part in (
-            self.doc.part.package.iter_parts() if not self.template else ()
-        ):  # the template's header and
-            if str(part.partname).startswith("/word/theme/"):  # footer may use its theme fonts
-                part._blob = re.sub(THEME_FONTS_RE.encode(), lambda m: m[1] + font.encode() + m[2], part.blob)
+        if not self.template:  # the template's header and footer may use its defaults and theme fonts
+            for fonts in styles.element.xpath("w:docDefaults/w:rPrDefault/w:rPr/w:rFonts"):
+                for attr in THEME_FONT_ATTRS:
+                    fonts.attrib.pop(qn(attr), None)
+                for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+                    fonts.set(qn(attr), font)
+            theme_fonts = re.compile(THEME_FONTS_RE.encode())
+            for part in self.doc.part.package.iter_parts():
+                if str(part.partname).startswith("/word/theme/"):
+                    part._blob = theme_fonts.sub(lambda m: m[1] + font.encode() + m[2], part.blob)
         for style in styles:
             link = style.element.find(qn("w:link"))
             if style.type != WD_STYLE_TYPE.PARAGRAPH or link is None or style.element.rPr is None:
@@ -977,7 +993,7 @@ class DocxWriter:
                 header_flag = OxmlElement("w:tblHeader")
                 header_flag.set(qn("w:val"), "true")
                 doc_row._tr.get_or_add_trPr().append(header_flag)
-            fill = self.design.accent if row_index == 0 else self.design.band if row_index % 2 == 0 else None
+            fill = self.design.row_fill(row_index)
             for cell, text, align in zip(doc_row.cells, row, table.aligns, strict=True):
                 paragraph = cell.paragraphs[0]
                 if self.template:
@@ -993,8 +1009,8 @@ class DocxWriter:
 
     def _add_runs(self, paragraph: DocxParagraph, runs: list[Run], color: str | None = None) -> None:
         for run in runs:
-            link = run.url if run.url and is_word_link(run.url) else None
-            docx_run = paragraph.add_run(run.text if link else _run_text(run, with_url=True))
+            text, link = word_link(run)
+            docx_run = paragraph.add_run(text)
             docx_run.bold = run.bold or None
             docx_run.italic = run.italic or None
             if color:
@@ -1004,7 +1020,7 @@ class DocxWriter:
             if run.code:
                 docx_run.font.name = CODE_FONT
             if link:
-                self._make_link(paragraph, docx_run, link.strip(), color or self.design.accent)
+                self._make_link(paragraph, docx_run, link, color or self.design.accent)
 
     @staticmethod
     def _make_link(paragraph: DocxParagraph, docx_run: Any, url: str, color: str) -> None:
@@ -1325,7 +1341,7 @@ PDF_WIDTHS = {
 # Characters the standard fonts lack (they cover cp1252 only): common ones get a stand-in, emoji are
 # dropped, other characters lose their accents ("č" -> "c") or become "?".
 PDF_REPLACEMENTS = {
-    "\t": " ", "\u00ad": "", "\u00a0": "\u00a0", "\u2007": "\u00a0", "\u202f": "\u00a0",  # no-break spaces
+    "\t": " ", "\u00ad": "", "\u2007": "\u00a0", "\u202f": "\u00a0",  # no-break spaces
     "\u2010": "-", "\u2011": "-", "\u2012": "–", "\u2015": "—", "\u2212": "-", "\u2043": "-",  # dashes
     "′": "'", "″": '"', "⁄": "/", "∕": "/", "∗": "*", "∙": "·", "⋅": "·",
     "←": "<-", "→": "->", "↔": "<->", "⇐": "<=", "⇒": "=>", "⇔": "<=>",
@@ -1357,10 +1373,10 @@ def _pdf_char(char: str) -> str:
         return char
     if category in ("Cc", "Cf", "Mn", "Me") or any(low <= ord(char) <= high for low, high in EMOJI_RANGES):
         return ""  # control and format characters (zero-width space ...), variation selectors, emoji
+    if _cp1252(char):  # also the no-break space, which keeps words together
+        return char
     if category.startswith("Z"):
         return " "
-    if _cp1252(char):
-        return char
     folded = "".join(
         PDF_REPLACEMENTS.get(part, part if _cp1252(part) and not unicodedata.combining(part) else "")
         for part in unicodedata.normalize("NFKD", char)
@@ -1427,10 +1443,10 @@ def pdf_words(runs: list[Run], size: float, color: str, link_color: str) -> list
     word: PdfWord | None = None
     space: tuple[PdfStyle, str] | None = None
     for run in runs:
-        link = run.url.strip() if run.url and is_word_link(run.url) else None
+        text, link = word_link(run)
         font = PDF_FONTS[run.bold, run.italic, run.code]
         style = PdfStyle(font, size, link_color if link else color, link, run.strike)
-        for token in SPACE_RE.split(pdf_safe_text(run.text if link else _run_text(run, with_url=True))):
+        for token in SPACE_RE.split(pdf_safe_text(text)):
             if token == "\n":
                 words.append(None)
                 word = space = None
@@ -1615,12 +1631,10 @@ class PdfWriter:
         lines = wrap_words(pdf_words(runs, size, color, self.design.accent), self.right - self.left - indent)
         self._start(before, height + keep)
         room = int((self.y - self.bottom) / height + 1e-6)  # lines that fit on this page
-        if 0 < room < len(lines) and self.y < self.top:  # no single line at the bottom or top of a page
-            if len(lines) - room == 1:
-                room = room - 1 if room > 2 else 0
-            if room == 1:
+        if 0 < room < len(lines) and self.y < self.top:  # at least two lines on each side of a page break
+            room = min(room, len(lines) - 2)
+            if room < 2:
                 room = 0
-            if not room:
                 self._new_page()
         for n, line in enumerate(lines):
             if n == room and n:
@@ -1697,8 +1711,7 @@ class PdfWriter:
         first = min(heights[1], 3 * height + 2 * PDF_CELL_PAD_Y) if len(heights) > 1 else 0.0
         self._start(6, heights[0] + first)  # the header row not alone at the bottom of a page
         for r, row in enumerate(rows):
-            fill = accent if r == 0 else self.design.band if r % 2 == 0 else None
-            self._table_row(row, widths, aligns, size, fill, header if r else None)
+            self._table_row(row, widths, aligns, size, self.design.row_fill(r), header if r else None)
         self._stroke(self.left, self.left + sum(widths), self.y, 1, accent)
         self.after = 10
 
@@ -1898,7 +1911,9 @@ link.remove();
 
 def download_js(data: bytes, filename: str, mime: str) -> str:
     return f"""
-const bytes = Uint8Array.from(atob({json.dumps(base64.b64encode(data).decode())}), (c) => c.charCodeAt(0));
+const text = atob({json.dumps(base64.b64encode(data).decode())});
+const bytes = new Uint8Array(text.length);
+for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
 const url = URL.createObjectURL(new Blob([bytes], {{ type: {json.dumps(mime)} }}));
 {_click_link_js("url", filename)}
 setTimeout(() => URL.revokeObjectURL(url), 10000);
@@ -2114,7 +2129,9 @@ class Action:
         if not tables:
             await export.browser.notify("warning", export.texts["no_tables"])
             return
-        data = await asyncio.to_thread(tables_to_xlsx, tables, export.texts["sheet_name"], self.valves.font)
+        data = await asyncio.to_thread(
+            tables_to_xlsx, tables, export.texts["sheet_name"], self._design().font
+        )
         await export.browser.download(data, f"{self._file_stem(blocks, export)}.xlsx", XLSX_MIME)
 
     async def _export_pdf(self, content: str, export: Export) -> None:
