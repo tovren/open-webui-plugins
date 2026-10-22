@@ -719,18 +719,25 @@ def json_error_hint(text: str, pos: int, msg: str) -> str:
     return 'check the quotes and brackets at the mark; a " inside a text must be written as \\"'
 
 
-def open_brackets(text: str, end: int) -> str:
-    """The closing brackets that are still owed at position `end`, innermost last ('}]}' for '{"a": [{')."""
-    stack: list[str] = []
+def _brackets(text: str) -> Iterator[tuple[int, str]]:
+    """The brackets of a JSON text with their positions, leaving out those inside strings."""
     in_string = escaped = False
-    for char in text[:end]:
+    for i, char in enumerate(text):
         if in_string:
             escaped, in_string = (False, True) if escaped else (char == "\\", char != '"')
         elif char == '"':
             in_string = True
-        elif char in "[{":
+        elif char in "[]{}":
+            yield i, char
+
+
+def open_brackets(text: str, end: int) -> str:
+    """The closing brackets that are still owed at position `end`, innermost last ('}]}' for '{"a": [{')."""
+    stack: list[str] = []
+    for _, char in _brackets(text[:end]):
+        if char in "[{":
             stack.append("]" if char == "[" else "}")
-        elif char in "]}" and stack and stack[-1] == char:
+        elif stack and stack[-1] == char:
             stack.pop()
     return "".join(stack)
 
@@ -1042,15 +1049,10 @@ def wrap_array_run(text: str, pos: int) -> str | None:
 def _object_start(text: str, close: int) -> int | None:
     """The position of the '{' that the '}' at `close` closes."""
     starts: list[int] = []
-    in_string = escaped = False
-    for i, char in enumerate(text[: close + 1]):
-        if in_string:
-            escaped, in_string = (False, True) if escaped else (char == "\\", char != '"')
-        elif char == '"':
-            in_string = True
-        elif char in "[{":
+    for i, char in _brackets(text[: close + 1]):
+        if char in "[{":
             starts.append(i)
-        elif char in "]}" and starts:
+        elif starts:
             start = starts.pop()
             if i == close:
                 return start if char == "}" else None
@@ -1062,21 +1064,18 @@ def _close_brackets(text: str) -> tuple[str, int]:
     text and the number of brackets added at the end."""
     out: list[str] = []
     stack: list[str] = []
-    in_string = escaped = False
-    for char in text:
-        if in_string:
-            escaped, in_string = (False, True) if escaped else (char == "\\", char != '"')
-        elif char == '"':
-            in_string = True
-        elif char in "[{":
+    copied = 0  # the text up to here is in out
+    for i, char in _brackets(text):
+        if char in "[{":
             stack.append("]" if char == "[" else "}")
-        elif char in "]}":
-            while stack and stack[-1] != char:
-                out.append(stack.pop())
-            if stack:
-                stack.pop()
-        out.append(char)
-    return "".join(out) + "".join(reversed(stack)), len(stack)
+            continue
+        out.append(text[copied:i])
+        copied = i
+        while stack and stack[-1] != char:
+            out.append(stack.pop())
+        if stack:
+            stack.pop()
+    return "".join(out) + text[copied:] + "".join(reversed(stack)), len(stack)
 
 
 class Checker:
