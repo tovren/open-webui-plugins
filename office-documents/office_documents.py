@@ -2,7 +2,7 @@
 title: Office Documents
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 0.3.1
+version: 0.3.2
 license: MIT
 required_open_webui_version: 0.11.4
 description: Lets the model create Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files. The model only supplies the content as structured JSON; fixed code builds the file, so no model-written code is ever run. The file is attached to the answer, where it can be previewed and downloaded.
@@ -3196,6 +3196,11 @@ def check_excel(
             break
         if sheet.rows and fits:
             complete.append(s)
+    if sheets and not any(sheet.rows for sheet in sheets):  # a test call or a copy without its data
+        check.errors.append(
+            "sheets: no sheet has rows, so the file would be empty. Send the data in 'rows'; for a template to fill "
+            "in, send its rows with empty cells (null)"
+        )
     used = book.used_columns()
     for s in complete:
         check.errors.extend(_column_problems(book, s, used, charted))

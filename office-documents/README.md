@@ -136,7 +136,8 @@ A short example for a slide deck (the model sees the full schema with descriptio
   sheet does not have, values sent in a formula column that differ from what its formula computes there
   (`999` where quantity times price is 10: the formula or the values are wrong, e.g. sums of rows below the
   data that the formula would overwrite with 0; `0` and the same value in every row count as
-  placeholders), a total on an empty column, a total row written into the rows (a last row labelled e.g.
+  placeholders), a workbook in which no sheet has rows (a test call or an empty copy of the file; a template to fill
+  in has rows of empty cells), a total on an empty column, a total row written into the rows (a last row labelled e.g.
   "Summe" or "Netto-Summe" without its own formulas: it would get the column formulas too, be counted twice
   next to a column's `total`, or add up nothing, so the model is told to use `total` or write the sums as
   formulas), a chart column without numbers, a

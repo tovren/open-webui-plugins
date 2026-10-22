@@ -2,6 +2,17 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
+## 2026-10-22, second update
+
+Office Documents 0.3.2. The other plugins are unchanged.
+
+### Office Documents 0.3.2
+
+- A workbook in which no sheet has rows is sent back instead of being attached as an empty file. Models
+  sometimes send such a call next to the real one (a "Test" workbook, or an empty copy with the same title),
+  and the empty file then sat next to the real one in the chat. A template to fill in still works with rows
+  of empty cells (`null`).
+
 ## 2026-10-22
 
 Office Documents 0.3.1. The other plugins are unchanged.

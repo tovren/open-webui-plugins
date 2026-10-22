@@ -2024,6 +2024,16 @@ def test_sum_rows_next_to_charts_copies_and_templates() -> None:
     assert "circular" not in str(call("create_excel_file", sheets=[loop])[0])  # formula columns using each other
 
 
+def test_workbook_without_rows() -> None:
+    """A parallel test call or an empty copy of the file would be attached as an empty workbook."""
+    empty = invalid("create_excel_file", sheets=[{"name": "Test", "columns": [{"header": "x"}], "rows": []}])
+    assert "sheets: no sheet has rows, so the file would be empty" in empty
+    template = sheet(["Datum", {"header": "Stunden", "type": "number"}], [[None, None], [None, None]])
+    assert excel([template])[0]["S"].max_row == 3  # a template with empty rows is fine
+    info = sheet(["Hinweis"], [])
+    assert excel([sheet(["A", {"header": "B", "type": "number"}], [["x", 1]]), {**info, "name": "T"}])
+
+
 def test_sum_rows_that_go_wrong() -> None:
     def problem(rows: list[Any], **column: Any) -> str:
         return invalid("create_excel_file", sheets=[with_total("=B{row}*C{row}", rows, **column)])
