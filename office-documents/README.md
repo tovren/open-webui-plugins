@@ -100,6 +100,16 @@ A short example for a slide deck (the model sees the full schema with descriptio
   `=C2-C3` … when the months are columns; they are checked against the same whitelist, and one that is not
   allowed is sent back (only one with a function such as `HYPERLINK` stays text, see Security). In columns
   the model marks as `text`, values that start with `=` stay text.
+- **Sum rows below the items** (net, VAT, gross, subtotals per cost centre) are rows with their own
+  formulas. A formula sent in a row of a formula column replaces the column formula in that row
+  (`=SUM(F2:F6)` below `=D{row}*E{row}`), and the column formulas that have nothing to compute in such a row
+  are left out instead of showing 0. The column formula written out for each row (`=B2*C2`, `=B3*C3` …) is
+  not a sum row: the column formula applies. Charts and the auto filter end above the sum rows at the end of
+  the table. Sent back: a formula that uses its own cell (`=SUM(F2:F7)` in F7), a subtotal (`SUM`, `SUMIF`) in a
+  column with `total`, which would be counted twice (a discount row such as `=-ROUND(SUM(F2:F6)*0.05,2)` is
+  meant to be in the total), and a formula that uses a cell of its own sheet that can only be meant by a
+  wrong row count: outside the table, in an empty row, or a formula column's cell with nothing to compute.
+  The message lists the rows by their labels (`2=Laptop, …, 8=Netto`).
 - **Formats of formula columns without a type** follow what the formula computes: a date plus days
   (`=B{row}+14`, a deadline) is a date, quantity times price the currency, the days between two dates a
   whole number, the difference of two times `[h]:mm`.
@@ -127,8 +137,9 @@ A short example for a slide deck (the model sees the full schema with descriptio
   (`999` where quantity times price is 10: the formula or the values are wrong, e.g. sums of rows below the
   data that the formula would overwrite with 0; `0` and the same value in every row count as
   placeholders), a total on an empty column, a total row written into the rows (a last row labelled e.g.
-  "Summe" or "Netto-Summe": it would get the column formulas too, be counted twice next to a column's
-  `total`, or add up nothing, so the model is told to use `total`), a chart column without numbers, a
+  "Summe" or "Netto-Summe" without its own formulas: it would get the column formulas too, be counted twice
+  next to a column's `total`, or add up nothing, so the model is told to use `total` or write the sums as
+  formulas), a chart column without numbers, a
   formula that uses its own column, a slide table with only a header row, a table of contents without
   chapters, and more text than fits on a slide or into a slide table. Every message about a formula lists
   the columns with their letters (`A=Artikel, B=Menge, C=Preis`).
@@ -153,12 +164,18 @@ A short example for a slide deck (the model sees the full schema with descriptio
   either, e.g. a letter, has no title block and is named "Document"), and empty paragraphs used as spacing
   (left out). A heading that only repeats the title is left out.
 - **Broken JSON is repaired.** Long arguments often reach the tool as JSON text rather than as
-  structured data (the server could not parse them), with the same few mistakes: German quotes
-  closed with a straight quote (`„Hoch"`), a forgotten `}` or `]`, table rows written as several
-  arrays without the outer brackets, or the other tool parameters (e.g. the title) written into the
-  same text, which are then used. Fields that end up inside a chart object because its `}` was forgotten
-  (e.g. the speaker notes) are taken back to the slide or sheet. Valid JSON is never changed, and a repair
-  is only used if no content is lost. Otherwise the error shows the text on both sides of the place and
+  structured data (the server could not parse them, e.g. vLLM's `qwen3_coder` parser passes them on as
+  text), with the same few mistakes: German quotes closed with a straight quote (`„Hoch"`), a forgotten
+  `}` or `]`, two closing brackets in the wrong order (`null]}]` for `null]]}`), one bracket too many, an
+  object whose `{` is missing, a stray quote after a number (`"level": 1"}`), a key without its opening
+  quote (`level": 2`), table rows written as several arrays without the outer brackets, or the other tool
+  parameters (e.g. the title) written into the same text, which are then used. Fields that end up inside a
+  chart object because its `}` was forgotten (e.g. the speaker notes) are taken back to the slide or sheet.
+  Valid JSON is never changed; a repair only changes brackets and quotes, and it is only used if no content
+  is lost (nothing left over, no key that comes twice with different values) and the result is valid
+  arguments for the tool. Other tool parameters after the value are only used if nothing else follows
+  them. Replayed on the 139 calls of two benchmark runs (2,923 calls) that 0.3.0 sent back for broken JSON
+  text, 0.3.1 builds the file for 73 (Nemotron 3.5 Super 51 of 68, Qwen3.8-27B 17 of 32). Otherwise the error shows the text on both sides of the place and
   names the likely slip: a quote that ends a text too early, a bracket too many, a key inside a list that
   was not closed, a missing comma or value, a comma before `]`, a backslash or line break inside a text,
   or arguments cut off in the middle (output limit reached).

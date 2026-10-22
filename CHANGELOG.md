@@ -2,6 +2,41 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
+## 2026-10-22
+
+Office Documents 0.3.1. The other plugins are unchanged.
+
+### Office Documents 0.3.1
+
+Excel sum rows:
+- A formula sent in a row of a formula column is kept and replaces the column formula in that row. Until
+  now the tool dropped it without a word, so net, VAT and gross rows below the items
+  (`=SUM(F2:F6)`, `=F7*0.19`, `=F7+F8`) got the line item formula and showed 0. In two benchmark runs this
+  decided 28 failed runs of offers and order lists.
+- Column formulas with nothing to compute in such a sum row (quantity × price where the row has no
+  quantity) are left out there instead of showing 0. The column formula written out for each row (`=B2*C2`)
+  is no sum row; the column formula applies, as before.
+- Charts and the auto filter end above the sum rows at the end of a table, so a pie chart does not show
+  Netto, MwSt and Brutto as slices and sorting does not move them.
+- A last row labelled "Summe", "Netto" etc. with its own formulas is the model's own total and no longer
+  sent back as a total row; the message for a total row without formulas says how to write sums that
+  `total` cannot build.
+- Sent back: a formula that uses its own cell (`=SUM(F2:F7)` in F7), a subtotal (`SUM`, `SUMIF`) in a column
+  with `total`, which counted it twice, and a formula that uses a cell of its own sheet that can only be
+  meant by a wrong row count (`=F8*0.19` with an empty row 8 and the net in F9); the message lists the rows
+  by their labels.
+
+JSON repair:
+- Two closing brackets in the wrong order (`null]}]` for `null]]}`), one bracket too many, an object whose
+  `{` is missing, a stray quote after a number (`"level": 1"}`) and a key without its opening quote
+  (`level": 2`) are repaired. Where a slip allows several repairs, they are tried in turn.
+- A repair is only used if the result is valid arguments for the tool and no key comes twice with
+  different values (a wrong repair can move the keys of one object into the one before it).
+- Other tool parameters written after the value (`], "title": "T"`) are only used if nothing else follows;
+  before, a text after them was dropped.
+- In the replay of two benchmark runs, 73 of the 139 calls sent back for broken JSON text now build the
+  file (Nemotron 3.5 Super 51 of 68, Qwen3.8-27B 17 of 32).
+
 ## 2026-10-21, third update
 
 Context Guard 1.3.0 · Response Export 1.2.1 · Office File UI. The other plugins are unchanged.

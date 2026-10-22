@@ -2,7 +2,7 @@
 title: Office Documents
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 0.3.0
+version: 0.3.1
 license: MIT
 required_open_webui_version: 0.11.4
 description: Lets the model create Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files. The model only supplies the content as structured JSON; fixed code builds the file, so no model-written code is ever run. The file is attached to the answer, where it can be previewed and downloaded.
@@ -360,7 +360,8 @@ class ExcelColumn(Schema):
         description="Optional formula filled into every data row, e.g. '=B{row}*C{row}' ({row} is the current "
         "row; data starts in row 2). English function names (SUM, AVERAGE, MIN, MAX, COUNT, IF, ROUND, "
         "IFERROR ...), commas between arguments. Cells of another sheet: 'Rates'!$B$3 (one fixed cell) or "
-        "'Rates'!B{row}. Put null in the rows for this column.",
+        "'Rates'!B{row}. Put null in the rows for this column; a row that needs another formula (a sum row "
+        "below the items: '=SUM(D2:D6)', '=D7*0.19') gets it in its cell instead.",
     )
     total: Literal["none", "sum", "average", "min", "max", "count"] = Field(
         default="none", description="Adds a total row below the data with this function for the column."
@@ -591,7 +592,7 @@ def parse_argument(adapter: TypeAdapter, value: Any, name: str, extras: dict[str
     the list (`_index`), so error messages still name the item the model sent after empty blocks were left out.
     """
     if isinstance(value, str):
-        value = _loads_argument(value, name, extras)
+        value = _loads_argument(value, name, extras, adapter)
     if isinstance(value, dict) and isinstance(value.get(name), list) and len(value) > 1:
         # {"sheets": [...], "title": "T"}: all parameters in one object
         others = {k: v for k, v in value.items() if k != name}
@@ -624,11 +625,18 @@ def parse_argument(adapter: TypeAdapter, value: Any, name: str, extras: dict[str
     return result
 
 
-def _loads_argument(text: str, name: str, extras: dict[str, Any] | None) -> Any:
+def _loads_argument(text: str, name: str, extras: dict[str, Any] | None, adapter: TypeAdapter) -> Any:
+    def accept(value: Any) -> bool:  # a repaired text must give valid arguments, or the JSON error is shown
+        try:
+            parse_argument(adapter, value, name, {})
+        except InvalidInput:
+            return False
+        return True
+
     try:
-        value = loads_lenient(text, extras)
+        value = loads_lenient(text, extras, accept)
         if isinstance(value, str) and value.strip()[:1] in ("[", "{"):
-            value = loads_lenient(value, extras)  # JSON text encoded twice
+            value = loads_lenient(value, extras, accept)  # JSON text encoded twice
     except json.JSONDecodeError as e:
         raise InvalidInput([json_error_message(name, e)]) from e
     except RecursionError as e:
@@ -846,33 +854,55 @@ def markdown_table_rows(lines: list[str]) -> list[list[str]]:
 
 
 GERMAN_QUOTE_RE = re.compile(r'„([^"“”„\n]{0,79}[^"“”„\n\\])"')  # „Text" -> „Text“ (not „Text\")
-MAX_JSON_REPAIRS = 20
+MAX_JSON_REPAIRS = 20  # repairs of one text
+MAX_REPAIR_TRIES = 60  # decoding attempts of one text: a slip can have several repairs, only one fits
 # Other tool parameters a model may write into the same JSON text after the value ('[...], "title": "T"').
 TOOL_PARAMETERS = {"title", "subtitle", "header_text", "table_of_contents", "landscape"}
 TRAILING_PARAMETER_RE = re.compile(r',\s*"(\w+)"\s*:')
+LITERAL_BEFORE_RE = re.compile(r":\s*(?:-?\d[\d.eE+-]*|true|false|null)\s*$")  # '"level": 1' before a stray '"'
+UNQUOTED_KEY_RE = re.compile(r'[A-Za-z_]\w*"\s*:')  # 'level": 2': the opening quote of a key is missing
 
 
 def _reject_constant(name: str) -> Any:
     raise ValueError(f"{name} is not a valid number, use null for empty values")
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """An object whose key comes twice with different values: after a wrong repair, the keys of the next object
+    land in this one and replace its content. The same value twice ("type": "table" written twice) loses nothing."""
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen and seen[key] != value:
+            raise ValueError(f"the key '{key}' twice")
+        seen[key] = value
+    return seen
+
+
 JSON_DECODER = json.JSONDecoder(parse_constant=_reject_constant)
+REPAIR_DECODER = json.JSONDecoder(parse_constant=_reject_constant, object_pairs_hook=_no_duplicate_keys)
 
 
-def loads_lenient(text: str, extras: dict[str, Any] | None = None) -> Any:
+def loads_lenient(text: str, extras: dict[str, Any] | None = None, accept: Callable[[Any], bool] | None = None) -> Any:
     """json.loads that repairs the mistakes models make in long arguments sent as text.
 
     - German quotes closed with a straight quote („Hoch") end the JSON string early; they become „Hoch“.
     - A forgotten '}' shows up where the next object starts in place of a key ('…"}, {"layout"…');
       the missing brace is added before that comma.
     - Arrays listed without their outer brackets ('"table": ["A", "B"], ["1", "2"]') get them back.
+    - A bracket that does not fit where it stands: two closing brackets in the wrong order ('null]}]' for
+      'null]]}') are swapped, one too many is deleted, forgotten ones are added before it; an object whose '{' is
+      missing in a list ('}, "name": …') gets it.
+    - A stray quote after a number ('"level": 1"}') is deleted, a missing opening quote of a key ('level": 2')
+      added.
     - Other forgotten closing brackets are added where a different bracket closes, or at the end if the
       text ends with a complete object or array.
     - Other tool parameters written into the same text after the value ('[...], "title": "T"') are
       put into `extras`.
-    The text is only changed after strict parsing failed. A repair is only accepted if nothing of the
-    text is lost: if text is left over after the value, or the text was cut off in the middle of a value,
-    the original error is raised so the model sends the arguments again.
+    The text is only changed after strict parsing failed, and only brackets and quotes are changed. Where a slip
+    allows several repairs, they are tried in turn. A repair is only accepted if nothing of the text is lost: no
+    text left over after the value, no text cut off in the middle of a value, no key twice in an object (the keys
+    of another object), and the value passes `accept` (the tool's schema); otherwise the original error is raised
+    so the model sends the arguments again.
     """
     try:
         return JSON_DECODER.decode(text)
@@ -880,40 +910,84 @@ def loads_lenient(text: str, extras: dict[str, Any] | None = None) -> Any:
         error = first_error
     stripped = text.strip()
     for candidate in dict.fromkeys((GERMAN_QUOTE_RE.sub("„\\1“", stripped), stripped)):
-        repaired = _repair_json(candidate)
-        if repaired is None:
-            continue
-        value, rest = repaired
-        parameters = _trailing_parameters(rest)
-        if parameters is not None:
+        repaired = _repair_json(candidate, accept)
+        if repaired is not None:
+            value, parameters = repaired
             if extras is not None:
                 extras.update(parameters)
             return value
     raise error
 
 
-def _repair_json(text: str) -> tuple[Any, str] | None:
-    """Return (value, text left over after it), or None if the text cannot be repaired without losing content."""
-    bracket_fix_used = False
-    for _ in range(MAX_JSON_REPAIRS):
+def _repair_json(text: str, accept: Callable[[Any], bool] | None = None) -> tuple[Any, dict[str, Any]] | None:
+    """Return (value, tool parameters written after it), or None if the text cannot be repaired without losing
+    content. Searches the repairs depth first: each failed decoding offers the repairs at its place."""
+    tries = 0
+
+    def search(text: str, depth: int, bracket_fix_used: bool) -> tuple[Any, dict[str, Any]] | None:
+        nonlocal tries
+        tries += 1
         try:
-            value, end = JSON_DECODER.raw_decode(text)
-            return value, text[end:]
+            value, end = REPAIR_DECODER.raw_decode(text)
         except json.JSONDecodeError as e:
-            comma = text.rfind(",", 0, e.pos)
-            key_expected = e.msg == "Expecting property name enclosed in double quotes"
-            if key_expected and text.startswith("{", e.pos) and comma >= 0:
-                text = text[:comma] + "}" + text[comma:]
-            elif key_expected and text.startswith("[", e.pos) and (wrapped := wrap_array_run(text, e.pos)):
-                text = wrapped
-            elif not bracket_fix_used:
-                fixed, appended = _close_brackets(text)
-                if appended and not text.rstrip().endswith(("}", "]")):
-                    return None  # cut off in the middle of a value (e.g. the output limit was reached)
-                text, bracket_fix_used = fixed, True
-            else:
+            if depth >= MAX_JSON_REPAIRS:
                 return None
-    return None
+            for fixed, uses_bracket_fix in _json_repairs(text, e, bracket_fix_used):
+                if tries >= MAX_REPAIR_TRIES:
+                    return None
+                if (found := search(fixed, depth + 1, bracket_fix_used or uses_bracket_fix)) is not None:
+                    return found
+            return None
+        except ValueError:  # a key twice, NaN
+            return None
+        parameters = _trailing_parameters(text[end:])
+        if parameters is None or (accept is not None and not accept(value)):
+            return None
+        return value, parameters
+
+    return search(text, 0, False)
+
+
+def _json_repairs(text: str, e: json.JSONDecodeError, bracket_fix_used: bool) -> Iterator[tuple[str, bool]]:
+    """The repairs that fit the place of a decoding error, likeliest first: (repaired text, whether it is the
+    bracket fix over the whole text, which is tried once)."""
+    pos, char = e.pos, text[e.pos : e.pos + 1]
+    comma = text.rfind(",", 0, pos)
+    key_expected = e.msg == "Expecting property name enclosed in double quotes"
+    if key_expected and char == "{" and comma >= 0:
+        yield text[:comma] + "}" + text[comma:], False
+    if key_expected and char == "[" and (wrapped := wrap_array_run(text, pos)):
+        yield wrapped, False
+    if key_expected and UNQUOTED_KEY_RE.match(text, pos):
+        yield text[:pos] + '"' + text[pos:], False
+    if char == '"' and LITERAL_BEFORE_RE.search(text[max(0, pos - 40) : pos]) and re.match(r'"\s*[,}\]]', text[pos:]):
+        yield text[:pos] + text[pos + 1 :], False
+    owed = open_brackets(text, pos)
+    if char and char in "]}" and owed[-1:] != char:
+        following = re.match(r"\s*([\]}])", text[pos + 1 :])
+        if owed and following and following[1] == owed[-1] and owed[-2:-1] == char:  # '}]' for ']}'
+            other = pos + 1 + following.start(1)
+            yield text[:pos] + owed[-1] + text[pos + 1 : other] + char + text[other + 1 :], False
+        if owed:  # '["E"}': the wrong bracket
+            yield text[:pos] + owed[-1] + text[pos + 1 :], False
+        if char in owed:  # it closes an outer one: the inner ones were forgotten
+            inner = owed[owed.rindex(char) + 1 :]
+            yield text[:pos] + inner[::-1] + text[pos:], False
+        yield text[:pos] + text[pos + 1 :], False  # one too many
+    if char == ":" and owed[-1:] == "]":  # '[…]}, "name": …' in a list: an object lost its '{'
+        key = text.rfind('"', 0, text.rfind('"', 0, pos))
+        before = text[:key].rstrip()
+        if key > 0 and before.endswith(",") and before[:-1].rstrip().endswith("}"):
+            start = _object_start(text, len(before[:-1].rstrip()) - 1)
+            first = re.match(r'\{\s*("(?:[^"\\]|\\.)*")', text[start:]) if start is not None else None
+            if (
+                first and first[1] == text[key : text.index('"', key + 1) + 1]
+            ):  # the same first key as the object before
+                yield text[:key] + "{" + text[key:], False
+    if not bracket_fix_used:
+        fixed, appended = _close_brackets(text)
+        if not (appended and not text.rstrip().endswith(("}", "]"))):  # not cut off in the middle of a value
+            yield fixed, True
 
 
 def _trailing_parameters(rest: str) -> dict[str, Any] | None:
@@ -927,11 +1001,17 @@ def _trailing_parameters(rest: str) -> dict[str, Any] | None:
     body = "{" + rest[match.start(1) - 1 :]
     for candidate in (body, body + "}"):
         try:
-            parameters, _end = JSON_DECODER.raw_decode(candidate)
+            parameters, end = JSON_DECODER.raw_decode(candidate)
         except (json.JSONDecodeError, ValueError):
             continue
-        return {k: v for k, v in parameters.items() if k in TOOL_PARAMETERS} if isinstance(parameters, dict) else {}
-    return {}
+        if (
+            isinstance(parameters, dict)
+            and set(parameters) <= TOOL_PARAMETERS
+            and not candidate[end:].strip("}] \t\r\n")
+        ):
+            return parameters
+        return None  # other keys or more content after the parameters: it would be lost
+    return None
 
 
 ARRAY_VALUE_RE = re.compile(r'"(?:rows|table)"\s*:\s*\[')  # only table rows: wrapped list items would be lists in lists
@@ -957,6 +1037,24 @@ def wrap_array_run(text: str, pos: int) -> str | None:
     if end <= pos:  # the arrays must reach past the place where the error was found
         return None
     return text[:start] + "[" + text[start:end] + "]" + text[end:]
+
+
+def _object_start(text: str, close: int) -> int | None:
+    """The position of the '{' that the '}' at `close` closes."""
+    starts: list[int] = []
+    in_string = escaped = False
+    for i, char in enumerate(text[: close + 1]):
+        if in_string:
+            escaped, in_string = (False, True) if escaped else (char == "\\", char != '"')
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            starts.append(i)
+        elif char in "]}" and starts:
+            start = starts.pop()
+            if i == close:
+                return start if char == "}" else None
+    return None
 
 
 def _close_brackets(text: str) -> tuple[str, int]:
@@ -2749,6 +2847,7 @@ class Book:
         self.cells: dict[tuple[int, int, int], str] = {}  # (sheet, data row from 0, column): a formula in one cell
         self._parsed: dict[str, tuple[list[FormulaToken], FormulaNode]] = {}
         self._kinds: dict[tuple[int, int], str] = {}
+        self._inputs: dict[tuple[int, int, int], bool] = {}
 
     def where(self, s: int) -> str:
         sheet = self.sheets[s]
@@ -2783,6 +2882,40 @@ class Book:
             if column.type in NUMBER_TYPES or FORMULA_LIKE_RE.match(value.strip()):
                 return f"the formula '{value.strip()[:60]}' in '{column.header.strip()}' is not allowed: {e}"
         return None
+
+    def has_inputs(self, s: int, r: int, c: int) -> bool:
+        """Whether data row r (from 0) has a value in a column that the formula of column c uses in its own row;
+        True for a formula that uses no such column. Formula columns that use each other count as filled."""
+        key = (s, r, c)
+        if key not in self._inputs:
+            self._inputs[key] = True  # while it is worked out: a cycle counts as filled
+            inputs = {self.target(t, s)[1] for t in self.parsed(self.columns[(s, c)])[0]
+                      if t.kind == "cell" and t.row == "{row}" and self.target(t, s)[0] == s} - {c}  # fmt: skip
+            self._inputs[key] = not inputs or any(_cell_filled(self, s, r + 2, u) for u in inputs)
+        return self._inputs[key]
+
+    def copies_column_formula(self, s: int, r: int, c: int) -> bool:
+        """Whether the formula of a cell in a formula column is the column formula written out for a row: the same
+        but for the row numbers ('=B2*C2', also '=B3*C3' in another row)."""
+        column = [t._replace(text="", row="") if t.kind == "cell" else t for t in self.parsed(self.columns[(s, c)])[0]]
+        cell = [t._replace(text="", row="") if t.kind == "cell" else t for t in self.parsed(self.cells[(s, r, c)])[0]]
+        return [(t.kind, t.text.upper(), t.sheet, t.column) for t in column] == [
+            (t.kind, t.text.upper(), t.sheet, t.column) for t in cell
+        ]
+
+    def trailing_sum_rows(self, s: int) -> int:
+        """How many rows at the end are sum rows (or empty rows between them): charts and the filter end above."""
+        rows, count = self.sheets[s].rows, 0
+        for r in range(len(rows) - 1, 0, -1):
+            if self.sum_row(s, r):
+                count = len(rows) - r
+            elif any(v is not None and str(v).strip() for v in rows[r]):
+                break
+        return count
+
+    def sum_row(self, s: int, r: int) -> bool:
+        """A row with a formula of its own in a formula column (net, VAT, gross below the items)."""
+        return any((s, r, c) in self.cells for (t, c) in self.columns if t == s)
 
     def parsed(self, formula: str) -> tuple[list[FormulaToken], FormulaNode]:
         """The tokens and tree of a checked formula."""
@@ -3037,9 +3170,16 @@ def check_excel(
                 check.require(
                     len(value) <= MAX_CELL_CHARS, f"{where}.rows[{r}]: a cell has more than {MAX_CELL_CHARS} characters"
                 )
-                formula = fits and value.strip().startswith("=") and (s, c) not in book.columns
+                formula = fits and value.strip().startswith("=")  # in a formula column it replaces the formula
                 if formula and (problem := book.add_cell_formula(s, r, c, value)):
                     check.errors.append(f"{where}.rows[{r}]: {problem} ({hint})")
+                elif (
+                    formula
+                    and (s, r, c) in book.cells
+                    and (s, c) in book.columns
+                    and book.copies_column_formula(s, r, c)
+                ):
+                    del book.cells[(s, r, c)]  # '=B2*C2' (or '=B3*C3') in every row: the column formula applies
         check.require(len(sheet.charts) <= MAX_SHEET_CHARTS, f"{where}.chart: at most {MAX_SHEET_CHARTS} charts")
         for k, chart in enumerate(sheet.charts):
             place = f"{where}.chart" + (f"[{k}]" if isinstance(sheet.chart, list) else "")
@@ -3060,7 +3200,14 @@ def check_excel(
     for s in complete:
         check.errors.extend(_column_problems(book, s, used, charted))
     if not check.errors:  # all sheets are complete: cells of other sheets can be looked up
-        for problems in (_reference_problems, _percent_problems, _arithmetic_problems, _kind_problems, _value_problems):
+        for problems in (
+            _reference_problems,
+            _row_formula_problems,
+            _percent_problems,
+            _arithmetic_problems,
+            _kind_problems,
+            _value_problems,
+        ):
             check.errors.extend(problems(book))
     check.raise_if_failed()
     return book
@@ -3152,7 +3299,8 @@ def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: se
         if any(token.column == letter for _, token in own_sheet):
             problems.append(
                 f"{where}.columns[{c}] ('{sheet.columns[c].header.strip()}'): the formula uses its own column "
-                f"{letter}; it may only use the other columns (e.g. quantity * price) ({hint})"
+                f"{letter}; it may only use the other columns (e.g. quantity * price). A sum row below the items "
+                f"gets its own formula in its row instead, e.g. '=SUM({letter}2:{letter}6)' ({hint})"
             )
             continue
         for i, token in own_sheet:
@@ -3171,7 +3319,7 @@ def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: se
                     f"{where}.columns[{used_column}] ('{sheet.columns[used_column].header.strip()}') is empty, but the "
                     f"formula of '{sheet.columns[c].header.strip()}' uses it: fill in its values ({hint})"
                 )
-    if problem := _total_row_problem(sheet, rows, where, formulas):
+    if problem := _total_row_problem(book, s, formulas):
         problems.append(problem)
     return problems
 
@@ -3286,6 +3434,108 @@ def _reference_problems(book: Book) -> list[str]:
     return problems
 
 
+def _row_formula_problems(book: Book) -> list[str]:
+    """Formulas in single cells (sum rows below the items: Netto, MwSt, Brutto, subtotals) that reach their own
+    cell (a circular reference), that a column total counts a second time, or that use an empty cell of their own
+    sheet: models count the rows wrong (row 1 is the header), and an empty cell silently counts as 0."""
+    problems: list[str] = []
+    for s, c, r, place, formula in book.formulas():
+        if r is None:
+            continue
+        sheet, header = book.sheets[s], book.sheets[s].columns[c].header.strip()
+        tokens, tree = book.parsed(formula)
+        own_row, letter = r + 2, get_column_letter(c + 1)
+        in_ranges = {arg.index for node in walk(tree) if node.kind == "range" for arg in node.args}
+        cells, spans = [], []  # (column, row) of single cells; (first column, last column, first row, last row)
+        for node in walk(tree):
+            if node.kind == "range" and all(arg.cell is not None and not arg.cell.sheet for arg in node.args):
+                (a, ra), (b, rb) = ((_column_number(arg.cell.column) - 1, _row_of(arg.cell, own_row))
+                                    for arg in node.args if arg.cell is not None)  # fmt: skip
+                spans.append((min(a, b), max(a, b), min(ra, rb), max(ra, rb)))
+        for i, token in enumerate(tokens):
+            if token.kind == "cell" and not token.sheet and i not in in_ranges:
+                cells.append((_column_number(token.column) - 1, _row_of(token, own_row)))
+        shown = formula.replace("{row}", str(own_row))
+        if (c, own_row) in cells or any(a <= c <= b and ra <= own_row <= rb for a, b, ra, rb in spans):
+            problems.append(
+                f"{place}: the formula {shown} in '{header}' uses its own cell {letter}{own_row} (a circular "
+                f"reference); a sum of the rows above ends in the row above, e.g. =SUM({letter}2:{letter}{own_row - 1})"
+            )
+            continue
+        if (
+            sheet.columns[c].total != "none"
+            and tree.kind == "call"
+            and tree.text in ("SUM", "SUMIF", "SUMIFS")
+            and any(a <= c <= b for a, b, _, _ in spans)
+        ):  # a subtotal; a discount row (=-ROUND(SUM(…)*0.05,2)) is meant to be in the total
+            problems.append(
+                f"{place}: the formula {shown} computes from '{header}' itself, and the column's total "
+                f'("{sheet.columns[c].total}") adds up every row, this one too, so it counts twice: either drop '
+                f'"total" on \'{header}\' and write all sum rows yourself, or drop the sum rows and keep "total"'
+            )
+            continue
+        empty = list(dict.fromkeys((column, row) for column, row in cells if _miscounted(book, s, row, column)))
+        if empty:
+            names = ", ".join(f"{get_column_letter(column + 1)}{row}" for column, row in empty)
+            problems.append(
+                f"{place}: the formula {shown} uses {names}, which "
+                f"{'is' if len(empty) == 1 else 'are'} empty, so it computes with 0. Row 1 is the header, the data is "
+                f"in rows 2 to {len(sheet.rows) + 1} ({_row_labels(book, s)}); is the row number right?"
+            )
+    return problems
+
+
+def _miscounted(book: Book, s: int, row: int, c: int) -> bool:
+    """A cell that a formula of the same sheet can only mean by a wrong row count: outside the table, in a row
+    with nothing in it, or a formula column's cell that has nothing to compute in its row. An empty input cell
+    in a filled row may be left for the user (a template, an IF that checks it)."""
+    sheet = book.sheets[s]
+    if _cell_filled(book, s, row, c):
+        return False
+    r = row - 2
+    if not 0 <= r < len(sheet.rows) or (s, c) in book.columns:
+        return True
+    return not any(v is not None and str(v).strip() for v in sheet.rows[r]) and not book.sum_row(s, r)
+
+
+def _row_of(token: FormulaToken, own_row: int) -> int:
+    return own_row if token.row == "{row}" else int(token.row)
+
+
+def _cell_filled(book: Book, s: int, row: int, c: int) -> bool:
+    """Whether a cell of sheet s (row as in Excel, column from 0) holds something: the header, a value, a formula
+    of the cell, the column formula with values to compute with, or the total row the tool adds."""
+    sheet = book.sheets[s]
+    if not 0 <= c < len(sheet.columns):
+        return False
+    if row == 1:
+        return bool(sheet.columns[c].header.strip())
+    if row == len(sheet.rows) + 2 and has_totals(sheet):
+        return sheet.columns[c].total != "none" or c == 0
+    r = row - 2
+    if not 0 <= r < len(sheet.rows):
+        return False
+    if (s, r, c) in book.cells:
+        return True
+    if (s, c) in book.columns:  # with no values in the columns it uses, the formula gives 0 (or an error)
+        return book.has_inputs(s, r, c)  # the writer leaves it out of a sum row only without inputs
+    value = sheet.rows[r][c]
+    return value is not None and str(value).strip() != ""
+
+
+def _row_labels(book: Book, s: int) -> str:
+    """'2=Laptop, 3=Monitor, 8=Netto, …': the rows by their text column with the most labels (the first of
+    those), for messages about row numbers."""
+    sheet = book.sheets[s]
+    texts = [c for c, column in enumerate(sheet.columns) if column.type == "text" and (s, c) not in book.columns]
+    count = {c: sum(isinstance(row[c], str) and bool(row[c].strip()) for row in sheet.rows) for c in texts}
+    c = max(texts, key=lambda c: (count[c], -c)) if texts else 0
+    labels = [f"{r + 2}={to_plain(str(row[c]).strip())[:20]}" for r, row in enumerate(sheet.rows[:30])
+              if row[c] is not None and str(row[c]).strip()]  # fmt: skip
+    more = ", …" if len(sheet.rows) > 30 else ""
+    return "rows: " + ", ".join(labels) + more if labels else "the rows have no labels"
+
+
 def _arithmetic_problems(book: Book) -> list[str]:
     """Formulas that compute (+ - * / ^) with text, which Excel shows as #VALUE!: a text column (usually the column
     letters were miscounted: '=A{row}*B{row}' with the article names in A), the header row, or single texts in the
@@ -3387,7 +3637,7 @@ def _value_problems(book: Book) -> list[str]:
                 f"{book.where(s)}.rows[{r}]: the formula {formula} of '{header}' gives {shown} in this row, but the "
                 f"row sends {json.dumps(sent, ensure_ascii=False)}{more}. The formula fills the column, the values "
                 f"sent for it are not used: check which columns it uses ({book.columns_hint(s)}), and send null for "
-                f"'{header}'"
+                f"'{header}'; a sum row (net, VAT, gross) needs its own formula there instead, e.g. '=SUM(...)'"
             )
     return problems
 
@@ -3401,21 +3651,29 @@ TOTAL_ROW_LABEL_RE = re.compile(
 )
 
 
-def _total_row_problem(sheet: ExcelSheet, rows: list[list[Any]], where: str, formulas: dict[int, str]) -> str | None:
+def _total_row_problem(book: Book, s: int, formulas: dict[int, str]) -> str | None:
     """A total row written into the rows: with column formulas it gets them too (quantity * price of the total
     row), next to a column's "total" it is counted twice, and without its own values it adds up nothing. The
-    column's "total" builds a correct one."""
+    column's "total" builds a correct one. A row with its own sum formulas, whose other formula columns have
+    nothing to compute with, is the model's own total (net, VAT, gross)."""
+    sheet, where, rows = book.sheets[s], book.where(s), book.sheets[s].rows
     label = rows[-1][0] if len(rows) >= 2 and rows[-1] else None
     if not isinstance(label, str) or not TOTAL_ROW_LABEL_RE.fullmatch(to_plain(label).strip()):
         return None
     numbers = bool(formulas) or any(c.total != "none" or c.type in NUMBER_TYPES for c in sheet.columns[1:])
     others = [v for c, v in enumerate(rows[-1]) if c > 0 and c not in formulas and v is not None and str(v).strip()]
     totals = any(c.total != "none" for c in sheet.columns)
-    if not numbers or (others and not formulas and not totals):
+    last = len(rows) - 1
+    own = all((s, last, c) in book.cells or not book.has_inputs(s, last, c) for c in formulas) and (
+        bool(others) if not formulas else book.sum_row(s, last)
+    )
+    if not numbers or (not totals and own):
         return None  # nothing to add up, or the model's own sums ('=SUM(…)' cells are written as formulas)
     return (
         f"{where}.rows[{len(rows) - 1}] ('{label.strip()}') is a total row: remove it and set \"total\" "
-        '(e.g. "sum") on the columns to add up; the tool adds the total row with the right formulas'
+        '(e.g. "sum") on the columns to add up; the tool adds the total row with the right formulas. Sums that '
+        '"total" cannot build (net, VAT, gross, subtotals) need their own formula in every column that has one, '
+        "e.g. '=SUM(D2:D6)' in the row, and no \"total\" on those columns"
     )
 
 
@@ -3555,7 +3813,14 @@ class XlsxWriter:
             for c, (column, raw) in enumerate(zip(sheet.columns, row, strict=True), start=1):
                 cell = ws.cell(row=r, column=c)
                 cell.font, cell.border = self.body_font, ROW_LINE
-                formula = self.book.columns.get((s, c - 1)) or self.book.cells.get((s, r - 2, c - 1))
+                formula = self.book.cells.get((s, r - 2, c - 1)) or self.book.columns.get((s, c - 1))
+                if (
+                    formula
+                    and (s, r - 2, c - 1) not in self.book.cells
+                    and self.book.sum_row(s, r - 2)
+                    and not self.book.has_inputs(s, r - 2, c - 1)
+                ):
+                    formula = ""  # a sum row: the line item formula would show 0 there
                 if formula:  # checked against the whitelist
                     cell.value = formula.replace("{row}", str(r))
                     cell.alignment = ALIGN["date" if column.type in TIME_TYPES else "number"]
@@ -3592,7 +3857,8 @@ class XlsxWriter:
             width = (widths[c - 1] + 4) * (1 if self.narrow_font else 1.15)  # + 4: the indent on both sides
             ws.column_dimensions[get_column_letter(c)].width = min(max(width, MIN_COLUMN_WIDTH), MAX_COLUMN_WIDTH)
         ws.freeze_panes = "A2"
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(sheet.columns))}{last_row}"
+        data_last = last_row - self.book.trailing_sum_rows(s)  # sorting must not move the sums
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(sheet.columns))}{data_last}"
         ws.sheet_view.showGridLines = False
         if len(rows) >= 2:  # every second row tinted by a rule, not by cell fills: it stays in place when sorted
             band = PatternFill("solid", start_color=self.design.band, end_color=self.design.band)
@@ -3602,7 +3868,7 @@ class XlsxWriter:
             )
         self._totals(ws, sheet, last_row, formats)
         for k, chart in enumerate(sheet.charts):
-            self._chart(ws, sheet, chart, last_row, 2 + k * CHART_ROWS)
+            self._chart(ws, sheet, chart, data_last, 2 + k * CHART_ROWS)
         self._print_setup(ws, landscape=len(sheet.columns) > WIDE_SHEET_COLUMNS or bool(sheet.charts))
 
     def markdown(self) -> str:
@@ -3685,6 +3951,8 @@ class XlsxWriter:
             excel_chart = BarChart()
             excel_chart.type = "bar" if chart.type == "bar" else "col"
         min_col, max_col, min_row, max_row = layout.categories
+        if not layout.by_rows:
+            max_row = min(max_row, last_row)  # not the sum rows below the data
         for title, index in series:
             if layout.by_rows:
                 values = Reference(ws, min_col=min_col, max_col=max_col, min_row=index, max_row=index)

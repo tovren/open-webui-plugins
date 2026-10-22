@@ -481,7 +481,14 @@ def test_json_error_messages_point_to_the_slip() -> None:
     def message(text: str) -> str:
         return invalid("create_word_file", blocks=text)
 
-    extra = message('[{"type": "numbered", "items": ["a", "b"]]}, {"type": "paragraph", "text": "x"}]')
+    def unrepaired(text: str) -> str:  # the message for a slip the repair would fix
+        try:
+            json.loads(text)
+        except json.JSONDecodeError as e:
+            return od.json_error_message("blocks", e)
+        raise AssertionError("valid JSON")
+
+    extra = unrepaired('[{"type": "numbered", "items": ["a", "b"]]}, {"type": "paragraph", "text": "x"}]')
     assert '"items": ["a", "b"] <<<HERE>>> ]}, {"type"' in extra
     assert "the open object must be closed with } first, or the ] is one too many" in extra
     assert "the } at the mark closes nothing that is open" in message('[{"type": "paragraph", "text": "x"}]}, 1')
@@ -1232,9 +1239,8 @@ def test_internal_error_is_not_leaked(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_repairs_never_drop_content() -> None:
     """A repair that would lose text is not applied; the model gets the position of the problem instead."""
-    stray = '[{"type": "heading", "text": "Intro"}}, {"type": "paragraph", "text": "Body"}]'
-    result = invalid("create_word_file", blocks=stray)
-    assert "the JSON is invalid at character 37" in result
+    stray = '[{"type": "heading", "text": "Intro"}}, {"type": "paragraph", "text": "Body"}]'  # only a brace too many
+    assert od.loads_lenient(stray) == [{"type": "heading", "text": "Intro"}, {"type": "paragraph", "text": "Body"}]
     cut_off = '[{"type": "paragraph", "text": "A"}, {"type": "table", "rows": [["H1", "H2"], ["c"'
     assert "the JSON is invalid" in invalid("create_word_file", blocks=cut_off)
     split_list = '[{"type": "paragraph", "text": "A"}], [{"type": "paragraph", "text": "B"}]'
@@ -1246,6 +1252,29 @@ def test_repairs_never_drop_content() -> None:
     # a correctly escaped quote after „ does not stop a bracket repair
     escaped = '[{"type": "paragraph", "text": "Er sagte „\\"Hallo\\" und ging."}'
     assert od.loads_lenient(escaped) == [{"type": "paragraph", "text": 'Er sagte „"Hallo" und ging.'}]
+
+
+def test_bracket_and_quote_slips_are_repaired() -> None:
+    """Slips seen in real runs; only brackets and quotes change, and a repair that would merge two objects is not
+    taken."""
+    swapped = '[{"name": "A", "rows": [["a", 1], ["b", 2]}], {"name": "B", "rows": [["c", 3]]}]'  # '}]' for ']}'
+    assert od.loads_lenient(swapped) == [{"name": "A", "rows": [["a", 1], ["b", 2]]}, {"name": "B", "rows": [["c", 3]]}]
+    extra = '[{"type": "bullets", "items": ["a", "b"]]}, {"type": "paragraph", "text": "x"}]'
+    assert od.loads_lenient(extra) == [{"type": "bullets", "items": ["a", "b"]}, {"type": "paragraph", "text": "x"}]
+    no_brace = '[{"name": "A", "rows": [["a", 1]}], "name": "B", "rows": [["c", 3]]}]'  # the '{' of B is missing
+    assert od.loads_lenient(no_brace) == [{"name": "A", "rows": [["a", 1]]}, {"name": "B", "rows": [["c", 3]]}]
+    stray_quote = '[{"type": "heading", "text": "Ziel", "level": 1"}, {"type": "paragraph", "text": "x"}]'
+    assert od.loads_lenient(stray_quote)[0] == {"type": "heading", "text": "Ziel", "level": 1}
+    open_quote = '[{"type": "heading", "text": "Ziel", level": 2}]'
+    assert od.loads_lenient(open_quote) == [{"type": "heading", "text": "Ziel", "level": 2}]
+    assert od.loads_lenient('[{"type": "table", "type": "table", "rows": [["a"]}]')[0]["rows"] == [["a"]]
+    assert od._repair_json('[{"type": "paragraph", "text": "A", "text": "B"]') is None  # "A" would be lost
+    split = '[{"name": "S", "chart": {"type": "pie", "value_columns": ["E"}, "unit": "EUR"}}]'
+    assert od.loads_lenient(split)[0]["chart"] == {"type": "pie", "value_columns": ["E"], "unit": "EUR"}  # one chart
+    after = '[{"type": "table", "rows": [["a"]]], "title": "Bericht", "text": "Wichtig"}, {"type": "paragraph"}]'
+    assert "the JSON is invalid" in invalid("create_word_file", blocks=after)  # "Wichtig" would be lost
+    sheets = '[{"name": "S", "columns": [{"header": "A"}, {"header": "B", "type": "number"}], "rows": [["x", 1]}]'
+    assert excel(sheets)[0]["S"]["B2"].value == 1  # type: ignore[arg-type]
 
 
 def test_parameters_written_into_the_json_text_are_used() -> None:
@@ -1957,6 +1986,61 @@ def test_values_sent_in_formula_columns() -> None:
     for rows in ([["Stuhl", 6, 240, 0], ["Tisch", 2, 890, 0]], [["Stuhl", 6, 240, 20], ["Tisch", 2, 890, 20]],
                  [["Stuhl", 6, 240, 1440.4], ["Tisch", 2, 890, 1780]]):  # fmt: skip
         assert excel([with_total("=B{row}*C{row}", rows)])[0]["S"]["D2"].value == "=B2*C2"
+
+
+def test_sum_rows_below_the_items() -> None:
+    """Net, VAT and gross below the line items: a formula sent in a row of a formula column replaces the column
+    formula there, and the line item formula is left out of such rows instead of showing 0."""
+    rows = [["Stuhl", 6, 240, None], ["Tisch", 2, 890, None], ["Netto", None, None, "=SUM(D2:D3)"],
+            ["MwSt 19 %", None, None, "=ROUND(D4*0.19,2)"], ["Brutto", None, None, "=D4+D5"]]  # fmt: skip
+    ws = excel([with_total("=B{row}*C{row}", rows)])[0]["S"]
+    assert [ws[f"D{r}"].value for r in range(2, 7)] == ["=B2*C2", "=B3*C3", "=SUM(D2:D3)", "=ROUND(D4*0.19,2)",
+                                                        "=D4+D5"]  # fmt: skip
+    discount = sheet([*ARTICLES, {"header": "Rabatt", "type": "percent"},
+                      {"header": "Netto", "type": "currency", "formula": "=B{row}*C{row}*(1-D{row})"},
+                      {"header": "Hinweis", "formula": '=IF(D{row}>0,"rabattiert","")'}],
+                     [["Stuhl", 6, 240, 5, None, None], ["Summe", None, None, None, "=SUM(E2:E2)", None]])  # fmt: skip
+    ws = excel([discount])[0]["S"]
+    assert ws["E3"].value == "=SUM(E2:E2)" and ws["F3"].value is None  # no IF over the empty row either
+    # a last row 'Summe' with its own formulas is the model's own total, not one the tool must build
+    assert excel([with_total("=B{row}*C{row}", [["Stuhl", 6, 240], ["Summe", None, None, "=SUM(D2:D2)"]])])
+
+
+def test_sum_rows_next_to_charts_copies_and_templates() -> None:
+    rows = [["Stuhl", 6, 240, "=B2*C2"], ["Tisch", 2, 890, "=B2*C2"], ["Netto", None, None, "=SUM(D2:D3)"]]
+    ws = excel([with_total("=B{row}*C{row}", rows, total="none")])[0]["S"]
+    assert ws["D3"].value == "=B3*C3"  # a copy of the column formula, even with the wrong row, is the column formula
+    chart = {"type": "pie", "category_column": "Artikel", "value_columns": ["Summe"]}
+    ws = excel([{**with_total("=B{row}*C{row}", rows[:2] + [rows[2], ["MwSt", None, None, "=D4*0.19"]]),
+                 "chart": chart}])[0]["S"]  # fmt: skip
+    assert ws.auto_filter.ref == "A1:D3" and "$D$2:$D$3" in str(ws._charts[0].series[0].val.numRef.f)
+    discount = [*rows[:2], ["Rabatt 5 %", None, None, "=-ROUND(SUM(D2:D3)*0.05,2)"]]
+    assert excel([with_total("=B{row}*C{row}", discount, total="sum")])  # meant to be in the total
+    template = sheet(["Angabe", {"header": "Wert", "type": "number"}],
+                     [["Stunden (bitte eintragen)", None], ["Satz", 80], ["Betrag", "=B2*B3"]])  # fmt: skip
+    assert excel([template])[0]["S"]["B4"].value == "=B2*B3"  # an input left for the user
+    loop = sheet(["A", {"header": "B", "formula": "=C{row}+1"}, {"header": "C", "formula": "=B{row}+1"}],
+                 [["x", None, None], ["Summe", "=SUM(B2:B2)", "=SUM(C2:C2)"]])  # fmt: skip
+    assert "circular" not in str(call("create_excel_file", sheets=[loop])[0])  # formula columns using each other
+
+
+def test_sum_rows_that_go_wrong() -> None:
+    def problem(rows: list[Any], **column: Any) -> str:
+        return invalid("create_excel_file", sheets=[with_total("=B{row}*C{row}", rows, **column)])
+
+    items = [["Stuhl", 6, 240, None], ["Tisch", 2, 890, None]]
+    assert "rows[2]: the formula =SUM(D2:D4) in 'Summe' uses its own cell D4 (a circular reference)" in problem(
+        [*items, ["Netto", None, None, "=SUM(D2:D4)"]]
+    )
+    twice = problem([*items, ["davon Stühle", None, None, '=SUMIF(A2:A3,"Stuhl",D2:D3)']], total="sum")
+    assert "computes from 'Summe' itself, and the column's total (\"sum\") adds up every row" in twice
+    # rows counted wrong: D5 is the empty row between the items and the sums, the net is in D6
+    shifted = problem([*items, [None, None, None, None], ["Netto", None, None, "=SUM(D2:D3)"],
+                       ["MwSt", None, None, "=D4*0.19"]])  # fmt: skip
+    assert "rows[4]: the formula =D4*0.19 uses D4, which is empty, so it computes with 0" in shifted
+    assert "(rows: 2=Stuhl, 3=Tisch, 5=Netto, 6=MwSt); is the row number right?" in shifted
+    own_column = invalid("create_excel_file", sheets=[with_total('=IF(A{row}="Netto",SUM(D2:D3),B{row}*C{row})')])
+    assert "A sum row below the items gets its own formula in its row instead, e.g. '=SUM(D2:D6)'" in own_column
 
 
 def test_numbers_right_aligned_in_word_and_slide_tables() -> None:
