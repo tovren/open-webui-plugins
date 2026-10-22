@@ -284,6 +284,11 @@ class Schema(BaseModel):
         return data
 
 
+def item_place(name: str, item: Schema, i: int) -> str:
+    """'blocks[3]': the item's position in the list the model sent (see parse_argument), for messages."""
+    return f"{name}[{item._index if item._index >= 0 else i}]"
+
+
 def blank(value: Any) -> bool:
     """An empty cell: None, or a text of spaces only."""
     return value is None or not str(value).strip()
@@ -1378,7 +1383,7 @@ def check_word(options: WordOptions, blocks: list[WordBlock]) -> None:
         )
     check.text(options.title, options.subtitle, options.header_text)
     for i, block in enumerate(blocks):
-        where = f"blocks[{block._index if block._index >= 0 else i}] ({block.type})"
+        where = f"{item_place('blocks', block, i)} ({block.type})"
         check.text(block.text, *block.items, *(cell for row in block.rows for cell in row))
         tables = [block.rows] if block.type == "table" else []
         if block.type == "paragraph":  # Markdown tables in the text become tables too
@@ -1403,25 +1408,20 @@ def _set_cell_shading(cell: Any, fill: str) -> None:
 
 def _add_field(paragraph: DocxParagraph, instruction: str, placeholder: str = "") -> None:
     """Insert a Word field (PAGE, NUMPAGES, TOC ...). Word fills in the value when it lays out the page."""
-    for kind, text in (
-        ("begin", None),
-        ("instr", instruction),
-        ("separate", None),
-        ("text", placeholder),
-        ("end", None),
-    ):
-        run = paragraph.add_run()
-        if kind == "instr":
-            element = OxmlElement("w:instrText")
-            element.set(qn("xml:space"), "preserve")
-            element.text = f" {text} "
-        elif kind == "text":
-            run.text = text or ""
-            continue
-        else:
-            element = OxmlElement("w:fldChar")
-            element.set(qn("w:fldCharType"), kind)
-        run._r.append(element)
+
+    def field_char(kind: str) -> None:
+        element = OxmlElement("w:fldChar")
+        element.set(qn("w:fldCharType"), kind)
+        paragraph.add_run()._r.append(element)
+
+    field_char("begin")
+    code = OxmlElement("w:instrText")
+    code.set(qn("xml:space"), "preserve")
+    code.text = f" {instruction} "
+    paragraph.add_run()._r.append(code)
+    field_char("separate")
+    paragraph.add_run().text = placeholder
+    field_char("end")
 
 
 # Word wants the children of w:pPr and w:tblPr in a fixed order; new ones go before these.
@@ -2503,13 +2503,12 @@ def parse_number_text(text: str, decimal_comma: bool | None = None) -> tuple[flo
     match = NUMBER_RE.fullmatch(text.strip().replace("\u2212", "-"))
     if not match or (match["prefix"] and match["suffix"]):
         return None
-    if match["group"] in (",", ".") and not match["fraction"]:
+    digits, fraction = re.sub(r"\D", "", match["int"]), match["fraction"] or ""
+    if match["group"] in (",", ".") and not fraction:
         head, *groups = match["int"].split(match["group"])
         decimal_mark = None if decimal_comma is None else "," if decimal_comma else "."
         if len(groups) == 1 and (head == "0" or match["group"] == decimal_mark):
-            number = float(f"{match['sign']}{head}.{groups[0]}")
-            return (number / 100, True) if match["suffix"] == "%" else (number, False)
-    digits, fraction = re.sub(r"\D", "", match["int"]), match["fraction"] or ""
+            digits, fraction = head, groups[0]  # the separator was the decimal mark
     number: float | int = float(f"{match['sign']}{digits}.{fraction}") if fraction else int(match["sign"] + digits)
     if match["suffix"] == "%":
         return number / 100, True
@@ -2601,9 +2600,9 @@ def convert_value(value: str | float | None, column_type: str, decimal_comma: bo
         number, is_fraction = value, False
     if column_type == "percent" and not is_fraction:
         number = number / 100
-    if column_type == "integer" and float(number).is_integer():
-        number = int(number)
-    elif isinstance(number, float) and number.is_integer() and column_type != "percent":
+    if (column_type == "integer" and float(number).is_integer()) or (
+        isinstance(number, float) and number.is_integer() and column_type != "percent"
+    ):
         number = int(number)
     return number, True
 
@@ -2856,8 +2855,7 @@ class Book:
         self._inputs: dict[tuple[int, int, int], bool] = {}
 
     def where(self, s: int) -> str:
-        sheet = self.sheets[s]
-        return f"sheets[{sheet._index if sheet._index >= 0 else s}]"
+        return item_place("sheets", self.sheets[s], s)
 
     def last_rows(self, s: int) -> dict[str, int]:
         """The last data row of every sheet by written name, "" for sheet s (for whole columns such as B:B)."""
@@ -3302,7 +3300,7 @@ def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: se
                 )
     hint = book.columns_hint(s)
     for c, formula in formulas.items():
-        tokens = book.parsed(formula)[0]
+        tokens, name = book.parsed(formula)[0], f"{where}.columns[{c}] ('{sheet.columns[c].header.strip()}')"
         own_sheet = [
             (i, token) for i, token in enumerate(tokens)
             if token.kind == "cell" and book.target(token, s)[0] == s
@@ -3310,7 +3308,7 @@ def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: se
         letter = get_column_letter(c + 1)
         if any(token.column == letter for _, token in own_sheet):
             problems.append(
-                f"{where}.columns[{c}] ('{sheet.columns[c].header.strip()}'): the formula uses its own column "
+                f"{name}: the formula uses its own column "
                 f"{letter}; it may only use the other columns (e.g. quantity * price). A sum row below the items "
                 f"gets its own formula in its row instead, e.g. '=SUM({letter}2:{letter}6)' ({hint})"
             )
@@ -3320,7 +3318,7 @@ def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: se
             in_range = (i and tokens[i - 1].text == ":") or (i + 1 < len(tokens) and tokens[i + 1].text == ":")
             if used_column >= len(sheet.columns) and not in_range:
                 problems.append(
-                    f"{where}.columns[{c}] ('{sheet.columns[c].header.strip()}'): the formula uses {token.text}, but "
+                    f"{name}: the formula uses {token.text}, but "
                     f"the sheet has only the columns A to {get_column_letter(len(sheet.columns))} ({hint})"
                 )
                 break
@@ -3889,8 +3887,9 @@ class XlsxWriter:
             return shown + (value.strftime(" %H:%M") if isinstance(value, datetime) and "hh:mm" in fmt else "")
         if ":mm" in fmt and isinstance(value, int | float):  # a time: the fraction of a day
             minutes = round(value * 1440)
-            hours = minutes // 60 if fmt.startswith("[h]") else minutes // 60 % 24
-            return f"{hours:02d}:{minutes % 60:02d}" if not fmt.startswith("[h]") else f"{hours}:{minutes % 60:02d}"
+            if fmt.startswith("[h]"):  # a duration
+                return f"{minutes // 60}:{minutes % 60:02d}"
+            return f"{minutes // 60 % 24:02d}:{minutes % 60:02d}"
         percent = "%" in fmt
         value = value * 100 if percent else value
         decimals = re.search(r"\.(0+)", fmt)
@@ -4069,7 +4068,7 @@ def check_slides(title: str, slides: list[Slide]) -> None:
     check.require(bool(slides), "slides: the presentation has no slides")
     check.require(len(slides) <= MAX_SLIDES, f"slides: at most {MAX_SLIDES} slides")
     for i, slide in enumerate(slides):
-        where = f"slides[{slide._index if slide._index >= 0 else i}] ({slide.layout})"
+        where = f"{item_place('slides', slide, i)} ({slide.layout})"
         check.text(slide.title, slide.subtitle, slide.notes, *slide.bullets, *slide.left, *slide.right)
         check.require(
             bool(slide.title.strip() or (slide.layout == "title" and title.strip())), f"{where}: 'title' is empty"
