@@ -534,10 +534,11 @@ def top_level(items: list[str], numbered: bool = False) -> list[str]:
         return items
     result = []
     for item in items:
-        if not item.strip() or item.strip().startswith(SUB_ITEM_PREFIX):
+        text = item.strip()
+        if not text or text.startswith(SUB_ITEM_PREFIX):
             result.append(item)
         else:
-            result.append(item.strip()[len(mark) :].strip() if mark else ITEM_NUMBER_RE.sub("", item.strip(), count=1))
+            result.append(text[len(mark) :].strip() if mark else ITEM_NUMBER_RE.sub("", text, count=1))
     return result
 
 
@@ -1466,6 +1467,11 @@ def _set_cell_margins(table: Any, top: int, bottom: int) -> None:
     table._tbl.tblPr.insert_element_before(margins, *TBLPR_AFTER_CELL_MARGINS)
 
 
+def _text_width(section: Any) -> int:
+    """The width between the page margins."""
+    return section.page_width - section.left_margin - section.right_margin
+
+
 def _set_style(style: Any, size: float, color: str, bold: bool = False, italic: bool = False,
                before: float | None = None, after: float | None = None, font: str = BODY_FONT) -> None:  # fmt: skip
     """Font, colour and spacing of a built-in style; its theme font and theme colour are removed, they would win."""
@@ -1756,24 +1762,26 @@ class DocxWriter:
             header.text = clean_text(self.options.header_text.strip())
             header.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         if self.options.page_numbers and section.footer.is_linked_to_previous:
-            # title on the left, "Page X of Y" on the right, a thin line above
-            footer = section.footer.paragraphs[0]
-            style = footer.style
-            while style is not None:  # a template's Footer style may have tab stops of its own (centre ...)
-                for tab in style.paragraph_format.tab_stops:
-                    footer.paragraph_format.tab_stops.add_tab_stop(tab.position, WD_TAB_ALIGNMENT.CLEAR)
-                style = style.base_style
-            width = section.page_width - section.left_margin - section.right_margin
-            footer.paragraph_format.tab_stops.add_tab_stop(width, WD_TAB_ALIGNMENT.RIGHT)
-            _set_borders(footer._p.get_or_add_pPr(), "w:pBdr", PPR_AFTER_BORDERS, [("top", 4, RULE_COLOR)])
-            footer.add_run(clean_text(to_plain(self.options.title))[:90] + "\t")
-            before, _, rest = self.texts["page_footer"].partition("{page}")
-            between, _, after = rest.partition("{pages}")
-            footer.add_run(before)
-            _add_field(footer, "PAGE", "1")
-            footer.add_run(between)
-            _add_field(footer, "NUMPAGES", "1")
-            footer.add_run(after)
+            self._footer(section)
+
+    def _footer(self, section: Any) -> None:
+        """The title on the left, "Page X of Y" on the right, a thin line above."""
+        footer = section.footer.paragraphs[0]
+        style = footer.style
+        while style is not None:  # a template's Footer style may have tab stops of its own (centre ...)
+            for tab in style.paragraph_format.tab_stops:
+                footer.paragraph_format.tab_stops.add_tab_stop(tab.position, WD_TAB_ALIGNMENT.CLEAR)
+            style = style.base_style
+        footer.paragraph_format.tab_stops.add_tab_stop(_text_width(section), WD_TAB_ALIGNMENT.RIGHT)
+        _set_borders(footer._p.get_or_add_pPr(), "w:pBdr", PPR_AFTER_BORDERS, [("top", 4, RULE_COLOR)])
+        footer.add_run(clean_text(to_plain(self.options.title))[:90] + "\t")
+        before, _, rest = self.texts["page_footer"].partition("{page}")
+        between, _, after = rest.partition("{pages}")
+        footer.add_run(before)
+        _add_field(footer, "PAGE", "1")
+        footer.add_run(between)
+        _add_field(footer, "NUMPAGES", "1")
+        footer.add_run(after)
 
     def _table_of_contents(self) -> None:
         self.doc.add_paragraph(
@@ -1853,8 +1861,7 @@ class DocxWriter:
                  ("insideH", 4, RULE_COLOR), ("insideV", 0, "")]  # fmt: skip
         _set_borders(table._tbl.tblPr, "w:tblBorders", TBLPR_AFTER_BORDERS, lines)
         _set_cell_margins(table, top=50, bottom=50)
-        section = self.doc.sections[-1]
-        widths = column_widths(rows, columns, section.page_width - section.left_margin - section.right_margin)
+        widths = column_widths(rows, columns, _text_width(self.doc.sections[-1]))
         numbers = number_columns(rows, columns)
         cells = table._cells  # once: row.cells and column.cells rebuild the whole grid on every call
         for c, (column, width) in enumerate(zip(table.columns, widths, strict=True)):
