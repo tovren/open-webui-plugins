@@ -86,6 +86,11 @@ def parse_budgets(text: str) -> dict[str, int]:
     return budgets
 
 
+def for_model(values: dict[str, Any], ids: list[str], default: Any = None) -> Any:
+    """The value of the first model ID that has one, else the default."""
+    return next((values[model_id] for model_id in ids if model_id in values), default)
+
+
 def model_ids(body: dict[str, Any], model: dict[str, Any] | None) -> list[str]:
     """The requested model ID, then the base model of a workspace model (if any)."""
     info = (model or {}).get("info") or {}
@@ -128,8 +133,7 @@ class Filter:
             "enable_thinking": True,
         }
 
-        efforts = parse_efforts(self.valves.model_reasoning_effort)
-        if effort := next((efforts[model_id] for model_id in ids if model_id in efforts), None):
+        if effort := for_model(parse_efforts(self.valves.model_reasoning_effort), ids):
             body["reasoning_effort"] = effort
         elif body.get("reasoning_effort") == "none":
             # A model default of "none" keeps thinking off while the button is off. vLLM would still
@@ -137,10 +141,7 @@ class Filter:
             body["reasoning_effort"] = None
 
         budgets = parse_budgets(self.valves.model_thinking_budget)
-        budget = next(
-            (budgets[model_id] for model_id in ids if model_id in budgets), self.valves.thinking_budget
-        )
-        if budget:
+        if budget := for_model(budgets, ids, self.valves.thinking_budget):
             body["thinking_budget_tokens"] = budget  # llama-server
             body["thinking_token_budget"] = budget  # vLLM
         return body
