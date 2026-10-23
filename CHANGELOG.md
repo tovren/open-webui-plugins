@@ -2,6 +2,119 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
+## 2026-10-23
+
+Office Documents 0.4.0 · Response Export 1.3.0 · Context Guard 1.4.0. The other plugins are unchanged.
+
+### Before you update
+
+- **Context Guard finds the context size on its own** where the server reports it: Ollama's `num_ctx`
+  of the model and vLLM's `max_model_len`. If `context_tokens` was set lower than vLLM's
+  `--max-model-len` on purpose, add the model to `model_context_tokens`, which still wins. This also
+  works with Redis (several workers).
+- **Office Documents writes the user's name into the file properties** (author), like Word does. Until
+  now the files named `python-docx`, a python-pptx developer or `openpyxl` there.
+- Office Documents: Excel cells may now be `true`/`false`, so the tool's parameters changed. Models see
+  the new parameters with the next request; nothing else has to be done.
+- Response Export reads numbers such as `2.000` by the other numbers of their column and, if those do not
+  show it, by the language: in an English export a column of nothing but `2.000` and `15.000` becomes 2
+  and 15 (German: 2000 and 15000).
+
+### Office Documents 0.4.0
+
+Excel:
+- Amounts written as text in one column are read with one decimal mark: the values that show it
+  (`2.350,50 €`, `980,00 €`) decide it for the whole column, also against the `language` valve. Until now
+  `1.500 €` next to them became 1.5 with `language = en` (and `$1,500` next to `$2,350.50` 1.5 with `de`),
+  without a word. A column whose values use both marks next to a value they decide (`1.500`) is sent back.
+- Years, numbers and codes have no thousands separator: a `Jahr` column shows 2024 instead of 2.024, also
+  `Nr.`, `Pos.`, `Kundennr.`, `Rechnungsnummer`, `ID`, `PLZ`, `Invoice no.` and similar identifier names
+  (whole numbers in a column without a total). `Anzahl` or `Average number` stay amounts.
+- A chart sent with only a type and title takes its labels from the first text or date column (the
+  products next to `Pos.`, not 1, 2, 3) and does not plot years and numbers as values (no `Jahr` bars next
+  to `Umsatz`).
+- A cell that is one link (`[Intranet](https://…)`) is a clickable link; in other cells the address stays
+  after the label (`Wiki (https://…)`). Until now only the label was left.
+- `true` and `false` are TRUE and FALSE (WAHR and FALSCH in German Excel) instead of the numbers 1 and 0.
+  In Word and slide tables they are Yes and No (Ja and Nein) instead of being sent back.
+- ISO timestamps (`2026-10-23T08:30:00Z`, `…+02:00`, `… 08:30:15.250`) are dates with their time as
+  written instead of being sent back; the message for other dates with a time names `YYYY-MM-DD hh:mm`.
+- Dates before 1 March 1900 are written as text (`18.01.1871`); Excel showed `####` or a wrong day. A formula
+  that computes with them (`=B{row}+14`) is sent back, as Excel would show #VALUE!.
+
+Word:
+- Code blocks between ``` or ~~~ lines in a paragraph (a language name may follow the opening one) are a
+  monospace block with their lines and indentation as written. Until now a `# comment` in them became a
+  heading (also in the table of contents), indentation was lost and the ``` stayed visible.
+- `header_text` is plain text like the title and the footer: `**ACME** GmbH` showed the asterisks.
+
+All formats:
+- Windows paths keep their backslashes: `\\fs01\Vertrieb\_Archiv` became `\fs01\Vertrieb_Archiv`,
+  `C:\Daten\*.xlsx` became `C:\Daten*.xlsx`.
+- The file properties hold the document title, the user's name as author and the time the file was made.
+- A comma before a closing bracket (`"b",]`) is repaired; with Python 3.13 and later the message for it,
+  when the repair is not enough, says to delete it.
+
+In the replay of all 4,605 calls of the three benchmark runs, one more call builds its file (a trailing
+comma) and none is sent back newly. The files differ in their properties, in the number format of 157
+position and number columns and in the paths of 15 Word files.
+
+### Response Export 1.3.0
+
+Excel:
+- Numbers that can be read two ways (`1.085`, `2.000`, `1,234`) follow the other numbers of their column:
+  next to `1.25`, `1.085` is 1.085 (before: 1085); next to `1.250.000`, `2.000` is 2000. If the column does
+  not show it, the language decides (English: dot as decimal mark, German: comma). `0.125` is now a number
+  instead of text.
+- Dates such as `15.03.2024`, `1.3.2024` and `2024-03-12` become real dates, shown as `15.03.2024` in German
+  and `2024-03-12` in English, so they can be sorted and filtered. `03/12/2024` stays text: month and day
+  could be either way round.
+- A cell that is one link (`[Docs](https://…)`) is a clickable link. Other links in a cell keep their
+  address as `text (url)` instead of losing it.
+- A heading directly above a table names its sheet instead of "Table 1", "Table 2" …
+
+Word, PDF and e-mail:
+- If the answer cites sources (`[1]`, `[2, 3]`), the file and the e-mail end with a numbered list of them,
+  with name and web address as under the answer in the chat. Before, the numbers led nowhere. Numbers in
+  brackets that are no source (`[2024]`) do not count.
+- Code blocks and inline code are exported as written: an HTML example with `<details>` or a `<think>` tag
+  in backticks is no longer cut out. Open WebUI's own reasoning and tool-call blocks are still always
+  removed.
+- Collapsible sections the model wrote itself (`<details>`, e.g. a solution) are exported open, with the
+  summary as a bold line; before they were left out. Reasoning, tool calls and code interpreter runs are
+  still removed.
+- Embedded images and charts of the code interpreter show their description (or "[Image]"). Before, an
+  embedded chart came out as pages of characters (a 400 KB chart gave a 113-page PDF) and a code
+  interpreter chart as a file path.
+- Formulas (`$a*b*c$`, `\[ E = mc^2 \]`) are kept as written; before, `*` turned into italics and `\[` lost
+  its backslash. Amounts such as `$5 and $10` are not affected.
+- `&amp;`, `&lt;`, `&nbsp;` and other HTML entities show as the characters they stand for.
+- An answer with a broken emoji character no longer makes the Word and e-mail export fail.
+
+PDF:
+- Directory trees and boxes drawn with line characters keep their shape (`├── src/` becomes `+-- src/`)
+  instead of turning into question marks. Arrows and symbols such as ↑ ↓ ▶ ▲ ▼ get a stand-in too.
+
+### Context Guard 1.4.0
+
+- The request's `max_tokens` is kept free if it is larger than `answer_reserve_tokens`. vLLM rejects a
+  request whose prompt and `max_tokens` together exceed `--max-model-len`: with `max_tokens` 8192 as a
+  model or default parameter and a 32k context, the guard let a 25,000-token prompt through and vLLM
+  answered with an HTTP 400 error. A `max_tokens` at or above the context size is left to the server.
+- The context size: an entry in `model_context_tokens`, else Ollama's `num_ctx` of the model (sent with
+  the request), else the `max_model_len` that vLLM reports in its model list (also for workspace models
+  on a vLLM model), else `context_tokens`. llama-server reports no size that fits, so it still needs
+  `context_tokens` or `model_context_tokens`.
+- `answer_reserve_tokens` keeps at most half the context free. With a small context (an Ollama `num_ctx`
+  of 4096 and the default reserve of 6000), the guard used to switch itself off and log a warning on every
+  request.
+- Context Compaction: the room for the summary request is checked in the context of the compaction model
+  if one is set (`CONTEXT_COMPACTION_MODEL`), with the summary length of the task model parameters
+  (`max_tokens`, 1000 if they set none). Before, a small compaction model could hide the hint although its
+  summary request did not fit.
+- New integration test with a vLLM-like server that reports `max_model_len`, checked with 0.11.4 and
+  0.12.3.
+
 ## 2026-10-22, third update
 
 Response Export 1.2.2. The code of Context Guard, Reasoning Toggle and Office File UI was tidied up
