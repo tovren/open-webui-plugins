@@ -4,7 +4,7 @@ python -I mock_model.py <port> <log.jsonl> <llama|vllm>
 
 - "Tokenizer": characters / 3.5 over all texts, tool calls and tool definitions.
 - llama mode rejects a prompt larger than the context with HTTP 400 like llama-server; vllm mode
-  also rejects it when prompt + max_tokens is larger, like vLLM.
+  also rejects it when prompt + max_tokens is larger, and reports max_model_len in /v1/models, like vLLM.
 - Summary requests of Open WebUI's Context Compaction get a short summary.
 - The answer length is set with "[answer:1234]" in the last user message; "[tool:8]" makes the
   model call the first tool 8 times before it answers.
@@ -61,7 +61,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/").endswith("/models"):
-            self._json(200, {"object": "list", "data": [{"id": MODEL, "object": "model", "owned_by": "mock"}]})
+            model = {"id": MODEL, "object": "model", "owned_by": "mock"}
+            if MODE == "vllm":
+                model["max_model_len"] = N_CTX
+            self._json(200, {"object": "list", "data": [model]})
         else:
             self._json(404, {"error": "not found"})
 

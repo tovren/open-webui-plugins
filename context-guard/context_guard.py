@@ -2,7 +2,7 @@
 title: Context Guard
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.3.0
+version: 1.4.0
 license: MIT
 required_open_webui_version: 0.11.4
 description: Estimates the prompt size right before each request is sent to the model - after document excerpts and tool results have been added - and shows a warning or stops with a clear, friendly message before the model's context window overflows.
@@ -12,7 +12,10 @@ How it works
   injected and again after every tool-call round. The model's system prompt, which Open WebUI only
   adds after this hook, and earlier reasoning sent back to the model are counted too.
 - Shows a status hint above the answer once the prompt uses warn_percent of the usable context
-  (context size minus the space reserved for the answer).
+  (context size minus the space reserved for the answer, or the request's max_tokens if larger:
+  vLLM rejects a request whose prompt and max_tokens together exceed the context).
+- The context size is a per-model valve entry, else Ollama's num_ctx of the request, else the
+  max_model_len that vLLM reports in its model list, else the context_tokens valve.
 - Stops the request with an explanation and practical next steps when the prompt would not fit.
   If the user's own message makes up most of it (a long pasted text), the message says so. Without
   this, llama-server and vLLM reject the request with a technical HTTP 400 error
@@ -24,8 +27,9 @@ How it works
 - Works together with Open WebUI's Context Compaction: compaction runs first, so the guard checks
   the shortened history. While compaction will summarize the chat before the limit, the hint to
   start a new chat is not shown. The summary request contains the whole chat, so the compaction
-  threshold must leave room for it (COMPACTION_RESERVE_TOKENS below the usable context); otherwise a
-  warning is logged once and the hint is shown as usual. If compaction could not get a summary from
+  threshold must leave room for it in the usable context of the model that writes the summary (the
+  compaction model if one is set): SUMMARY_PROMPT_TOKENS plus the summary's max_tokens from the task
+  model parameters. Otherwise a warning is logged once and the hint is shown as usual. If compaction could not get a summary from
   the model and fell back to cutting the old messages short, a warning is logged once per chat.
 
 Security & privacy
@@ -38,6 +42,7 @@ import logging
 import math
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Literal
 
@@ -49,9 +54,10 @@ EventEmitter = Callable[[dict[str, Any]], Awaitable[Any]]
 
 MESSAGE_OVERHEAD_CHARS = 16  # role and chat-template tokens per message
 REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking")
-# Context Compaction: room the summary request needs besides the chat itself (prompt template
-# about 300 tokens, the summary up to Open WebUI's default max_tokens of 1000, plus a margin)
-COMPACTION_RESERVE_TOKENS = 1500
+# Context Compaction: room the summary request needs besides the chat itself (prompt template about
+# 300 tokens plus a margin) and the summary's length if the task model parameters set no max_tokens
+SUMMARY_PROMPT_TOKENS = 500
+DEFAULT_SUMMARY_TOKENS = 1000
 SUMMARY_MARKER = "[CONVERSATION SUMMARY]\n"
 # Open WebUI's fallback when the summary request fails: "- role: first 500 characters" per message
 FALLBACK_SUMMARY_LINE = re.compile(r"^- (?:user|assistant|system|tool): ", re.MULTILINE)
@@ -199,11 +205,44 @@ def has_fallback_summary(messages: list[Any]) -> bool:
     return False
 
 
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def model_ids(body: dict[str, Any], model: dict[str, Any] | None) -> list[str]:
     """The requested model ID, then the base model of a workspace model (if any)."""
     info = (model or {}).get("info") or {}
     ids = [body.get("model"), (model or {}).get("id"), info.get("base_model_id")]
     return [model_id for model_id in dict.fromkeys(ids) if isinstance(model_id, str) and model_id]
+
+
+def app_models(request: Any) -> Any:
+    """Open WebUI's model list by ID (request.app.state.MODELS: a dict, with Redis a RedisDict), empty
+    outside Open WebUI."""
+    try:
+        models = request.app.state.MODELS
+    except AttributeError:
+        return {}
+    return models if hasattr(models, "get") and hasattr(models, "__contains__") else {}
+
+
+def model_entries(model: dict[str, Any] | None, models: Any) -> list[Any]:
+    """The model's entry, then its base model's: a workspace model has no max_model_len of its own."""
+    base_id = ((model or {}).get("info") or {}).get("base_model_id")
+    return [model, models.get(base_id) if isinstance(base_id, str) else None]
+
+
+def served_context_tokens(model: Any) -> int | None:
+    """vLLM's max_model_len from its /v1/models entry, which Open WebUI keeps in the model (also under
+    "openai"); llama-server and Ollama report no size that fits."""
+    if not isinstance(model, dict):
+        return None
+    raw = model.get("openai") if isinstance(model.get("openai"), dict) else {}
+    return _positive_int(model.get("max_model_len")) or _positive_int(raw.get("max_model_len"))
 
 
 def user_language(language: str, metadata: dict[str, Any] | None) -> str:
@@ -232,19 +271,24 @@ def parse_model_overrides(text: str) -> dict[str, int]:
     return overrides
 
 
-def _positive_int(value: Any) -> int | None:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
+def requested_answer_tokens(body: dict[str, Any]) -> int | None:
+    """max_tokens of an OpenAI-compatible request (model or chat parameter, or the default parameters)."""
+    return _positive_int(body.get("max_tokens")) or _positive_int(body.get("max_completion_tokens"))
 
 
-async def compaction_threshold(metadata: dict[str, Any] | None) -> int | None:
-    """Token threshold of Open WebUI's Context Compaction for this request, None if it is off.
+@dataclass(frozen=True)
+class Compaction:
+    threshold: int
+    model_id: str | None  # the model that writes the summary; None = the chat model
+    summary_tokens: int
 
-    Resolved like open_webui.utils.context_compaction (0.11.4): the model's compact_token_threshold
-    or the global threshold (default 80000), capped by the token cap."""
+
+async def compaction_settings(metadata: dict[str, Any] | None) -> Compaction | None:
+    """Open WebUI's Context Compaction for this request, None if it is off.
+
+    Resolved like open_webui.utils.context_compaction (0.11.4 to 0.12.3): the model's
+    compact_token_threshold or the global threshold (default 80000), capped by the token cap; the
+    summary is written by the compaction model if one is set, with the task model parameters."""
     try:
         from open_webui.models.config import Config
 
@@ -252,6 +296,8 @@ async def compaction_threshold(metadata: dict[str, Any] | None) -> int | None:
             "chat.context_compaction.enable",
             "chat.context_compaction.token_threshold",
             "chat.context_compaction.token_cap",
+            "chat.context_compaction.model",
+            "task.model.params",
         )
     except Exception:
         log.debug("Context Guard: Context Compaction settings not available", exc_info=True)
@@ -261,7 +307,14 @@ async def compaction_threshold(metadata: dict[str, Any] | None) -> int | None:
     threshold = _positive_int(values.get("chat.context_compaction.token_threshold")) or 80000
     cap = _positive_int(values.get("chat.context_compaction.token_cap")) or threshold
     model_threshold = _positive_int(((metadata or {}).get("params") or {}).get("compact_token_threshold"))
-    return min(model_threshold or threshold, cap)
+    model_id = values.get("chat.context_compaction.model")
+    task_params = values.get("task.model.params")
+    summary_tokens = _positive_int(task_params.get("max_tokens")) if isinstance(task_params, dict) else None
+    return Compaction(
+        threshold=min(model_threshold or threshold, cap),
+        model_id=model_id if isinstance(model_id, str) and model_id else None,
+        summary_tokens=summary_tokens or DEFAULT_SUMMARY_TOKENS,
+    )
 
 
 class Filter:
@@ -281,18 +334,20 @@ class Filter:
             default=32768,
             ge=1,
             description="Context size of the model in tokens (llama-server --ctx-size, vLLM --max-model-len, "
-            "Ollama num_ctx).",
+            "Ollama num_ctx). Used when the request has no num_ctx (Ollama) and the server reports no "
+            "max_model_len (vLLM).",
         )
         model_context_tokens: str = Field(
             default="",
             description="Optional per-model context sizes as comma-separated model_id=tokens pairs, "
             "e.g. 'qwen3-32b=40960, llama3.1:8b=8192'. A workspace model uses the size of its base model "
-            "unless it has its own entry. Other models use context_tokens.",
+            "unless it has its own entry. An entry wins over num_ctx and max_model_len.",
         )
         answer_reserve_tokens: int = Field(
             default=6000,
             ge=0,
-            description="Tokens kept free for the answer, including the model's reasoning.",
+            description="Tokens kept free for the answer, including the model's reasoning; at most half the "
+            "context size (small Ollama num_ctx). A larger max_tokens of the request is kept free instead.",
         )
         chars_per_token: float = Field(
             default=3.5,
@@ -313,25 +368,46 @@ class Filter:
         self._reported_thresholds: set[tuple[str, int, int]] = set()
         self._reported_fallbacks: set[str] = set()
 
-    def _context_tokens(self, ids: list[str]) -> int:
+    def _context_tokens(self, ids: list[str], entries: list[Any], options: Any = None) -> int:
+        """A per-model valve entry, then Ollama's num_ctx of the request, then vLLM's max_model_len."""
         overrides = parse_model_overrides(self.valves.model_context_tokens)
-        return next(
-            (overrides[model_id] for model_id in ids if model_id in overrides), self.valves.context_tokens
-        )
+        override = next((overrides[model_id] for model_id in ids if model_id in overrides), None)
+        if override is not None:
+            return override
+        num_ctx = _positive_int(options.get("num_ctx")) if isinstance(options, dict) else None
+        served = next(filter(None, map(served_context_tokens, entries)), None)
+        return num_ctx or served or self.valves.context_tokens
 
-    def _report_threshold_too_high(self, model_id: str, threshold: int, usable: int) -> None:
-        if (model_id, threshold, usable) in self._reported_thresholds:
+    def _reserve(self, context: int) -> int:
+        """answer_reserve_tokens, at most half the context: a small num_ctx must not leave no room at all."""
+        return min(self.valves.answer_reserve_tokens, context // 2)
+
+    def _summary_usable(self, compaction: Compaction, model_id: str, context: int, models: Any) -> tuple[str, int]:
+        """The model that writes the summary and its usable context (`context`: the chat model's). A
+        compaction model that is not in the model list is not used (Open WebUI then takes the chat model)."""
+        if compaction.model_id and (compaction.model_id in models or not models):
+            entry = models.get(compaction.model_id)
+            ids = model_ids({"model": compaction.model_id}, entry)
+            model_id, context = compaction.model_id, self._context_tokens(ids, model_entries(entry, models))
+        return model_id, context - self._reserve(context)
+
+    def _report_threshold_too_high(
+        self, model_id: str, threshold: int, summary_model: str, needed: int, usable: int
+    ) -> None:
+        key = (model_id, threshold, usable)
+        if key in self._reported_thresholds:
             return
-        self._reported_thresholds.add((model_id, threshold, usable))
+        self._reported_thresholds.add(key)
         log.warning(
             "Context Guard: the Context Compaction threshold for model %r (%d tokens) leaves too little "
             "room: the summary request contains the whole chat plus about %d tokens and must fit into "
-            "the usable context (%d tokens). Otherwise long chats are stopped, or compacted without a "
-            "real summary. Set CONTEXT_COMPACTION_TOKEN_THRESHOLD or the model's compact_token_threshold "
+            "the usable context of %r (%d tokens). Otherwise long chats are stopped, or compacted without "
+            "a real summary. Set CONTEXT_COMPACTION_TOKEN_THRESHOLD or the model's compact_token_threshold "
             "to about half the context size.",
             model_id,
             threshold,
-            COMPACTION_RESERVE_TOKENS,
+            needed,
+            summary_model,
             usable,
         )
 
@@ -354,23 +430,36 @@ class Filter:
         __event_emitter__: EventEmitter | None = None,
         __metadata__: dict[str, Any] | None = None,
         __model__: dict[str, Any] | None = None,
+        __request__: Any = None,
     ) -> dict[str, Any]:
         """Check the final payload; warn via status event or abort with ContextLimitError."""
         model_id = body.get("model") or ""
-        usable = self._context_tokens(model_ids(body, __model__)) - self.valves.answer_reserve_tokens
-        if usable <= 0:
-            log.warning("Context Guard: answer_reserve_tokens >= context size, check is skipped")
-            return body
+        models = app_models(__request__)
+        context = self._context_tokens(
+            model_ids(body, __model__), model_entries(__model__, models), body.get("options")
+        )
+        reserve = self._reserve(context)
+        requested = requested_answer_tokens(body)
+        if requested is not None and reserve < requested < context:  # a larger value is left to the server
+            reserve = requested
+        usable = context - reserve
         used = estimate_tokens(body, self.valves.chars_per_token, self.valves.tokens_per_image, __metadata__)
         fallback_summary = has_fallback_summary(body.get("messages") or [])
         if fallback_summary:
             self._report_fallback_summary(str((__metadata__ or {}).get("chat_id") or ""))
         if used * 100 < self.valves.warn_percent * usable:
             return body
-        threshold = await compaction_threshold(__metadata__)
-        compaction_fits = threshold is not None and threshold + COMPACTION_RESERVE_TOKENS <= usable
-        if threshold is not None and not compaction_fits:
-            self._report_threshold_too_high(model_id, threshold, usable)
+        compaction = await compaction_settings(__metadata__)
+        threshold = compaction.threshold if compaction else None
+        compaction_fits = False
+        if compaction is not None:
+            summary_model, summary_usable = self._summary_usable(compaction, model_id, context, models)
+            needed = SUMMARY_PROMPT_TOKENS + compaction.summary_tokens
+            compaction_fits = compaction.threshold + needed <= summary_usable
+            if not compaction_fits:
+                self._report_threshold_too_high(
+                    model_id, compaction.threshold, summary_model, needed, summary_usable
+                )
         percent = math.ceil(used * 100 / usable)
         texts = TRANSLATIONS[user_language(self.valves.language, __metadata__)]
         if used > usable:

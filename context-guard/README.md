@@ -9,7 +9,9 @@ and warns or stops before the context window overflows.
   adds after this hook, and earlier reasoning that is sent back to the model (`reasoning_content`
   for llama.cpp, `thinking` for Ollama).
 - Once the prompt uses `warn_percent` of the usable context, a status line appears above the
-  answer. The usable context is the context size minus `answer_reserve_tokens`.
+  answer. The usable context is the context size minus `answer_reserve_tokens`, or minus the
+  request's `max_tokens` if that is larger (a model or chat parameter, or the default parameters):
+  vLLM rejects a request whose prompt and `max_tokens` together exceed `--max-model-len`.
 - If the prompt would not fit, the request is stopped with a friendly explanation and next steps:
   start a new chat, paste less text, attach fewer documents. If the user's own message makes up
   most of the prompt (a long pasted text), the message says so and suggests pasting only the
@@ -36,7 +38,17 @@ guard counts a little higher than Open WebUI does.
 
 File: [`context_guard.py`](context_guard.py). Install it under **Admin Panel → Functions** and
 enable it globally or per model, see [Installation](../README.md#installation). Set
-`context_tokens` to the context size of your model.
+`context_tokens` to the context size of your model, unless the guard finds it on its own:
+
+1. an entry for the model in `model_context_tokens`,
+2. Ollama: the model's `num_ctx` parameter (Workspace → Models → Advanced Params), which Open WebUI
+   sends with the request,
+3. vLLM: the `max_model_len` that vLLM reports in its model list (also for workspace models on a
+   vLLM base model),
+4. otherwise `context_tokens`.
+
+llama-server reports no context size that fits (only the training size), so set `context_tokens` or
+`model_context_tokens` for it.
 
 ## Valves
 
@@ -44,15 +56,15 @@ enable it globally or per model, see [Installation](../README.md#installation). 
 |---|---|---|
 | `priority` | `100` | Filter order (lower runs first). Only matters among the `request` hooks of several filters; keep it high so their changes are counted. Inlet hooks such as Company Context always run before and are counted at any priority |
 | `language` | `auto` | Language of the warning and error messages: `auto` (the user's interface language, English if there is no translation), `en` or `de` |
-| `context_tokens` | `32768` | Context size of your model: llama-server `--ctx-size`, vLLM `--max-model-len`, Ollama `num_ctx` |
-| `model_context_tokens` | _(empty)_ | Optional per-model sizes as `model_id=tokens` pairs, e.g. `qwen3-32b=40960, llama3.1:8b=8192`. A workspace model (assistant) uses the size of its base model unless it has its own entry. Other models use `context_tokens` |
-| `answer_reserve_tokens` | `6000` | Tokens kept free for the answer, including reasoning |
+| `context_tokens` | `32768` | Context size of your model: llama-server `--ctx-size`, vLLM `--max-model-len`, Ollama `num_ctx`. Used when the request has no `num_ctx` and the server reports no `max_model_len` |
+| `model_context_tokens` | _(empty)_ | Optional per-model sizes as `model_id=tokens` pairs, e.g. `qwen3-32b=40960, llama3.1:8b=8192`. A workspace model (assistant) uses the size of its base model unless it has its own entry. An entry wins over `num_ctx` and `max_model_len` |
+| `answer_reserve_tokens` | `6000` | Tokens kept free for the answer, including reasoning; at most half the context size. A larger `max_tokens` of the request is kept free instead |
 | `chars_per_token` | `3.5` | Characters per token for the estimate (English about 4, German about 3.5 to 4.3) |
 | `tokens_per_image` | `300` | Estimated tokens per attached image |
 | `warn_percent` | `75` | Show the hint from this share of the usable context (percent) |
 
-If `answer_reserve_tokens` is not smaller than the context size, the check is skipped and a
-warning is logged, so a misconfiguration never blocks every chat.
+At most half the context size is kept free for the answer, so a model with a small context (an
+Ollama `num_ctx` of 4096, say) still gets a check with the default `answer_reserve_tokens` of 6000.
 
 ## Built-in tools of Open WebUI 0.12
 
@@ -92,10 +104,11 @@ with the guard:
   The guard then stops the request with its message.
 - Long tool-call loops: Open WebUI 0.12.0 also compacts between the rounds, before the guard checks
   each round. In 0.11.4 only the guard covers a loop that keeps growing.
-- The summary request contains the whole chat plus the summary prompt and room for the summary
-  (`max_tokens` 1000 by default), so it needs about 1500 tokens more than the threshold. If the
-  threshold plus these 1500 tokens is not below the usable context, the guard logs a warning once
-  and shows its hint as usual. The default of 80000 tokens is above most local context sizes, so
+- The summary request contains the whole chat plus the summary prompt (about 500 tokens) and room
+  for the summary (`max_tokens` of the task model parameters, 1000 if they set none), so it needs
+  about 1500 tokens more than the threshold. It goes to the compaction model if one is set
+  (`CONTEXT_COMPACTION_MODEL`), otherwise to the chat model. If the threshold plus these tokens is not
+  below the usable context of that model, the guard logs a warning once and shows its hint as usual. The default of 80000 tokens is above most local context sizes, so
   compaction never runs before the guard stops a chat.
 - If the summary request fails, for example because vLLM rejects a prompt plus `max_tokens` that
   is larger than `--max-model-len`, Open WebUI does not report it: it stores the first 500

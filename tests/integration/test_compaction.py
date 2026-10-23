@@ -100,7 +100,10 @@ class OpenWebUI:
             self.api("POST", "/api/v1/functions/id/context_guard/toggle")
         if not fn.get("is_global"):
             self.api("POST", "/api/v1/functions/id/context_guard/toggle/global")
-        code, res = self.api("POST", "/api/v1/functions/id/context_guard/valves/update", GUARD_VALVES)
+        self.update_guard()
+
+    def update_guard(self, **valves: Any) -> None:
+        code, res = self.api("POST", "/api/v1/functions/id/context_guard/valves/update", {**GUARD_VALVES, **valves})
         assert code == 200, res
 
     def new_calls(self) -> list[dict[str, Any]]:
@@ -108,12 +111,12 @@ class OpenWebUI:
         calls, self.log_pos = [json.loads(line) for line in lines[self.log_pos :]], len(lines)
         return calls
 
-    def send(self, content: str, tools: bool = False) -> Turn:
+    def send(self, content: str, tools: bool = False, params: dict[str, Any] | None = None) -> Turn:
         user_id, assistant_id = str(uuid.uuid4()), str(uuid.uuid4())
         user_message = {"id": user_id, "parentId": self.parent, "childrenIds": [], "role": "user",
                         "content": content, "timestamp": int(time.time()), "models": [MODEL]}
         body = {"model": MODEL, "stream": tools, "messages": [{"role": "user", "content": content}],
-                "id": assistant_id, "parent_id": self.parent, "user_message": user_message, "params": {}}
+                "id": assistant_id, "parent_id": self.parent, "user_message": user_message, "params": params or {}}
         if self.chat_id:
             body["chat_id"] = self.chat_id
         if tools:
@@ -263,3 +266,14 @@ def test_threshold_too_close_for_vllm(start) -> None:
     assert log.count("(7000 tokens) leaves too little room") == 1
     assert log.count(f"could not get a summary from the model for chat {owui.chat_id}") == 1
     assert any(turn.status for turn in played)  # no false sense of safety: the hint is shown
+
+
+def test_vllm_context_size_and_max_tokens(start) -> None:
+    # the valve says 100k, but vLLM reports max_model_len 8192; the chat asks for max_tokens 3000,
+    # which vLLM adds to the prompt: the guard stops the chat before vLLM rejects a request
+    owui = start("vllm")
+    owui.update_guard(context_tokens=100000)
+    played = [owui.send(content, params={"max_tokens": 3000}) for content in turns(8)]
+    assert all(call["max_tokens"] == 3000 for call in owui.calls)
+    assert not any(call.get("rejected") for call in owui.calls)
+    assert any(turn.error.startswith("This request is too large for the AI model") for turn in played)

@@ -1309,7 +1309,7 @@ def test_guard_counts_the_model_system_prompt(key: str) -> None:
         body, 3.5, 300
     ) == pytest.approx((len(MODEL_PROMPT) + 1) / 3.5, abs=1)
     # blocked only because of the model's prompt
-    flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=8000)
+    flt = make_filter(cg, context_tokens=4000, answer_reserve_tokens=2000)  # usable 2000 tokens
     run_guard(flt, body_with_chars(1000))
     with pytest.raises(cg.ContextLimitError):
         run_guard(flt, body_with_chars(1000), {key: MODEL_PROMPT})
@@ -1361,8 +1361,11 @@ def test_guard_per_model_override_and_misconfiguration(caplog: pytest.LogCapture
         run_guard(flt, body_with_chars(10000, model="small:latest"))
     run_guard(flt, body_with_chars(10000, model="other"))
     assert "broken" in caplog.text and "x=abc" in caplog.text
-    body = body_with_chars(10**6)
-    assert run_guard(make_filter(cg, context_tokens=1000, answer_reserve_tokens=1000), body)[0] is body
+    # a reserve as large as the context (a small Ollama num_ctx) keeps half of it free, not all of it
+    small = make_filter(cg, context_tokens=32768)
+    assert run_guard(small, {**body_with_chars(1500 * 35 // 10), "options": {"num_ctx": 4096}})[1].events == []
+    with pytest.raises(cg.ContextLimitError):
+        run_guard(small, {**body_with_chars(2100 * 35 // 10), "options": {"num_ctx": 4096}})
 
 
 def stub_compaction_config(monkeypatch: pytest.MonkeyPatch, values: dict[str, Any]) -> None:
@@ -1482,16 +1485,103 @@ def test_guard_messages_need_no_line_breaks(language: str) -> None:
 
 def test_guard_compaction_threshold_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     per_model = {"params": {"compact_token_threshold": 5000}}
-    assert asyncio.run(cg.compaction_threshold(per_model)) is None  # outside Open WebUI
+    assert asyncio.run(cg.compaction_settings(per_model)) is None  # outside Open WebUI
     stub_compaction_config(monkeypatch, {"chat.context_compaction.enable": False})
-    assert asyncio.run(cg.compaction_threshold(per_model)) is None
+    assert asyncio.run(cg.compaction_settings(per_model)) is None
     settings = {"chat.context_compaction.enable": True, "chat.context_compaction.token_threshold": "20000"}
     stub_compaction_config(monkeypatch, settings)
-    assert asyncio.run(cg.compaction_threshold(None)) == 20000
-    assert asyncio.run(cg.compaction_threshold(per_model)) == 5000
-    assert asyncio.run(cg.compaction_threshold({"params": {"compact_token_threshold": 30000}})) == 20000
+    assert asyncio.run(cg.compaction_settings(None)).threshold == 20000
+    assert asyncio.run(cg.compaction_settings(per_model)).threshold == 5000
+    assert asyncio.run(cg.compaction_settings({"params": {"compact_token_threshold": 30000}})).threshold == 20000
     stub_compaction_config(monkeypatch, {**settings, "chat.context_compaction.token_cap": 40000})
-    assert asyncio.run(cg.compaction_threshold({"params": {"compact_token_threshold": 30000}})) == 30000
+    assert asyncio.run(cg.compaction_settings({"params": {"compact_token_threshold": 30000}})).threshold == 30000
+
+
+def test_guard_keeps_room_for_the_requested_max_tokens() -> None:
+    # 32k context, 25,005 tokens prompt: fits with the reserve of 6000, but not with max_tokens 8192,
+    # which vLLM adds to the prompt and rejects with HTTP 400
+    flt = make_filter(cg, context_tokens=32768)
+    prompt = 25005 * 35 // 10
+    assert run_guard(flt, body_with_chars(prompt))[1].events
+    for key in ("max_tokens", "max_completion_tokens"):
+        with pytest.raises(cg.ContextLimitError):
+            run_guard(flt, {**body_with_chars(prompt), key: 8192})
+    assert run_guard(flt, {**body_with_chars(prompt), "max_tokens": 2000})[1].events  # reserve is larger
+    # a max_tokens at or above the context size is left to the server (llama-server just stops there)
+    assert run_guard(flt, {**body_with_chars(prompt), "max_tokens": 32768})[1].events
+
+
+def app_request(models: Any) -> SimpleNamespace:
+    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(MODELS=models)))
+
+
+class RedisModels:
+    """Stands in for Open WebUI's RedisDict, the model list with Redis: a mapping, but no dict."""
+
+    def __init__(self, models: dict[str, Any]) -> None:
+        self.models = models
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.models.get(key, default)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.models
+
+    def __len__(self) -> int:
+        return len(self.models)
+
+
+def test_guard_reads_the_context_size_from_ollama_and_vllm() -> None:
+    flt = make_filter(cg, context_tokens=32768, answer_reserve_tokens=1000)
+    body = body_with_chars(20000 * 35 // 10)
+    assert asyncio.run(flt.request(body))  # fits into 32k
+    with pytest.raises(cg.ContextLimitError):  # Ollama: the model's num_ctx comes with the request
+        asyncio.run(flt.request({**body, "options": {"num_ctx": 8192}}))
+    vllm = {"id": "m", "max_model_len": 8192, "openai": {"id": "m", "max_model_len": 8192}}
+    with pytest.raises(cg.ContextLimitError):
+        asyncio.run(flt.request(body, __model__=vllm))
+    with pytest.raises(cg.ContextLimitError):
+        asyncio.run(flt.request(body, __model__={"id": "m", "openai": {"max_model_len": 8192}}))
+    # a workspace model has no max_model_len of its own: the base model's entry in the model list counts
+    assistant = {"id": "support", "info": {"base_model_id": "m"}}
+    support = body_with_chars(20000 * 35 // 10, model="support")
+    assert asyncio.run(flt.request(support, __model__=assistant))
+    for models in ({"m": vllm}, RedisModels({"m": vllm})):
+        with pytest.raises(cg.ContextLimitError):
+            asyncio.run(flt.request(support, __model__=assistant, __request__=app_request(models)))
+    # an entry in model_context_tokens wins
+    flt.valves.model_context_tokens = "m=40960"
+    assert asyncio.run(flt.request({**body, "options": {"num_ctx": 8192}}))
+    assert asyncio.run(flt.request(body, __model__=vllm))
+
+
+def test_guard_compaction_checks_the_model_that_writes_the_summary(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # the chat model has room for threshold 6500 + 1500, but the summary goes to a small task model
+    settings = {
+        "chat.context_compaction.enable": True,
+        "chat.context_compaction.token_threshold": 6500,
+        "chat.context_compaction.model": "small",
+    }
+    stub_compaction_config(monkeypatch, settings)
+    flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=2000, model_context_tokens="small=4096")
+    request = app_request({"m": {"id": "m"}, "small": {"id": "small"}})
+    recorder = Recorder()
+    asyncio.run(flt.request(body_with_chars(22384), __event_emitter__=recorder.emit, __request__=request))
+    assert len(recorder.events) == 1
+    assert "usable context of 'small' (2096 tokens)" in caplog.text
+    # a compaction model that is not in the model list is not used: Open WebUI takes the chat model
+    recorder = Recorder()
+    request = app_request({"m": {"id": "m"}})
+    asyncio.run(flt.request(body_with_chars(22384), __event_emitter__=recorder.emit, __request__=request))
+    assert recorder.events == []
+    # a longer summary (max_tokens of the task model parameters) needs more room
+    stub_compaction_config(
+        monkeypatch, {**settings, "chat.context_compaction.model": "", "task.model.params": {"max_tokens": 2000}}
+    )
+    assert len(run_guard(flt, body_with_chars(22384))[1].events) == 1
+    assert "plus about 2500 tokens and must fit into the usable context of 'm' (8000 tokens)" in caplog.text
 
 
 # ------------------------------------------------------------------------------- company context --
