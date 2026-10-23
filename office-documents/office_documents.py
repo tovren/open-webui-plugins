@@ -2,7 +2,7 @@
 title: Office Documents
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 0.3.2
+version: 0.4.0
 license: MIT
 required_open_webui_version: 0.11.4
 description: Lets the model create Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files. The model only supplies the content as structured JSON; fixed code builds the file, so no model-written code is ever run. The file is attached to the answer, where it can be previewed and downloaded.
@@ -15,7 +15,8 @@ Tools
   date, time), row formulas from a checked whitelist, total rows and native Excel charts.
 - create_powerpoint_file: 16:9 slides with the layouts title, section, bullets, two columns,
   table and chart (native PowerPoint charts), plus speaker notes.
-Inline **bold**, *italic* and [links](https://...) work in Word and PowerPoint; Excel cells get plain text.
+Inline **bold**, *italic* and [links](https://...) work in Word and PowerPoint; Excel cells get plain text (a cell
+that is one link gets it as a hyperlink).
 
 Security & privacy
 - The model never writes code: it fills in a fixed JSON schema, the plugin validates it and builds
@@ -43,7 +44,7 @@ import unicodedata
 import zipfile
 from collections.abc import Awaitable, Callable, Collection, Iterator
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any, ClassVar, Literal, NamedTuple
 
 from docx import Document
@@ -160,6 +161,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "paper": "letter",
         "chart": "Chart",
         "notes": "Notes",
+        "true": "TRUE",  # as Excel shows booleans
+        "false": "FALSE",
+        "yes": "Yes",  # booleans in Word and slide tables
+        "no": "No",
     },
     "de": {
         "status_word": "Word-Dokument wird erstellt …",
@@ -177,6 +182,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "paper": "a4",
         "chart": "Diagramm",
         "notes": "Notizen",
+        "true": "WAHR",
+        "false": "FALSCH",
+        "yes": "Ja",
+        "no": "Nein",
     },
 }
 
@@ -333,8 +342,8 @@ class WordBlock(Schema):
 
     @field_validator("rows", mode="before")
     @classmethod
-    def _null_cells(cls, rows: Any) -> Any:
-        return null_cells(rows)
+    def _null_cells(cls, rows: Any, info: ValidationInfo) -> Any:
+        return null_cells(rows, info.context)
 
     @model_validator(mode="after")
     def _content_in_the_field_of_the_type(self) -> "WordBlock":
@@ -401,7 +410,7 @@ class ExcelChart(Schema):
 class ExcelSheet(Schema):
     name: str = Field(default="", description="Sheet name, at most 31 characters.")
     columns: list[ExcelColumn] = Field(description="Columns from left to right.")
-    rows: list[list[str | float | None]] = Field(
+    rows: list[list[str | float | bool | None]] = Field(
         default=[],
         description="Data rows. Each row has one value per column, in column order. Use JSON numbers for "
         "numbers and null for empty cells and formula columns.",
@@ -491,8 +500,8 @@ class Slide(Schema):
 
     @field_validator("table", mode="before")
     @classmethod
-    def _null_cells(cls, rows: Any) -> Any:
-        return null_cells(rows)
+    def _null_cells(cls, rows: Any, info: ValidationInfo) -> Any:
+        return null_cells(rows, info.context)
 
     @model_validator(mode="before")
     @classmethod
@@ -542,11 +551,16 @@ def top_level(items: list[str], numbered: bool = False) -> list[str]:
     return result
 
 
-def null_cells(rows: Any) -> Any:
-    """null in a table cell is an empty cell."""
+def null_cells(rows: Any, texts: dict[str, str] | None = None) -> Any:
+    """null in a table cell is an empty cell, true and false are Yes and No in the language of `texts`."""
     if not isinstance(rows, list):
         return rows
-    return [["" if cell is None else cell for cell in row] if isinstance(row, list) else row for row in rows]
+    texts = texts or TRANSLATIONS["en"]
+
+    def cell(value: Any) -> Any:
+        return "" if value is None else texts["yes" if value else "no"] if isinstance(value, bool) else value
+
+    return [[cell(value) for value in row] if isinstance(row, list) else row for row in rows]
 
 
 WORD_BLOCKS = TypeAdapter(list[WordBlock])
@@ -595,12 +609,28 @@ def _union_errors(errors: list[Any]) -> list[Any]:
     return kept
 
 
-def parse_argument(adapter: TypeAdapter, value: Any, name: str, extras: dict[str, Any] | None = None) -> Any:
+VALID_TYPE = "Input should be a valid "
+
+
+def _join_type_errors(messages: list[str]) -> list[str]:
+    """One line for the types a value may have ('Input should be a valid string, number or boolean' for an Excel
+    cell), instead of one per type: these would push out the places of other errors (MAX_ERRORS_SHOWN)."""
+    types = [message.removeprefix(VALID_TYPE) for message in messages if message.startswith(VALID_TYPE)]
+    if len(types) < 2 or len(types) < len(messages):
+        return messages
+    return [VALID_TYPE + ", ".join(types[:-1]) + " or " + types[-1]]
+
+
+def parse_argument(
+    adapter: TypeAdapter, value: Any, name: str, extras: dict[str, Any] | None = None,
+    texts: dict[str, str] | None = None,
+) -> Any:  # fmt: skip
     """Validate a tool argument.
 
     Some models send nested arguments as a JSON string (see loads_lenient); `extras` receives other tool
     parameters that the model wrote into the same JSON text. Every validated item remembers its position in
     the list (`_index`), so error messages still name the item the model sent after empty blocks were left out.
+    `texts` (TRANSLATIONS) give the words for true and false in tables.
     """
     if isinstance(value, str):
         value = _loads_argument(value, name, extras, adapter)
@@ -625,12 +655,13 @@ def parse_argument(adapter: TypeAdapter, value: Any, name: str, extras: dict[str
                 + [f"Write every key and string with plain double quotes and send the complete {name} again."]
             )  # fmt: skip
     try:
-        result = adapter.validate_python(value)
+        result = adapter.validate_python(value, context=texts)
     except ValidationError as e:
-        raise InvalidInput(
-            [f"{_location((name, *err['loc']))}: {err['msg'].removeprefix('Value error, ')}"
-             for err in _union_errors(e.errors())]
-        ) from e  # fmt: skip
+        errors: dict[str, list[str]] = {}
+        for err in _union_errors(e.errors()):
+            errors.setdefault(_location((name, *err["loc"])), []).append(err["msg"].removeprefix("Value error, "))
+        raise InvalidInput([f"{where}: {message}" for where, messages in errors.items()
+                            for message in _join_type_errors(messages)]) from e  # fmt: skip
     for i, item in enumerate(result):
         item._index = i
     return result
@@ -690,6 +721,8 @@ def json_error_hint(text: str, pos: int, msg: str) -> str:
         return "a line break or tab inside a text must be written as \\n or \\t"
     if pos >= len(text.rstrip()):
         return "the arguments end in the middle (cut off, e.g. at the output limit): send them again completely"
+    if msg.startswith("Illegal trailing comma"):  # Python 3.13 and later: the mark is at the comma
+        return f"delete the comma before the {text[pos + 1 :].lstrip()[:1]}"
     if msg == "Expecting value" and char in "„“”‘’'":
         return 'a text must start and end with a straight double quote "'
     if msg == "Expecting value" and text.startswith(("True", "False", "None"), pos):
@@ -807,18 +840,33 @@ TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\
 LIST_LINE_RE = re.compile(r"^(?P<indent>\s*)(?:(?P<bullet>[-*•])|(?P<number>\d{1,3})[.)])\s+(?P<text>\S.*)$")
 HEADING_LINE_RE = re.compile(r"^\s{0,3}(?P<level>#{1,6})\s+(?P<text>\S.*?)(?:\s+#+)?\s*$")
 RULE_LINE_RE = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")  # ---, ***, ___
+# ```, ```bash, ~~~ c++: the fence and at most one word; not ```inline code``` or ~~~durchgestrichen~~~ Text
+CODE_FENCE_RE = re.compile(r"^\s{0,3}(?P<fence>`{3,}(?=\s*[^\s`]*\s*$)|~{3,}(?=\s*[^\s~]*\s*$))")
 
 
 def split_paragraph(text: str) -> list[tuple[str, list[str]]]:
-    """Split paragraph text into ("text", lines), ("bullets", items), ("numbered", items), ("table", lines) and
-    ("heading1" to "heading3", [text]) parts.
+    """Split paragraph text into ("text", lines), ("bullets", items), ("numbered", items), ("table", lines),
+    ("code", lines) and ("heading1" to "heading3", [text]) parts.
 
     Models often write Markdown into a paragraph: lists (indented list lines become '- ' sub items), tables,
-    headings ('## Abschnitt') and rules ('---', left out). Numbered lines only form a list when they count up
-    from 1, so lines that merely start with a number ('3. Oktober ist Feiertag.') stay text.
+    headings ('## Abschnitt'), rules ('---', left out) and code blocks between ``` lines, whose lines stay as they
+    are ('# comment' is no heading). Numbered lines only form a list when they count up from 1, so lines that
+    merely start with a number ('3. Oktober ist Feiertag.') stay text.
     """
     parts: list[tuple[str, list[str]]] = []
+    fence = ""  # the ``` of an open code block; without its closing line the block ends with the text
     for line in text.strip().split("\n"):
+        if fence:
+            closing = line.strip()
+            if closing.startswith(fence) and not closing.strip(fence[0]):
+                fence = ""
+            else:
+                parts[-1][1].append(line.rstrip())
+            continue
+        if opening := CODE_FENCE_RE.match(line):
+            fence = opening["fence"]
+            parts.append(("code", []))
+            continue
         if RULE_LINE_RE.match(line):
             parts.append(("break", []))
             continue
@@ -858,7 +906,10 @@ def split_paragraph(text: str) -> list[tuple[str, list[str]]]:
     for kind, lines in parts:
         if kind == "table" and not (len(lines) >= 2 and any(TABLE_SEPARATOR_RE.match(line) for line in lines)):
             kind = "text"  # lines with | but no table
-        if kind != "break":
+        if kind == "code":
+            filled = [i for i, line in enumerate(lines) if line.strip()]
+            lines = lines[filled[0] : filled[-1] + 1] if filled else []
+        if kind != "break" and lines:
             result.append((kind, lines))
     return result
 
@@ -879,6 +930,7 @@ TOOL_PARAMETERS = {"title", "subtitle", "header_text", "table_of_contents", "lan
 TRAILING_PARAMETER_RE = re.compile(r',\s*"(\w+)"\s*:')
 LITERAL_BEFORE_RE = re.compile(r":\s*(?:-?\d[\d.eE+-]*|true|false|null)\s*$")  # '"level": 1' before a stray '"'
 UNQUOTED_KEY_RE = re.compile(r'[A-Za-z_]\w*"\s*:')  # 'level": 2': the opening quote of a key is missing
+TRAILING_COMMA_RE = re.compile(r",\s*[\]}]")
 
 
 def _reject_constant(name: str) -> Any:
@@ -911,7 +963,7 @@ def loads_lenient(text: str, extras: dict[str, Any] | None = None, accept: Calla
       'null]]}') are swapped, one too many is deleted, forgotten ones are added before it; an object whose '{' is
       missing in a list ('}, "name": …') gets it.
     - A stray quote after a number ('"level": 1"}') is deleted, a missing opening quote of a key ('level": 2')
-      added.
+      added, a comma before a closing bracket ('"b",]') deleted.
     - Other forgotten closing brackets are added where a different bracket closes, or at the end if the
       text ends with a complete object or array.
     - Other tool parameters written into the same text after the value ('[...], "title": "T"') are
@@ -971,6 +1023,10 @@ def _json_repairs(text: str, e: json.JSONDecodeError, bracket_fix_used: bool) ->
     bracket fix over the whole text, which is tried once)."""
     pos, char = e.pos, text[e.pos : e.pos + 1]
     comma = text.rfind(",", 0, pos)
+    if char == "," and TRAILING_COMMA_RE.match(text, pos):  # '"b",]': Python 3.13 and later mark the comma
+        yield text[:pos] + text[pos + 1 :], False
+    elif char and char in "]}" and text[:pos].rstrip().endswith(","):  # earlier versions the bracket after it
+        yield text[:comma] + text[comma + 1 :], False
     key_expected = e.msg == "Expecting property name enclosed in double quotes"
     if key_expected and char == "{" and comma >= 0:
         yield text[:comma] + "}" + text[comma:], False
@@ -1113,7 +1169,11 @@ class Checker:
 # ----------------------------------------------------------------------------------- inline markdown --
 
 INLINE_RE = re.compile(
-    r"\\(?P<escaped>[\\`*_{}\[\]()#+\-.!|~<>])"
+    # A Windows path keeps its backslashes, also before _ or *: \\fs01\Vertrieb\_Archiv, C:\Daten\*.xlsx. It is a
+    # whole word (after a space, bracket or quote); one with doubled backslashes inside (\\\\fs01\\Vertrieb,
+    # C:\\Daten) is escaped Markdown, the rule after it applies.
+    r"(?P<path>(?<![^\s(\[{\"'„“‘«])(?:\\\\(?=[^\s\\])|[A-Za-z]:(?=\\))(?:(?!\\\\)\S)*(?!\S))"
+    r"|\\(?P<escaped>[\\`*_{}\[\]()#+\-.!|~<>])"
     r"|`(?P<code>[^`]+)`"
     r"|!?\[(?P<label>[^\]]*)\]\((?P<url>(?:[^()\s]|\([^()\s]*\))+)(?:\s+\"[^\"]*\")?\)"
     r"|<(?P<autolink>(?:https?://|mailto:)[^>\s]+)>"
@@ -1177,8 +1237,8 @@ def parse_inline(text: str, style: Run = PLAIN) -> list[Run]:
 
 def _runs_for_match(match: re.Match[str], style: Run) -> list[Run]:
     kind = match.lastgroup or ""
-    if kind == "escaped":
-        return [replace(style, text=match["escaped"])]
+    if kind in ("path", "escaped"):
+        return [replace(style, text=match[kind])]
     if kind == "code":
         return [replace(style, text=match["code"], code=True)]
     if kind == "url":
@@ -1195,9 +1255,23 @@ def to_plain(text: str) -> str:
 
 
 def excel_text(text: str) -> str:
-    """Text for an Excel cell: Excel cells have no inline formatting, so Markdown markers are removed."""
+    """Text for an Excel cell: Excel cells have no inline formatting, so Markdown markers are removed; a link keeps
+    its address after the label ('Intranet (https://…)'), a cell can only link to one."""
     text = clean_text(text)
-    return to_plain(text) if any(marker in text for marker in "*_`[~<\\") else text
+    if not any(marker in text for marker in "*_`[~<\\"):
+        return text
+    runs = parse_inline(text)
+    return "".join(run.text + (f" ({run.url})" if run.url and run.url != run.text else "") for run in runs).strip()
+
+
+def excel_link(text: str) -> tuple[str, str] | None:
+    """(label, address) of a cell that is one link and nothing else ('[Intranet](https://…)', '<https://…>')."""
+    if "](" not in text and "<" not in text:
+        return None
+    runs = [run for run in parse_inline(text) if run.text.strip() or run.url]
+    if len(runs) == 1 and runs[0].url:
+        return runs[0].text.strip(), runs[0].url
+    return None
 
 
 MAILTO_FIELDS = {"subject", "body", "cc", "bcc"}  # others, e.g. "attach", are acted on by some mail clients
@@ -1334,6 +1408,7 @@ class WordOptions:
     page_numbers: bool = True
     design: Design = DEFAULT_DESIGN
     template: bytes | None = None  # see read_word_template
+    author: str = ""  # the user's name
 
 
 def word_title(title: str, blocks: list[WordBlock], fallback: str = "") -> tuple[str, list[WordBlock]]:
@@ -1399,12 +1474,25 @@ def check_word(options: WordOptions, blocks: list[WordBlock]) -> None:
     check.raise_if_failed()
 
 
-def _set_cell_shading(cell: Any, fill: str) -> None:
+def set_core_properties(core: Any, title: str, author: str) -> None:
+    """Title, author and dates of a Word or PowerPoint file. Otherwise it keeps those of the file it is made from:
+    python-docx's and python-pptx's own (author 'python-docx' or 'Steve Canny', made in 2013), or a template's."""
+    core.title, core.author, core.last_modified_by = to_plain(title)[:255], author[:255], author[:255]
+    core.subject = core.keywords = core.comments = core.category = ""
+    core.created = core.modified = datetime.now(UTC).replace(tzinfo=None)
+    core.revision = 1
+
+
+def _shading(fill: str) -> Any:
     shading = OxmlElement("w:shd")
     shading.set(qn("w:val"), "clear")
     shading.set(qn("w:color"), "auto")
     shading.set(qn("w:fill"), fill)
-    cell._tc.get_or_add_tcPr().append(shading)
+    return shading
+
+
+def _set_cell_shading(cell: Any, fill: str) -> None:
+    cell._tc.get_or_add_tcPr().append(_shading(fill))
 
 
 def _add_field(paragraph: DocxParagraph, instruction: str, placeholder: str = "") -> None:
@@ -1616,9 +1704,6 @@ class DocxWriter:
                 for node in element.iter():
                     if node.get(qn("r:id")):
                         settings_part.drop_rel(node.get(qn("r:id")))
-        core = self.doc.core_properties  # the template's author, title ... are not the document's
-        core.author = core.last_modified_by = core.subject = core.keywords = core.comments = core.category = ""
-        core.title = to_plain(self.options.title)
 
     def _take_numbering(self, default: Any) -> None:
         """The list styles now point to the default template's numbering: copy it in, with new numbers."""
@@ -1724,6 +1809,7 @@ class DocxWriter:
             last.paragraph_format.space_after = Pt(18)
         if self.options.table_of_contents:
             self._table_of_contents()
+        set_core_properties(self.doc.core_properties, self.options.title, self.options.author)
         for block in blocks:
             match block.type:
                 case "heading":
@@ -1759,7 +1845,7 @@ class DocxWriter:
             section.page_width, section.page_height = section.page_height, section.page_width
         if self.options.header_text.strip() and section.header.is_linked_to_previous:
             header = section.header.paragraphs[0]
-            header.text = clean_text(self.options.header_text.strip())
+            header.text = clean_text(to_plain(self.options.header_text))  # plain like the title and the footer
             header.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         if self.options.page_numbers and section.footer.is_linked_to_previous:
             self._footer(section)
@@ -1819,10 +1905,24 @@ class DocxWriter:
                 self._add_runs(self.doc.add_paragraph(style=self.body_style), parse_inline("\n".join(lines)))
             elif kind == "table":
                 self._table(markdown_table_rows(lines))
+            elif kind == "code":
+                self._code(lines)
             elif kind.startswith("heading"):
                 self.doc.add_heading(to_plain(lines[0]), level=int(kind[-1]))
             else:
                 self._list(lines, ordered=kind == "numbered")
+
+    def _code(self, lines: list[str]) -> None:
+        """A code block: monospace on a light background, lines and indentation as written, no Markdown."""
+        paragraph = self.doc.add_paragraph(style=self.body_style)
+        paragraph.paragraph_format.line_spacing = 1.0
+        properties = paragraph._p.get_or_add_pPr()
+        band = self.design.band  # lines in the background colour: room between the text and the edge
+        sides = [(side, 4, band) for side in ("top", "left", "bottom", "right")]
+        _set_borders(properties, "w:pBdr", PPR_AFTER_BORDERS, sides)
+        properties.insert_element_before(_shading(band), *PPR_AFTER_BORDERS[1:])
+        run = paragraph.add_run(clean_text("\n".join(lines)))
+        run.font.name, run.font.size = CODE_FONT, Pt(9.5)
 
     def _style_names(self) -> set[str]:
         return {style.name for style in self.doc.styles}
@@ -2493,6 +2593,7 @@ CURRENCY_CODES = {"€": "EUR", "EUR": "EUR", "$": "USD", "USD": "USD", "£": "G
 DATE_FORMATS = ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M",
                 "%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M")  # fmt: skip
 DATE_LIKE_RE = re.compile(r"[0-9]{1,4}([./-])[0-9]{1,2}(?:\1[0-9]{1,4})?(?:[ T].*)?|[0-9]{1,2}[./][0-9]{4}")
+ISO_TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}\S*")  # 2026-10-23T08:30:00Z
 MONTH_ONLY_RE = re.compile(r"[0-9]{4}-[0-9]{1,2}|[0-9]{1,2}[./-][0-9]{4}")
 TIME_RE = re.compile(
     r"(?P<hours>[0-9]{1,3}):(?P<minutes>[0-5][0-9])(?::(?P<seconds>[0-5][0-9]))?(?:\s*(?:Uhr|h))?", re.IGNORECASE
@@ -2522,6 +2623,25 @@ def parse_number_text(text: str, decimal_comma: bool | None = None) -> tuple[flo
     return number, False
 
 
+def written_decimal_marks(values: list[Any]) -> dict[str, str]:
+    """The decimal marks that the number texts of a column show whatever the language, each with the first text
+    showing it: ',' for '2.350,50' and '980,00' (a separator after the thousands, or one not followed by three
+    digits), '.' for '1,234,567' (a separator that comes twice separates thousands)."""
+    marks: dict[str, str] = {}
+    for value in values:
+        match = NUMBER_RE.fullmatch(value.strip().replace("\u2212", "-")) if isinstance(value, str) else None
+        if match and match["decimal"]:
+            marks.setdefault(match["decimal"], value.strip())
+        elif match and match["group"] in (",", ".") and match["int"].count(match["group"]) > 1:
+            marks.setdefault("," if match["group"] == "." else ".", value.strip())
+    return marks
+
+
+def ambiguous_number(value: Any) -> bool:
+    """A number text that the decimal mark decides: '1.500' is 1500 or 1.5."""
+    return isinstance(value, str) and parse_number_text(value, True) != parse_number_text(value, False)
+
+
 def value_currency(value: Any) -> str | None:
     """The currency written with an amount ('$1,200.00' -> 'USD'); None without one."""
     match = NUMBER_RE.fullmatch(value.strip().replace("\u2212", "-")) if isinstance(value, str) else None
@@ -2529,12 +2649,19 @@ def value_currency(value: Any) -> str | None:
 
 
 def parse_date(text: str) -> date | datetime | None:
+    """A date, or a date with a time; an ISO timestamp with seconds' fractions or a time zone
+    ('2026-10-23T08:30:00Z', '…+02:00') keeps the time as written: Excel has no time zones."""
     for date_format in DATE_FORMATS:
         try:
             parsed = datetime.strptime(text.strip(), date_format)
         except ValueError:
             continue
         return parsed if "%H" in date_format else parsed.date()
+    if ISO_TIMESTAMP_RE.fullmatch(text.strip()):
+        try:
+            return datetime.fromisoformat(text.strip()).replace(tzinfo=None)
+        except ValueError:
+            return None
     return None
 
 
@@ -2551,19 +2678,22 @@ def date_problem(value: Any) -> str | None:
     """Why a value of a date column cannot be written as a date; None for dates, and for words that may stay
     text (e.g. 'offen')."""
     if isinstance(value, int | float) and not isinstance(value, bool):
-        return f"{value:g} is a number, not a date: write dates as YYYY-MM-DD"
+        return f"{value:g} is a number, not a date: write dates as YYYY-MM-DD (with a time: YYYY-MM-DD hh:mm)"
     text = str(value).strip()
     if not text or parse_date(text):
         return None
     if parse_time(text) is not None:
-        return f"'{text}' is a time: write dates as YYYY-MM-DD, and times into a column of type time"
+        return (
+            f"'{text}' is a time: write dates as YYYY-MM-DD (with a time: YYYY-MM-DD hh:mm), and times alone into a "
+            "column of type time"
+        )
     if not DATE_LIKE_RE.fullmatch(text):
         return None
     if "/" in text:
         return f"'{text}' could be day/month or month/day: write dates as YYYY-MM-DD (or DD.MM.YYYY)"
     if MONTH_ONLY_RE.fullmatch(text):
         return f"'{text}' has no day: write a whole date (e.g. 2026-11-01), or give the column the type text for months"
-    return f"'{text}' is not a valid date: write dates as YYYY-MM-DD, e.g. 2026-11-02"
+    return f"'{text}' is not a valid date: write dates as YYYY-MM-DD, e.g. 2026-11-02, with a time as YYYY-MM-DD hh:mm"
 
 
 def time_problem(value: Any) -> str | None:
@@ -2583,14 +2713,19 @@ def time_problem(value: Any) -> str | None:
 NULL_TEXTS = {"null", "none", "nan"}
 
 
-def convert_value(value: str | float | None, column_type: str, decimal_comma: bool | None = None) -> tuple[Any, bool]:
+def convert_value(
+    value: str | float | bool | None, column_type: str, decimal_comma: bool | None = None
+) -> tuple[Any, bool]:
     """Return (cell value, is_typed). Values that do not fit the column type stay text (is_typed False).
 
-    JSON numbers stay numbers in text columns too, so sums and charts over them work. A time is the fraction of a
-    day, as in Excel.
+    JSON numbers stay numbers in text columns too, so sums and charts over them work; true and false are Excel's
+    TRUE and FALSE (WAHR, FALSCH in German Excel), which are no numbers. A time is the fraction of a day, as in
+    Excel.
     """
     if blank(value):
         return None, True
+    if isinstance(value, bool):
+        return value, column_type == "text"
     if column_type == "text":
         if isinstance(value, float):
             return (int(value) if value.is_integer() else value), True
@@ -2620,7 +2755,16 @@ def computable(value: Any) -> bool:
     if value is None or isinstance(value, int | float | date):
         return True
     text = str(value)
-    return parse_number_text(text) is not None or parse_date(text) is not None or parse_time(text) is not None
+    if parse_number_text(text) is not None or parse_time(text) is not None:
+        return True
+    parsed = parse_date(text)
+    return parsed is not None and not early_date(parsed)  # '1871-01-18' stays text in Excel too
+
+
+def early_date(value: Any) -> bool:
+    """Whether a value is a date before 1 March 1900: Excel shows none before 1900, and up to 28 February 1900 it
+    counts a day apart from LibreOffice. Such dates are written as text."""
+    return isinstance(value, date) and value.timetuple()[:3] < FIRST_EXCEL_DATE
 
 
 def _decimals(values: list[Any]) -> int:
@@ -2640,6 +2784,7 @@ ALIGN = {
     "date": Alignment(horizontal="center", vertical="center"),
     "lines": Alignment(horizontal="left", vertical="top", wrap_text=True, indent=1),
 }
+FIRST_EXCEL_DATE = (1900, 3, 1)  # earlier dates stay text
 WIDE_SHEET_COLUMNS = 6  # wider sheets, and sheets with a chart, are printed in landscape
 NARROW_FONTS = {"calibri", "carlito"}  # most other fonts are wider: columns get more room, header rows grow
 SHEET_NAME_INVALID_RE = re.compile(r"[\[\]:*?/\\]")
@@ -2660,6 +2805,35 @@ UNIT_TEXT_RE = re.compile(  # '3 h', '500 Stk', 'ca. 500'
 )
 
 
+# Headers of columns whose numbers are years, numbers or codes, not amounts: 'Jahr', 'Kundennr.', 'Order no.', 'PLZ'.
+# Only clear names: 'Average number', 'Number of employees' and 'Durchschnittliche Nummer' are amounts.
+ID_QUALIFIERS = (
+    r"invoice|order|purchase order|customer|client|item|article|part|product|project|contract|document|serial|batch"
+    r"|account|phone|telephone|ticket|tracking|reference|ref\.?|employee|personnel|staff|cost cent(?:re|er)|postal|zip"
+    r"|tax|vat|line|row"
+)
+ID_HEADER_RE = re.compile(
+    r"(?:geschäfts|kalender|wirtschafts|bau)?jahr|jahrgang|(?:fiscal |calendar )?year"
+    r"|nr\.?|no\.?|#|nummer|(?:[^\W\d_][\w.]*[ -])?id|(?:lfd\.?|laufende) (?:nr\.?|nummer)"
+    r"|[^\W\d_][\w.]*-?(?:nr\.?|nummer)"  # Kundennummer, Kunden-Nr., Rechnungsnr.
+    rf"|(?:{ID_QUALIFIERS})[ -]?(?:number|no\.?|nr\.?|#)"
+    r"|pos(?:ition)?\.?|plz|postleitzahl|zip(?: code)?|postal code|postcode"
+)
+
+
+def id_column(column: ExcelColumn, values: list[Any]) -> bool:
+    """A column of years, numbers or codes ('Jahr', 'Kundennr.', 'PLZ'): its header says so, it has no total, and its
+    cell values are whole numbers. It is shown without thousands separators (2024, not 2.024) and a chart does not
+    plot it unless asked."""
+    header = " ".join(re.sub(r"\([^()]*\)", " ", to_plain(column.header)).split()).strip(" :").casefold()
+    return (
+        column.total == "none"
+        and bool(ID_HEADER_RE.fullmatch(header))
+        and all(isinstance(v, int | float) and not isinstance(v, bool) and float(v).is_integer()
+                for v in values if v is not None)
+    )  # fmt: skip
+
+
 def sheet_names(sheets: list[ExcelSheet], fallback: str = "Sheet") -> list[str]:
     """Make valid, unique sheet names (31 characters, no []:*?/\\)."""
     names: list[str] = []
@@ -2676,7 +2850,7 @@ def sheet_names(sheets: list[ExcelSheet], fallback: str = "Sheet") -> list[str]:
     return names
 
 
-def align_rows(sheet: ExcelSheet) -> list[list[str | float | None]]:
+def align_rows(sheet: ExcelSheet) -> list[list[str | float | bool | None]]:
     """Rows that left out the formula columns get None inserted at those positions; short rows are filled up."""
     formula_positions = [i for i, column in enumerate(sheet.columns) if column.formula.strip()]
     short = len(sheet.columns) - len(formula_positions)
@@ -2860,6 +3034,7 @@ class Book:
         self._parsed: dict[str, tuple[list[FormulaToken], FormulaNode]] = {}
         self._kinds: dict[tuple[int, int], str] = {}
         self._inputs: dict[tuple[int, int, int], bool] = {}
+        self._decimal_commas: dict[tuple[int, int], bool | None] = {}
 
     def where(self, s: int) -> str:
         return item_place("sheets", self.sheets[s], s)
@@ -2950,10 +3125,21 @@ class Book:
         return token.text if "!" in token.text or not token.sheet else _sheet_prefix(token.sheet) + token.text
 
     def value(self, s: int, r: int, c: int) -> Any:
-        """What is written into data row r (from 0) of column c: a number, date, text or None."""
+        """What is written into data row r (from 0) of column c: a number, date, text, boolean or None. A date before
+        1 March 1900 is text, as in the file."""
         rows = self.sheets[s].rows
         raw = rows[r][c] if 0 <= r < len(rows) and c < len(rows[r]) else None
-        return convert_value(raw, self.sheets[s].columns[c].type, self.decimal_comma)[0]
+        value = convert_value(raw, self.sheets[s].columns[c].type, self.decimal_comma_of(s, c))[0]
+        return early_date_text(value, False) if early_date(value) else value
+
+    def decimal_comma_of(self, s: int, c: int) -> bool | None:
+        """Whether a column's number texts use the decimal comma: as their values show it ('2.350,50' next to '1.500',
+        also against the language), or as the language has it (decimal_comma). A column with both marks is sent back
+        (decimal_mark_problem)."""
+        if (s, c) not in self._decimal_commas:
+            marks = written_decimal_marks([row[c] for row in self.sheets[s].rows if c < len(row)])
+            self._decimal_commas[(s, c)] = "," in marks if len(marks) == 1 else self.decimal_comma
+        return self._decimal_commas[(s, c)]
 
     def used_columns(self) -> set[tuple[int, int]]:
         """(sheet, column) of every column a formula uses, the columns of ranges included."""
@@ -3125,9 +3311,11 @@ class Book:
         kind = self.kind(s, c) if formula and column.type == "text" else column.type
         match kind:
             case "integer":
-                return "#,##0"
+                return "0" if id_column(column, values) else "#,##0"
             case "number" | "hours":
                 decimals = _decimals(values) if not formula else 2
+                if kind == "number" and not decimals and id_column(column, values):
+                    return "0"
                 return "#,##0" + ("." + "0" * decimals if decimals else "")
             case "currency":
                 return CURRENCY_FORMATS[self.currency_of(s, c)]
@@ -3263,7 +3451,8 @@ def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: se
         uses = [what for what, given in (("the total", column.total != "none"), ("the formulas", (s, c) in used),
                                          ("the chart", (s, c) in charted)) if given]  # fmt: skip
         values = [(r, row[c]) for r, row in enumerate(rows) if not blank(row[c]) and (s, r, c) not in book.cells]
-        texts = [(r, v) for r, v in values if not convert_value(v, column.type, book.decimal_comma)[1]]
+        decimal_comma = book.decimal_comma_of(s, c)
+        texts = [(r, v) for r, v in values if not convert_value(v, column.type, decimal_comma)[1]]
         words = [(r, v) for r, v in texts if str(v).strip().lower() not in PLACEHOLDERS]
         if column.type in NUMBER_TYPES:
             if len(texts) >= 2 and len(texts) * 2 > len(values):
@@ -3276,7 +3465,10 @@ def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: se
                 )
                 count = f"{len(texts)} of {len(values)}"
                 problems.append(f"{name}: {count} values are not numbers (e.g. '{example}'). {advice}")
-            elif column.type == "percent" and (fraction := _fractions_only([v for _, v in values], book)) is not None:
+            elif (
+                column.type == "percent"
+                and (fraction := _fractions_only([v for _, v in values], decimal_comma)) is not None
+            ):
                 problems.append(
                     f"{name}: all values are below 1 (e.g. {fraction}), but a percent column takes percent numbers: "
                     f"5 means 5 %, so {fraction} would show as {fraction} %. Send 5 for 5 % (or '5 %'); a value that "
@@ -3289,6 +3481,8 @@ def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: se
                     f"{where}.rows[{r}]: '{value}' in '{header}' is not a number{more}, so {' and '.join(uses)} "
                     f"cannot count it: {number_advice(str(value), header)}"
                 )
+            if problem := decimal_mark_problem([v for _, v in values]):
+                problems.append(f"{name}: {problem}")
             if column.type == "currency" and len(found := book.currencies(s, c)) > 1:
                 problems.append(
                     f"{name}: the values have different currencies ({', '.join(found)}); a column has one currency: "
@@ -3341,7 +3535,21 @@ def _column_problems(book: Book, s: int, used: set[tuple[int, int]], charted: se
     return problems
 
 
-def _fractions_only(values: list[Any], book: Book) -> float | None:
+def decimal_mark_problem(values: list[Any]) -> str | None:
+    """Values of a number column with both decimal marks ('2.350,50' and '$1,200.50'), next to one that they decide
+    ('1.500'): it would be read in one of the two ways without a word."""
+    marks = written_decimal_marks(values)
+    unclear = next((value for value in values if ambiguous_number(value)), None)
+    if len(marks) < 2 or unclear is None:
+        return None
+    readings = " or ".join(f"{number[0]:g}" for comma in (False, True) if (number := parse_number_text(unclear, comma)))
+    return (
+        f"the values use both ',' and '.' as decimal mark ('{marks[',']}', '{marks['.']}'), so '{unclear.strip()}' "
+        f"could be {readings}: send the numbers as JSON numbers (1500.5)"
+    )
+
+
+def _fractions_only(values: list[Any], decimal_comma: bool | None) -> float | None:
     """The first value if every value of a percent column but 0 is a plain number between -1 and 1: the model sent
     fractions (0.05 for 5 %), which the column would show as 0.05 %. None if any value has a '%' or is 1 or more."""
     numbers = []
@@ -3350,7 +3558,7 @@ def _fractions_only(values: list[Any], book: Book) -> float | None:
             continue
         if isinstance(value, int | float):
             numbers.append(value)
-        elif isinstance(value, str) and (parsed := parse_number_text(value, book.decimal_comma)) and not parsed[1]:
+        elif isinstance(value, str) and (parsed := parse_number_text(value, decimal_comma)) and not parsed[1]:
             numbers.append(parsed[0])
         else:
             return None
@@ -3566,14 +3774,20 @@ def _arithmetic_problems(book: Book) -> list[str]:
             continue
         reported.add(key)
         values = [book.value(t, r, column) for r in range(len(target.rows))]
-        if not any(value is not None and computable(value) for value in values):
+        r, value = bad[0]
+        more = f" (and {len(bad) - 1} more rows)" if len(bad) > 1 else ""
+        if isinstance(value, str) and early_date(parse_date(value)):
+            problems.append(
+                f"{use.place}: the formula computes with '{header}' ({name}), but {book.where(t)}.rows[{r}] has "
+                f"'{value}' there{more}: Excel has no dates before 1900-03-01, so it is written as text, and computing "
+                "with it gives #VALUE!: write the results as values instead"
+            )
+        elif not any(value is not None and computable(value) for value in values):
             problems.append(
                 f"{use.place}: the formula computes with {name}, but '{header}' holds text (e.g. '{bad[0][1]}'), which "
                 f"gives #VALUE!; is the column letter right? ({book.columns_hint(t)})"
             )
         else:
-            r, value = bad[0]
-            more = f" (and {len(bad) - 1} more rows)" if len(bad) > 1 else ""
             problems.append(
                 f"{use.place}: the formula computes with '{header}' ({name}), but {book.where(t)}.rows[{r}] has "
                 f"'{value}' there{more}, which gives #VALUE!: send a number, or null for an empty cell"
@@ -3626,7 +3840,7 @@ def _value_problems(book: Book) -> list[str]:
             sent_values.add(str(sent))
             computed = book.evaluate(tree, s, r)
             number, typed = convert_value(sent, column.type if column.type in NUMBER_TYPES else "number",
-                                          book.decimal_comma)  # fmt: skip
+                                          book.decimal_comma_of(s, c))  # fmt: skip
             if computed is None or not typed or not isinstance(number, int | float) or number == 0:
                 continue  # 0 for "the formula fills it in"
             plain = sent if isinstance(sent, int | float) else number  # a percent sent as 0.25 for 25 %
@@ -3724,9 +3938,8 @@ def chart_layout(sheet: ExcelSheet, chart: ExcelChart) -> ChartLayout:
         if errors:
             raise ValueError(errors)
         return ChartLayout(True, series, (columns[0], columns[-1], 1, 1))
-    if not chart.category_column.strip() and not chart.value_columns:  # only type/title: plot the number columns
-        numbers = [h for c, h in enumerate(headers) if c > 0 and sheet.columns[c].type in NUMBER_TYPES]
-        chart = chart.model_copy(update={"category_column": headers[0] if headers else "", "value_columns": numbers})
+    if not chart.category_column.strip() and not chart.value_columns:  # only type/title: guess what to plot
+        chart = chart.model_copy(update=default_chart_columns(sheet))
     if chart.category_column.strip() not in headers:
         errors.append(f"category_column: '{chart.category_column}' is not a column header {listed}")
     if not chart.value_columns:
@@ -3757,12 +3970,28 @@ def chart_layout(sheet: ExcelSheet, chart: ExcelChart) -> ChartLayout:
     return ChartLayout(False, series, (category, category, 2, last_row))
 
 
+def default_chart_columns(sheet: ExcelSheet) -> dict[str, Any]:
+    """The columns of a chart sent with only a type and title: the number columns against the first column with
+    labels (text or dates; 'Produkt' next to 'Pos.'). Years and numbers ('Jahr', 'Kundennr.', see id_column) are no
+    values to plot."""
+    columns = sheet.columns
+    labels = next(
+        (c for c, column in enumerate(columns) if column.type not in NUMBER_TYPES and not column.formula.strip()), 0
+    )
+    values = [
+        column.header.strip() for c, column in enumerate(columns)
+        if c != labels and column.type in NUMBER_TYPES
+        and not id_column(column, [convert_value(row[c], column.type)[0] for row in sheet.rows])
+    ]  # fmt: skip
+    return {"category_column": columns[labels].header.strip() if columns else "", "value_columns": values}
+
+
 CHART_ROWS = 22  # charts below each other next to the table, one every 22 rows
 
 
 class XlsxWriter:
     def __init__(self, currency: str, texts: dict[str, str], decimal_comma: bool | None = None,
-                 design: Design = DEFAULT_DESIGN, title: str = "") -> None:  # fmt: skip
+                 design: Design = DEFAULT_DESIGN, title: str = "", author: str = "") -> None:  # fmt: skip
         self.currency = currency
         self.texts = texts
         self.decimal_comma = decimal_comma
@@ -3770,11 +3999,15 @@ class XlsxWriter:
         self.title = title
         self.workbook = Workbook()
         self.workbook.remove(self.workbook.active)
+        properties = self.workbook.properties  # openpyxl names itself the author
+        properties.title, properties.creator, properties.lastModifiedBy = title or None, author or None, author or None
         # Charts and cells the user adds later take the theme's fonts.
         self.workbook.loaded_theme = re.sub(THEME_FONTS_RE, lambda m: m[1] + design.font + m[2], theme_xml)
         self.body_font = Font(name=design.font, size=11, color=TEXT_COLOR)
         self.bold_font = Font(name=design.font, size=11, bold=True, color=TEXT_COLOR)
         self.header_font = Font(name=design.font, size=11, bold=True, color=WHITE)
+        self.link_font = Font(name=design.font, size=11, color=design.accent, underline="single")
+        self.day_first = texts["date_format"].startswith("DD")
         self.chart_titles: dict[str, list[str]] = {}  # per sheet, for the text version
         self.narrow_font = design.font.casefold() in NARROW_FONTS  # the column widths are measured for Calibri
 
@@ -3830,11 +4063,19 @@ class XlsxWriter:
                     cell.alignment = ALIGN["date" if column.type in TIME_TYPES else "number"]
                     widths[c - 1] = max(widths[c - 1], 12)
                     continue
-                value, typed = convert_value(raw, column.type, self.decimal_comma)
+                value, typed = convert_value(raw, column.type, self.book.decimal_comma_of(s, c - 1))
+                link = excel_link(raw) if isinstance(raw, str) and isinstance(value, str) else None
+                if early := early_date(value):  # Excel shows no dates before 1900 (and has a 29 February 1900)
+                    value = early_date_text(value, self.day_first)
+                if link:  # Excel's link style, in the font and accent colour of the design
+                    value = link[0]
+                    cell.style = "Hyperlink"
+                    cell.hyperlink = link[1]
+                    cell.font, cell.border = self.link_font, ROW_LINE
                 cell.value = value
                 cell.alignment = ALIGN[
                     "date"
-                    if isinstance(value, date) or (column.type == "time" and typed)
+                    if isinstance(value, date | bool) or early or (column.type == "time" and typed)
                     else "number"
                     if isinstance(value, int | float)
                     else "text"
@@ -3887,11 +4128,14 @@ class XlsxWriter:
     def _cell_text(self, cell: Any) -> str:
         """A cell's value as it is shown: decimals, %, currency, date and time from its number format."""
         value, fmt = cell.value, str(cell.number_format)
+        if isinstance(value, str) and cell.hyperlink is not None:
+            return f"[{value}]({cell.hyperlink.target})"
         if value is None or isinstance(value, str):
             return value or ""
+        if isinstance(value, bool):
+            return self.texts["true" if value else "false"]
         if isinstance(value, datetime | date):
-            shown = value.strftime("%d.%m.%Y" if self.texts["date_format"].startswith("DD") else "%Y-%m-%d")
-            return shown + (value.strftime(" %H:%M") if isinstance(value, datetime) and "hh:mm" in fmt else "")
+            return date_text(value, self.day_first, "hh:mm" in fmt)
         if ":mm" in fmt and isinstance(value, int | float):  # a time: the fraction of a day
             minutes = round(value * 1440)
             if fmt.startswith("[h]"):  # a duration
@@ -3902,8 +4146,8 @@ class XlsxWriter:
         decimals = re.search(r"\.(0+)", fmt)
         if fmt == "General":
             text = f"{value:,}"
-        else:
-            text = f"{value:,.{len(decimals[1]) if decimals else 0}f}"
+        else:  # thousands only where the format has them: not for years and numbers ("0")
+            text = f"{value:{',' if '#,##' in fmt else ''}.{len(decimals[1]) if decimals else 0}f}"
         if self.decimal_comma:
             text = text.replace(",", "\0").replace(".", ",").replace("\0", ".")
         symbol = next((s for s in ("€", "$", "£", "CHF") if s in fmt), "")
@@ -4026,14 +4270,29 @@ class XlsxWriter:
                                                    showSerName=False, showLegendKey=False)  # fmt: skip
 
 
+def early_date_text(value: date, day_first: bool) -> str:
+    """A date before 1 March 1900 as it is written: as text, with hh:mm if it has a time."""
+    return date_text(value, day_first, isinstance(value, datetime) and (value.hour, value.minute) != (0, 0))
+
+
+def date_text(value: date, day_first: bool, with_time: bool = False) -> str:
+    """A date as the files show it: 18.01.1871 (day_first) or 1871-01-18, with hh:mm if `with_time`."""
+    shown = (
+        f"{value.day:02d}.{value.month:02d}.{value.year:04d}"
+        if day_first
+        else f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+    )
+    return shown + (f" {value.hour:02d}:{value.minute:02d}" if with_time and isinstance(value, datetime) else "")
+
+
 def build_xlsx(
     sheets: list[ExcelSheet], currency: str, texts: dict[str, str], decimal_comma: bool | None = None,
-    design: Design = DEFAULT_DESIGN, title: str = "",
+    design: Design = DEFAULT_DESIGN, title: str = "", author: str = "",
 ) -> tuple[bytes, str]:  # fmt: skip
     """The file and its text as Markdown."""
     sheets = [prepare_sheet(sheet, decimal_comma) for sheet in sheets]
     book = check_excel(sheets, decimal_comma, sheet_names(sheets, texts["sheet"]), currency)
-    writer = XlsxWriter(currency, texts, decimal_comma, design, title)
+    writer = XlsxWriter(currency, texts, decimal_comma, design, title, author)
     return writer.render(book), writer.markdown()
 
 
@@ -4234,9 +4493,10 @@ class PptxWriter:
     """Title and section slides on a dark or accent background, content slides white with the title in the accent
     colour, a thin footer line with the presentation title and the slide number."""
 
-    def __init__(self, title: str, design: Design = DEFAULT_DESIGN) -> None:
+    def __init__(self, title: str, design: Design = DEFAULT_DESIGN, author: str = "") -> None:
         self.title = title
         self.design = design
+        self.author = author
         self.accent = PptxRGBColor.from_string(design.accent)
         self.prs = Presentation()
         self.prs.slide_width, self.prs.slide_height = SLIDE_WIDTH, SLIDE_HEIGHT
@@ -4249,6 +4509,7 @@ class PptxWriter:
     def render(self, slides: list[Slide]) -> bytes:
         for self.number, slide in enumerate(slides, start=1):
             getattr(self, f"_slide_{slide.layout}")(slide)
+        set_core_properties(self.prs.core_properties, self.title, self.author)
         buffer = io.BytesIO()
         self.prs.save(buffer)
         return buffer.getvalue()
@@ -4561,11 +4822,12 @@ def slides_markdown(title: str, slides: list[Slide], texts: dict[str, str]) -> s
 
 
 def build_pptx(
-    title: str, slides: list[Slide], design: Design = DEFAULT_DESIGN, texts: dict[str, str] | None = None
-) -> tuple[bytes, str]:
+    title: str, slides: list[Slide], design: Design = DEFAULT_DESIGN, texts: dict[str, str] | None = None,
+    author: str = "",
+) -> tuple[bytes, str]:  # fmt: skip
     """The file and its text as Markdown."""
     check_slides(title, slides)
-    return PptxWriter(title, design).render(slides), slides_markdown(title, slides, texts or TRANSLATIONS["en"])
+    return PptxWriter(title, design, author).render(slides), slides_markdown(title, slides, texts or TRANSLATIONS["en"])
 
 
 # ------------------------------------------------------------------------------------------- delivery --
@@ -4597,6 +4859,11 @@ class Context:
     message_id: str | None
     emitter: EventCallback | None
     caller: EventCallback | None
+
+    @property
+    def author(self) -> str:
+        """The user's name, the author of the files."""
+        return " ".join(clean_text(str((self.user or {}).get("name") or "")).split())
 
     async def status(self, description: str, done: bool = False) -> None:
         if self.emitter is not None:
@@ -4733,7 +5000,7 @@ class Tools:
 
         def build() -> tuple[str, bytes, str]:
             extras: dict[str, Any] = {}  # parameters the model wrote into the blocks text
-            parsed = parse_argument(WORD_BLOCKS, blocks, "blocks", extras)
+            parsed = parse_argument(WORD_BLOCKS, blocks, "blocks", extras, texts)
             parsed = [block for block in parsed if not is_empty_block(block)]
             given = {k: _unescape_newlines(str(v or extras.get(k) or "")) for k, v in
                      (("title", title), ("subtitle", subtitle), ("header_text", header_text))}  # fmt: skip
@@ -4747,6 +5014,7 @@ class Tools:
                 page_numbers=self.valves.page_numbers,
                 design=self._design(),
                 template=read_word_template(self.valves.word_template),
+                author=ctx.author,
             )
             return display_title, *build_docx(options, parsed, texts)
 
@@ -4781,7 +5049,9 @@ class Tools:
             display_title = tidy_title(given) or (tidy_title(parsed[0].name) if parsed else "")
             decimal_comma = self.valves.language == "de"
             design = self._design()
-            return display_title, *build_xlsx(parsed, self.valves.currency, texts, decimal_comma, design, display_title)
+            return display_title, *build_xlsx(
+                parsed, self.valves.currency, texts, decimal_comma, design, display_title, ctx.author
+            )
 
         return await self._create("create_excel_file", "xlsx", XLSX_MIME, build, texts["status_excel"], ctx)
 
@@ -4810,11 +5080,11 @@ class Tools:
 
         def build() -> tuple[str, bytes, str]:
             extras: dict[str, Any] = {}
-            parsed = parse_argument(SLIDES, slides, "slides", extras)
+            parsed = parse_argument(SLIDES, slides, "slides", extras, texts)
             display_title = tidy_title(str(title or extras.get("title") or "")) or next(
                 (tidy_title(s.title) for s in parsed if s.title.strip()), ""
             )
-            return display_title, *build_pptx(display_title, parsed, design, texts)
+            return display_title, *build_pptx(display_title, parsed, design, texts, ctx.author)
 
         return await self._create("create_powerpoint_file", "pptx", PPTX_MIME, build, texts["status_powerpoint"], ctx)
 

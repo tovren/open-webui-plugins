@@ -12,7 +12,10 @@ answer, where the user can preview and download it.
 | `create_powerpoint_file` | 16:9 slides with the layouts `title`, `section`, `bullets`, `two_columns`, `table` and `chart` (native PowerPoint charts: column, bar, line, pie, optionally with the unit at the value axis), plus speaker notes |
 
 Inline `**bold**`, `*italic*` and `[links](https://…)` work in all text fields of Word and PowerPoint;
-in Excel cells the markers are removed. File names come from the title, e.g. `Budget 2026.xlsx`.
+in Excel cells the markers are removed: a cell that is one link becomes a clickable link, other links keep
+their address in brackets (`Wiki (https://…)`). Windows paths keep their backslashes (`\\fs01\Vertrieb\_Archiv`,
+`C:\Daten\*.xlsx`); a path with every backslash doubled (`\\\\fs01\\Vertrieb`) is read as escaped Markdown. File
+names come from the title, e.g. `Budget 2026.xlsx`.
 
 ![An answer with the attached presentation](images/answer.png)
 
@@ -53,16 +56,26 @@ A short example for a slide deck (the model sees the full schema with descriptio
   times as `hh:mm`. Text such as `1.234,56 €`, `$1,200.00`, `CHF 1’234.50` or `7,5 %` is converted too. A
   separator followed by exactly three digits is read as thousands (`1.500`), except after a leading zero
   (`0,125`) and for the decimal mark of the `language` valve when it appears only once (`de`: `1,799` is
-  1.799; `en`: `1.500` is 1.5). Columns sent without a type whose values are all numbers become number
-  columns, so sums and charts work; values with leading zeros (postal codes, article numbers) stay text.
-  Columns without a type whose values are all dates (`2026-11-02`, `02.11.2026`) or times (`08:00`) become
-  date or time columns.
+  1.799; `en`: `1.500` is 1.5). Values of the same column that show their decimal mark (`2.350,50`, `980,00`,
+  `1,234,567`) decide it for the whole column, also against the `language` valve, so `1.500 €` next to
+  `2.350,50 €` is 1500 in English too; a column with both marks next to a value they decide (`1.500`) is sent
+  back. Columns sent without a type whose values are all numbers become number columns, so sums and charts
+  work; values with leading zeros (postal codes, article numbers) stay text. Columns without a type whose
+  values are all dates (`2026-11-02`, `02.11.2026`) or times (`08:00`) become date or time columns.
+  `true` and `false` are Excel's TRUE and FALSE (WAHR and FALSCH in German Excel), in Word and slide tables
+  Yes and No (Ja and Nein with `language = de`).
+- **Years and numbers** are shown without thousands separators (`2024`, not `2.024`): whole numbers in a column
+  without a total whose header says so (`Jahr`, `Year`, `Nr.`, `Pos.`, `Kundennr.`, `Rechnungsnummer`,
+  `Order no.`, `ID`, `PLZ`, `ZIP code` …).
 - **Currencies:** a `currency` column is shown in the currency of the `currency` valve, unless its values
   name another one (`$1,200.00` gives a dollar column, also for the formula columns computed from it).
   Values with different currencies in one column are sent back.
 - **Dates and times:** `22.10.26` is read as 22 October 2026; `05/11/2026` (5 November or 11 May?), a date
   without a day (`2026-11`), a day that does not exist (`31.11.2026`) and numbers in a date column are sent
-  back instead of being kept as text. A value with a time (`2026-10-22 14:30`) shows the time too. A `time`
+  back instead of being kept as text. A value with a time (`2026-10-22 14:30`) shows the time too; ISO
+  timestamps (`2026-10-23T08:30:00Z`, `…+02:00`, `… 08:30:15.250`) keep the time as written, without the time
+  zone (Excel has none). Dates before 1 March 1900 are written as text (`18.01.1871`): Excel shows no earlier
+  dates, and up to that day Excel and LibreOffice count one day apart. A `time`
   cell holds the fraction of a day, as in Excel: `=C{row}-B{row}` in a `time` column shows 8:30 (total row
   and formula columns as `[h]:mm`, so sums above 24 hours stay right), while hours as a number need a
   `number` column with `=(C{row}-B{row})*24`. The two slips with this (times subtracted in a number column,
@@ -121,8 +134,10 @@ A short example for a slide deck (the model sees the full schema with descriptio
   may reach beyond the data.
 - **Excel charts** plot columns (`category_column` plus `value_columns`) or, for tables with e.g. the
   months as columns, rows (`series_rows`: the labels in the first column of the rows to plot). A chart
-  with only a type and title plots the number columns against the first column. `chart` may be a list of up
-  to four charts, which are placed below each other next to the table; `unit` is shown at the value axis.
+  with only a type and title plots the number columns against the first column with labels (text or dates,
+  e.g. `Produkt` next to `Pos.`); years and numbers (see above, e.g. `Jahr`) are not plotted as values.
+  `chart` may be a list of up to four charts, which are placed below each other next to the table; `unit` is
+  shown at the value axis.
 - **Errors go back to the model.** If something is missing or too long, the tool answers with a list
   of exact problems (e.g. `slides[3].chart.series[0]: 2 values for 3 categories`), and the model
   can call it again. The positions refer to the list the model sent.
@@ -156,22 +171,24 @@ A short example for a slide deck (the model sees the full schema with descriptio
   `{"sheets": [...], "title": "…"}`), Excel rows written as objects whose keys are the column headers, list
   items that all start with `- ` (top-level items, not sub items), list items that all start with a bullet
   of their own (`• `, `* `, `– `) or, in a numbered list, with the numbers `1.`, `2.` … (removed, so they are
-  not shown twice), `<br>` as a line break, Markdown lists, tables, headings (`## …`) and rules (`---`, left
-  out) inside a paragraph (numbered lines only become a list when they count up from 1, so "3. Oktober …"
-  stays text; a table there has the same limits as a table block), numbers sent as text in an Excel column
-  without a type, `"null"` as text in a number or date column (an empty cell), a chart object without data
-  (no chart), formulas without `=`, formulas written into single cells, file-name-style titles
-  (`Report_Q3.xlsx`), a missing title (the first heading or slide title is used; a Word document without
-  either, e.g. a letter, has no title block and is named "Document"), and empty paragraphs used as spacing
-  (left out). A heading that only repeats the title is left out.
+  not shown twice), `<br>` as a line break, Markdown lists, tables, headings (`## …`), rules (`---`, left
+  out) and code blocks between ` ``` ` lines (in Word a monospace block with its lines and indentation as
+  written; `# comment` there is no heading) inside a paragraph (numbered lines only become a list when they
+  count up from 1, so "3. Oktober …" stays text; a table there has the same limits as a table block), numbers
+  sent as text in an Excel column without a type, `"null"` as text in a number or date column (an empty
+  cell), a chart object without data (no chart), formulas without `=`, formulas written into single cells,
+  file-name-style titles (`Report_Q3.xlsx`), a missing title (the first heading or slide title is used; a
+  Word document without either, e.g. a letter, has no title block and is named "Document"), and empty
+  paragraphs used as spacing (left out). A heading that only repeats the title is left out.
 - **Broken JSON is repaired.** Long arguments often reach the tool as JSON text rather than as
   structured data (the server could not parse them, e.g. vLLM's `qwen3_coder` parser passes them on as
   text), with the same few mistakes: German quotes closed with a straight quote (`„Hoch"`), a forgotten
   `}` or `]`, two closing brackets in the wrong order (`null]}]` for `null]]}`), one bracket too many, an
   object whose `{` is missing, a stray quote after a number (`"level": 1"}`), a key without its opening
-  quote (`level": 2`), table rows written as several arrays without the outer brackets, or the other tool
-  parameters (e.g. the title) written into the same text, which are then used. Fields that end up inside a
-  chart object because its `}` was forgotten (e.g. the speaker notes) are taken back to the slide or sheet.
+  quote (`level": 2`), a comma before a closing bracket (`"b",]`), table rows written as several arrays
+  without the outer brackets, or the other tool parameters (e.g. the title) written into the same text,
+  which are then used. Fields that end up inside a chart object because its `}` was forgotten (e.g. the
+  speaker notes) are taken back to the slide or sheet.
   Valid JSON is never changed; a repair only changes brackets and quotes, and it is only used if no content
   is lost (nothing left over, no key that comes twice with different values) and the result is valid
   arguments for the tool. Other tool parameters after the value are only used if nothing else follows
@@ -212,8 +229,9 @@ With the `word_template` valve, Word documents are built on a company file, e.g.
   set `font` to the company font if the two should match.
 - If the template has a header, the model's `header_text` is not added to it; if it has a footer, the
   "Page X of Y" footer is not added either. Without them, both are added as usual.
-- Removed from the template: its author and title, a mail merge (Word would ask to run its SQL command),
-  write protection, and the path of the template it was made from.
+- Removed from the template: its author, title and dates (the document gets its own, see
+  [Security & privacy](#security--privacy)), a mail merge (Word would ask to run its SQL command), write
+  protection, and the path of the template it was made from.
 - If the file cannot be read (missing, not a Word file, larger than 20 MB), the documents are made without
   it and Open WebUI's log says why.
 
@@ -232,6 +250,9 @@ With the `word_template` valve, Word documents are built on a company file, e.g.
 - **Links** are only created for `http`, `https` and `mailto` (only with `subject`, `body`, `cc`,
   `bcc`); other link targets stay plain text. Invisible format characters such as a right-to-left
   override are removed from file names.
+- **File properties:** the title, the user's name in Open WebUI as author and the time the file was made;
+  nothing of the libraries that build it (Word and PowerPoint files used to name `python-docx` or a
+  python-pptx developer as author, with a date in 2013).
 - **Limits** keep a runaway model from blocking the server: 200,000 characters per file, 500 Word
   blocks, 20 sheets with 10,000 rows and 50 columns each and 250,000 cells in all, 60 slides with 12
   items and 16 table rows each, 500 characters per formula. The Markdown parser runs in linear time,

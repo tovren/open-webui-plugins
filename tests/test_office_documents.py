@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 import zipfile
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -492,7 +492,9 @@ def test_json_error_messages_point_to_the_slip() -> None:
     assert '"items": ["a", "b"] <<<HERE>>> ]}, {"type"' in extra
     assert "the open object must be closed with } first, or the ] is one too many" in extra
     assert "the } at the mark closes nothing that is open" in message('[{"type": "paragraph", "text": "x"}]}, 1')
-    assert "delete the comma before the ]" in message('[{"type": "paragraph", "text": "x"},]')
+    # the message on every Python version (3.13 has its own: 'Illegal trailing comma'); the repair deletes it
+    assert "delete the comma before the ]" in unrepaired('[{"type": "paragraph", "text": "x"},]')
+    assert "delete the comma before the }" in unrepaired('[{"type": "paragraph", "text": "x",}]')
     assert "cut off" in message('[{"type": "paragraph", "text": "x"}, {"type": "paragraph", "text": "ab')
     assert "a list stands where a key belongs" in message('[{"type": "table", ["a"]}]')
     # list items written as several arrays are not wrapped (they would become lists inside the list)
@@ -1267,6 +1269,9 @@ def test_bracket_and_quote_slips_are_repaired() -> None:
     assert od.loads_lenient(stray_quote)[0] == {"type": "heading", "text": "Ziel", "level": 1}
     open_quote = '[{"type": "heading", "text": "Ziel", level": 2}]'
     assert od.loads_lenient(open_quote) == [{"type": "heading", "text": "Ziel", "level": 2}]
+    trailing = '[{"type": "table", "rows": [["a", "b", ], ["c", "d"]], }, {"type": "bullets", "items": ["x",]},]'
+    assert od.loads_lenient(trailing) == [{"type": "table", "rows": [["a", "b"], ["c", "d"]]},
+                                          {"type": "bullets", "items": ["x"]}]  # fmt: skip
     assert od.loads_lenient('[{"type": "table", "type": "table", "rows": [["a"]}]')[0]["rows"] == [["a"]]
     assert od._repair_json('[{"type": "paragraph", "text": "A", "text": "B"]') is None  # "A" would be lost
     split = '[{"name": "S", "chart": {"type": "pie", "value_columns": ["E"}, "unit": "EUR"}}]'
@@ -1527,10 +1532,21 @@ def test_escaped_line_breaks() -> None:
 
 
 def test_excel_chart_with_only_type_and_title() -> None:
-    sheet = {"name": "S", "columns": [{"header": "Monat"}, {"header": "Umsatz", "type": "currency"}],
-             "rows": [["Jan", 10], ["Feb", 12]], "chart": {"type": "line", "title": "Umsatzverlauf"}}  # fmt: skip
-    (chart,) = excel([sheet])[0]["S"]._charts
-    assert [s.val.numRef.f for s in chart.series] == ["'S'!$B$2:$B$3"]
+    def plotted(columns: list[Any], rows: list[Any]) -> tuple[list[str], str]:
+        (chart,) = excel([sheet(columns, rows, chart={"type": "column", "title": "Umsatz"})])[0]["S"]._charts
+        labels = chart.series[0].cat
+        return [s.val.numRef.f for s in chart.series], (labels.strRef or labels.numRef).f
+
+    revenue = {"header": "Umsatz", "type": "currency"}
+    assert plotted(["Monat", revenue], [["Jan", 10], ["Feb", 12]]) == (["'S'!$B$2:$B$3"], "'S'!$A$2:$A$3")
+    # the labels are the first text column, not the position numbers; years and numbers are no values
+    products = plotted(["Pos.", "Produkt", revenue], [[1, "Tisch", 500], [2, "Stuhl", 300]])
+    assert products == (["'S'!$C$2:$C$3"], "'S'!$B$2:$B$3")
+    regions = plotted(["Region", "Jahr", revenue], [["Nord", 2025, 500], ["Süd", 2025, 300]])
+    assert regions == (["'S'!$C$2:$C$3"], "'S'!$A$2:$A$3")
+    dates = [{"header": "Datum", "type": "date"}, "Kategorie", revenue]
+    assert plotted(dates, [["2026-01-01", "a", 1], ["2026-02-01", "b", 2]])[1] == "'S'!$A$2:$A$3"
+    assert plotted(["Jahr", revenue], [[2025, 500], [2026, 300]]) == (["'S'!$B$2:$B$3"], "'S'!$A$2:$A$3")
 
 
 @pytest.mark.parametrize(
@@ -2062,6 +2078,190 @@ def test_numbers_right_aligned_in_word_and_slide_tables() -> None:
     (shape,) = [s for s in prs.slides[0].shapes if s.has_table]
     assert shape.table.cell(0, 1).text_frame.paragraphs[0].alignment == od.PP_ALIGN.RIGHT
     assert shape.table.cell(1, 2).text_frame.paragraphs[0].alignment is None
+
+
+def test_one_decimal_mark_per_column() -> None:
+    """The values that show their decimal mark ('2.350,50') decide it for the whole column, also against the
+    language; '1.500' next to them is not read the other way without a word."""
+    for language, amounts in (("en", ["1.500 €", "2.350,50 €", "980,00 €"]), ("de", ["$1,500", "$2,350.50", "$980"])):
+        rows = [[f"P{i}", amount] for i, amount in enumerate(amounts)]
+        ws = excel([sheet(["Posten", {"header": "Betrag", "total": "sum"}], rows)], valves={"language": language})[0]
+        assert [ws["S"].cell(r, 2).value for r in (2, 3, 4)] == [1500, 2350.5, 980]
+    for language, expected in (("de", [1500, 12000]), ("en", [1.5, 12])):  # nothing shows the mark: the language
+        ws = excel([sheet(["A", "B"], [["x", "1.500"], ["y", "12.000"]])], valves={"language": language})[0]["S"]
+        assert [ws["B2"].value, ws["B3"].value] == expected
+    ws = excel([sheet(["A", "B"], [["x", "1.234.567"], ["y", "2.000"]])], valves={"language": "en"})[0]["S"]
+    assert [ws["B2"].value, ws["B3"].value] == [1234567, 2000]  # a separator that comes twice is no decimal mark
+    ws = excel([sheet(["A", "B"], [["x", "2.350,50"], ["y", "1,200.50"]])])[0]["S"]
+    assert [ws["B2"].value, ws["B3"].value] == [2350.5, 1200.5]  # both marks, but nothing they decide
+    mixed = sheet(["A", "Betrag"], [["x", "2.350,50"], ["y", "1,200.50"], ["z", "1.500"]])
+    assert (
+        "sheets[0].columns[1] ('Betrag'): the values use both ',' and '.' as decimal mark ('2.350,50', '1,200.50'), "
+        "so '1.500' could be 1.5 or 1500: send the numbers as JSON numbers"
+    ) in invalid("create_excel_file", sheets=[mixed])
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [("Jahr", True), ("Geschäftsjahr", True), ("Jahr (JJJJ)", True), ("Year", True), ("Nr.", True), ("Lfd. Nr.", True),
+     ("Kunden-Nr.", True), ("Artikelnr", True), ("Rechnungsnummer", True), ("Order no.", True), ("Customer ID", True),
+     ("Invoice number", True), ("Pos.", True), ("PLZ", True), ("Postleitzahl", True), ("ZIP code", True),
+     ("Vorjahr", False), ("Jahresumsatz", False), ("Umsatz (Jahr)", False), ("Casino", False), ("Paid", False),
+     ("Total number", False), ("Number", False), ("Anzahl", False), ("Average number", False),
+     ("Number of employees", False), ("Durchschnittliche Nummer", False), ("Nummer", True), ("No.", True), ("#", True),
+     ("Laufende Nummer", True), ("Pos.-Nr.", True), ("Employee no.", True), ("Cost center number", True)],
+)  # fmt: skip
+def test_columns_of_years_and_numbers(header: str, expected: bool) -> None:
+    assert od.id_column(od.ExcelColumn(header=header, type="integer"), [2024, 2025]) is expected
+
+
+def test_years_and_numbers_without_thousands_separators() -> None:
+    columns = ["Region", "Jahr", {"header": "Kundennr.", "type": "integer"}, {"header": "PLZ", "type": "integer"},
+               {"header": "Nr.", "type": "integer", "total": "sum"}, {"header": "Umsatz", "type": "number"},
+               {"header": "Stück", "type": "integer"}]  # fmt: skip
+    rows = [["Nord", 2024, 100234, 70173, 1001, 1500, 1200], ["Süd", 2025, 100235, 80331, 1002, 2500, 1300]]
+    ws = excel([sheet(columns, rows)], valves={"language": "de"})[0]["S"]
+    assert [ws.cell(2, c).number_format for c in range(2, 8)] == ["0", "0", "0", "#,##0", "#,##0", "#,##0"]
+    sheets = od.parse_argument(od.EXCEL_SHEETS, [sheet(columns, rows)], "sheets")
+    text = od.build_xlsx(sheets, "EUR", od.TRANSLATIONS["de"], decimal_comma=True)[1]
+    assert "| Nord | 2024 | 100234 | 70173 | 1.001 | 1.500 | 1.200 |" in text
+    years = sheet(["Datum", {"header": "Jahr", "formula": "=YEAR(A{row})"}], [["2026-01-05"]])
+    assert excel([years])[0]["S"]["B2"].number_format == "0"
+    amounts = sheet(["A", {"header": "Jahr", "type": "number"}], [["x", 1.5]])  # not whole numbers: amounts
+    assert excel([amounts])[0]["S"]["B2"].number_format == "#,##0.0"
+    counts = sheet(["Region", {"header": "Average number", "type": "integer"}], [["Nord", 12000], ["Süd", 15000]])
+    ws = excel([{**counts, "chart": {"type": "bar", "title": "Average"}}])[0]["S"]  # an amount: plotted
+    assert ws["B2"].number_format == "#,##0" and ws._charts[0].series[0].val.numRef.f == "'S'!$B$2:$B$3"
+
+
+def test_document_properties() -> None:
+    """Title, the user as author and the date of today, nothing of python-docx, python-pptx and openpyxl."""
+    user = {"id": "u1", "name": "Erika Muster", "email": "erika@example.com", "role": "user"}
+    doc, _, _ = word(blocks=[{"type": "paragraph", "text": "Hallo"}], title="Bericht Q3", __user__=user)
+    prs, _ = powerpoint([{"layout": "title", "title": "Vortrag"}], title="Vortrag", __user__=user)
+    for core, title in ((doc.core_properties, "Bericht Q3"), (prs.core_properties, "Vortrag")):
+        assert (core.title, core.author, core.last_modified_by, core.comments) == (title, *[user["name"]] * 2, "")
+        assert core.created.date() == date.today() and core.revision == 1
+    wb, _ = excel([sheet(["A"], [["x"]])], title="Liste", __user__=user)
+    assert (wb.properties.title, wb.properties.creator, wb.properties.lastModifiedBy) == ("Liste", *[user["name"]] * 2)
+    _, recorder = call("create_powerpoint_file", slides=[{"layout": "title", "title": "Vortrag"}])
+    core = Presentation(io.BytesIO(recorder.download()[0])).core_properties
+    assert (core.author, core.last_modified_by, core.comments) == ("", "", "")  # not "Steve Canny"
+    _, recorder = call("create_excel_file", sheets=[sheet(["A"], [["x"]])])
+    assert b"openpyxl" not in zipfile.ZipFile(io.BytesIO(recorder.download()[0])).read("docProps/core.xml")
+
+
+def test_windows_paths_keep_their_backslashes() -> None:
+    for text, expected in [
+        (r"Ablage: \\fs01\Vertrieb\_Archiv\2026", r"Ablage: \\fs01\Vertrieb\_Archiv\2026"),
+        (r"(G:\, H:\) und C:\Daten\*.xlsx, \*kein\* Kursiv", r"(G:\, H:\) und C:\Daten\*.xlsx, *kein* Kursiv"),
+        (r"**C:\Daten** und „\\nas\x“", r"C:\Daten und „\\nas\x“"),
+        # every backslash escaped as in Markdown: the escapes apply, as before
+        (r"auf \\\\srv01\\backup\\<JJJJ-MM> oder C:\\Daten", r"auf \\srv01\backup\<JJJJ-MM> oder C:\Daten"),
+    ]:
+        assert od.to_plain(text) == expected
+    ws = excel([sheet(["Pfad"], [[r"\\fs01\Vertrieb\_Archiv\2026"]])])[0]["S"]
+    assert ws["A2"].value == r"\\fs01\Vertrieb\_Archiv\2026"
+
+
+def test_links_in_excel_cells() -> None:
+    rows = [
+        ["[Intranet](https://intranet.acme.de/hr)", "siehe [Wiki](https://wiki.acme.de) oder [IT](mailto:it@acme.de)"],
+        ["<https://acme.de>", "[Böse](javascript:alert(1))"],
+    ]
+    ws = excel([sheet(["Seite", "Notiz"], rows)])[0]["S"]
+    assert (ws["A2"].value, ws["A2"].hyperlink.target, ws["A2"].font.u) == ("Intranet", rows[0][0][11:-1], "single")
+    assert (ws["A3"].value, ws["A3"].hyperlink.target, ws["A3"].style) == ("https://acme.de",) * 2 + ("Hyperlink",)
+    assert ws["B2"].value == "siehe Wiki (https://wiki.acme.de) oder IT (mailto:it@acme.de)"
+    assert ws["B2"].hyperlink is None
+    assert ws["B3"].value == "Böse" and ws["B3"].hyperlink is None  # only http, https and mailto
+    sheets = od.parse_argument(od.EXCEL_SHEETS, [sheet(["Seite", "Notiz"], rows)], "sheets")
+    assert "| [Intranet](https://intranet.acme.de/hr) |" in od.build_xlsx(sheets, "EUR", od.TRANSLATIONS["en"])[1]
+
+
+def test_code_blocks_in_word_paragraphs() -> None:
+    text = ("So startet man den Dienst:\n\n```bash\n# Dienst neu starten\nsudo systemctl restart nginx\nif true; then\n"
+            "    echo **ok** | tee log\nfi\n```\n\nFertig.")  # fmt: skip
+    doc, _, _ = word(blocks=[{"type": "paragraph", "text": text}], title="Anleitung")
+    paragraphs = [(p.style.name, p.text) for p in doc.paragraphs[1:]]
+    code = "# Dienst neu starten\nsudo systemctl restart nginx\nif true; then\n    echo **ok** | tee log\nfi"
+    assert paragraphs == [("Normal", "So startet man den Dienst:"), ("Normal", code), ("Normal", "Fertig.")]
+    assert doc.paragraphs[2].runs[0].font.name == od.CODE_FONT
+    assert doc.paragraphs[2]._p.pPr.find(f"{W_NS}shd") is not None
+    # without its closing line the block ends with the text; ```inline``` is no block
+    unclosed = od.split_paragraph("Text\n```\n| a | b |\n|---|---|")
+    assert unclosed == [("text", ["Text"]), ("code", ["| a | b |", "|---|---|"])]
+    assert od.split_paragraph("```x``` bleibt Text") == [("text", ["```x``` bleibt Text"])]
+    # a fence line holds at most one word (the language): the text after ~~~durchgestrichen~~~ stays
+    assert od.split_paragraph("~~~durchgestrichen~~~ Text\nmehr") == [("text", ["~~~durchgestrichen~~~ Text", "mehr"])]
+    assert od.split_paragraph("```Achtung wichtig\nmehr") == [("text", ["```Achtung wichtig", "mehr"])]
+    for opening, closing in (("```python", "```"), ("~~~", "~~~"), ("~~~ c++", "~~~~"), ("````shell-session", "````")):
+        assert od.split_paragraph(f"Text\n{opening}\nx = 1\n{closing}\nmehr") == [
+            ("text", ["Text"]), ("code", ["x = 1"]), ("text", ["mehr"])
+        ]
+
+
+def test_iso_timestamps() -> None:
+    rows = [["a", "2026-10-23T08:30:00Z"], ["b", "2026-10-23T09:00:00+02:00"], ["c", "2026-10-23 08:30:15.250"]]
+    ws = excel([sheet(["A", {"header": "Zeit", "type": "date"}], rows)])[0]["S"]
+    expected = [datetime(2026, 10, 23, 8, 30), datetime(2026, 10, 23, 9), datetime(2026, 10, 23, 8, 30, 15, 250000)]
+    for r, value in enumerate(expected, start=2):  # the time zone is dropped, the time stays as written
+        assert abs(ws.cell(r, 2).value - value) < timedelta(milliseconds=1)
+    assert ws["B2"].number_format == "YYYY-MM-DD hh:mm"
+    ws = excel([sheet(["A", "Zeit"], rows)])[0]["S"]  # a column without a type becomes a date column
+    assert isinstance(ws["B2"].value, datetime)
+    hours = sheet(["A", {"header": "Zeit", "type": "date"}], [["a", "2026-10-23 8:30 Uhr"]])
+    message = "is not a valid date: write dates as YYYY-MM-DD, e.g. 2026-11-02, with a time as YYYY-MM-DD hh:mm"
+    assert message in invalid("create_excel_file", sheets=[hours])
+
+
+def test_booleans_in_tables() -> None:
+    ws = excel([sheet(["Aufgabe", "Erledigt"], [["Angebot", True], ["Rechnung", False]])])[0]["S"]
+    assert (ws["B2"].value, ws["B3"].value, ws["B2"].data_type, ws["B2"].number_format) == (True, False, "b", "General")
+    counted = sheet(["A", {"header": "Menge", "type": "integer", "total": "sum"}], [["x", 3], ["y", True]])
+    message = "'True' in 'Menge' is not a number, so the total cannot count it"
+    assert message in invalid("create_excel_file", sheets=[counted])
+    sheets = od.parse_argument(od.EXCEL_SHEETS, [sheet(["A", "B"], [["x", True]])], "sheets")
+    assert "| x | WAHR |" in od.build_xlsx(sheets, "EUR", od.TRANSLATIONS["de"], decimal_comma=True)[1]
+    rows = [["Punkt", "Erledigt"], ["Angebot", True], ["Rechnung", False]]
+    blocks = [{"type": "table", "rows": rows}]
+    _, recorder = call("create_word_file", valves={"language": "de"}, blocks=blocks, title="T")
+    table = Document(io.BytesIO(recorder.download()[0])).tables[0]
+    assert [row.cells[1].text for row in table.rows] == ["Erledigt", "Ja", "Nein"]
+    prs, _ = powerpoint([{"layout": "table", "title": "T", "table": rows}], title="T")
+    (shape,) = [s for s in prs.slides[0].shapes if s.has_table]
+    assert [shape.table.cell(r, 1).text for r in range(3)] == ["Erledigt", "Yes", "No"]
+
+
+def test_dates_before_1900_stay_text() -> None:
+    """Excel has no dates before 1900; 1900-01-01 to 1900-02-28 are a day apart in Excel and LibreOffice."""
+    rows = [["Reichsgründung", "1871-01-18"], ["x", "1900-02-28"], ["y", "1900-03-01"]]
+    for language, early in (("de", ["18.01.1871", "28.02.1900"]), ("en", ["1871-01-18", "1900-02-28"])):
+        ws = excel([sheet(["A", {"header": "Datum", "type": "date"}], rows)], valves={"language": language})[0]["S"]
+        assert [ws["B2"].value, ws["B3"].value, ws["B4"].value] == [*early, datetime(1900, 3, 1)]
+        assert ws["B2"].data_type == "s" and ws["B2"].alignment.horizontal == "center"
+    # the checks see the text too: computing with it gives #VALUE! in Excel
+    deadline = {"header": "Frist", "type": "date", "formula": "=B{row}+14"}
+    later = sheet(["A", {"header": "Datum", "type": "date"}, deadline], rows[:1])
+    assert (
+        "the formula computes with 'Datum' (B{row}), but sheets[0].rows[0] has '1871-01-18' there: Excel has no dates "
+        "before 1900-03-01"
+    ) in invalid("create_excel_file", sheets=[later])
+    in_text = sheet(["A", "B", "C"], [["x", "18.01.1871", "=B2+1"]])  # a text column: the same text
+    assert "Excel has no dates before 1900-03-01" in invalid("create_excel_file", sheets=[in_text])
+    ws = excel([sheet(["A", {"header": "Datum", "type": "date"}, deadline], rows[2:])])[0]["S"]
+    assert ws["C2"].value == "=B2+14"
+
+
+def test_word_header_text_is_plain() -> None:
+    doc, _, _ = word(blocks=[{"type": "paragraph", "text": "x"}], title="T", header_text="**ACME** GmbH · *intern*")
+    assert doc.sections[0].header.paragraphs[0].text == "ACME GmbH · intern"
+
+
+def test_type_errors_of_a_cell_in_one_line() -> None:
+    nested = sheet(["A", "B"], [["x", 1], [["y", 2]]])
+    result = invalid("create_excel_file", sheets=[nested])
+    assert "- sheets[0].rows[1][0]: Input should be a valid string, number or boolean\n" in result
 
 
 @pytest.mark.skipif(not shutil.which("soffice"), reason="needs LibreOffice")
