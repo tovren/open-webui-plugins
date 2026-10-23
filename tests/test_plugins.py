@@ -18,6 +18,7 @@ import email.policy
 import importlib.util
 import io
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -1909,12 +1910,12 @@ def test_note_english() -> None:
     assert note.splitlines() == [
         "[Company context]",
         "You are the internal AI assistant of Example Ltd.",
-        "Today is Monday, 12 October 2026 (calendar week 42).",
         (
             "Always answer in English unless the user writes in another language "
             "or explicitly asks for a different one."
         ),
         cc.TRANSLATIONS["en"]["formal"],
+        "Today is Monday, 12 October 2026 (calendar week 42).",
         "The user's name is Ada Lovelace.",
     ]
 
@@ -1929,21 +1930,164 @@ def test_note_german_informal_with_rules() -> None:
         extra_rules="Wir schreiben Kunden gegenüber in der Wir-Form.",
     )
     note = flt.build_note({"name": "Max"}, MONDAY)
-    assert note.splitlines()[:3] == [
-        "[Firmen-Kontext]",
-        "Du bist der interne KI-Assistent der Firma Musterfirma GmbH.",
+    lines = note.splitlines()
+    assert lines[:2] == ["[Firmen-Kontext]", "Du bist der interne KI-Assistent der Firma Musterfirma GmbH."]
+    assert lines[2].startswith("Antworte immer auf Deutsch, außer")
+    assert "„du“" in lines[3] and "Du-Form" in lines[3]
+    assert lines[4:] == [
+        "Wir schreiben Kunden gegenüber in der Wir-Form.",
         "Heute ist Montag, 12. Oktober 2026 (Kalenderwoche 42).",
     ]
-    assert "Antworte immer auf Deutsch, außer" in note
-    assert "„du“" in note and "Du-Form" in note
     assert "Max" not in note
-    assert note.endswith("Wir schreiben Kunden gegenüber in der Wir-Form.")
 
 
 def test_note_without_company_and_custom_response_language() -> None:
     note = make_filter(cc, response_language="French").build_note(None, MONDAY)
     assert "internal AI assistant" not in note
     assert "Always answer in French unless" in note
+
+
+def test_note_company_profile_comes_before_date_and_name() -> None:
+    flt = make_filter(
+        cc, language="de", company_name="Musterfirma GmbH", company_profile="  Standorte: Stuttgart, Ulm\n"
+    )
+    note = flt.build_note({"name": "Max"}, MONDAY)
+    paragraphs = note.split("\n\n")
+    assert len(paragraphs) == 4
+    assert paragraphs[0].startswith("[Firmen-Kontext]\n") and "Heute" not in paragraphs[0]
+    assert paragraphs[1] == "Informationen zur Firma:\nStandorte: Stuttgart, Ulm"
+    assert paragraphs[2] == cc.TRANSLATIONS["de"]["no_invention"]
+    assert paragraphs[3] == "Heute ist Montag, 12. Oktober 2026 (Kalenderwoche 42).\nDer Nutzer heißt Max."
+    # the start up to the date is the same for every user, so the model server can share its cache
+    other = flt.build_note({"name": "Erika"}, datetime(2026, 10, 13))
+    assert other.split("\n\n")[:3] == paragraphs[:3]
+
+
+def test_parse_group_profiles() -> None:
+    text = (
+        "Text without group\r\n## Vertrieb\r\nPreise: siehe Preisliste\n### Ansprechpartner\nFrau Muster\n"
+        "##   Personal  ##\n\n## vertrieb\nZweiter Teil\n#Kein Abschnitt\n## Leer"
+    )
+    sections, text_before = cc.parse_group_profiles(text)
+    assert text_before
+    assert sections == [
+        ("Vertrieb", "Preise: siehe Preisliste\n### Ansprechpartner\nFrau Muster\nZweiter Teil\n#Kein Abschnitt"),
+        ("Personal", ""),
+        ("Leer", ""),
+    ]
+    assert cc.parse_group_profiles("") == ([], False)
+    assert cc.parse_group_profiles("## A\nx")[1] is False
+
+
+def test_note_group_sections() -> None:
+    flt = make_filter(cc, include_user_name=False)
+    note = flt.build_note(None, MONDAY, "en", [("Sales", "Price list: P:/Sales"), ("Staff", "")])
+    paragraphs = note.split("\n\n")
+    assert paragraphs[1:4] == [
+        "Information for Sales:\nPrice list: P:/Sales",
+        "The user belongs to: Sales, Staff.",
+        cc.TRANSLATIONS["en"]["no_invention"],
+    ]
+    # a heading without text only names the group; without names nothing is added
+    assert flt.build_note(None, MONDAY, "en", [("Staff", "")]).split("\n\n")[1] == "The user belongs to: Staff."
+    flt = make_filter(cc, include_user_name=False, include_group_names=False)
+    assert "\n\n" not in flt.build_note(None, MONDAY, "en", [("Staff", "")])
+    assert "belongs to" not in flt.build_note(None, MONDAY, "en", [("Sales", "x")])
+
+
+def stub_groups(
+    monkeypatch: pytest.MonkeyPatch, members: dict[str, list[str]], nested: bool = True, fail: bool = False
+) -> list[str]:
+    """Stands in for open_webui.models.groups.Groups; nested=False behaves like 0.11 (no
+    include_inherited). Returns the list of calls."""
+    calls: list[str] = []
+
+    async def get_groups_by_member_id(user_id: str, **kwargs: Any) -> list[Any]:
+        if kwargs and not nested:
+            raise TypeError("unexpected keyword argument 'include_inherited'")
+        if fail:
+            raise RuntimeError("database gone")
+        calls.append(f"member {user_id} {kwargs}")
+        return [SimpleNamespace(name=name) for name in members.get(user_id, [])]
+
+    async def get_all_groups() -> list[Any]:
+        calls.append("all")
+        return [SimpleNamespace(name=name) for names in members.values() for name in names]
+
+    modules = {
+        "open_webui": ModuleType("open_webui"),
+        "open_webui.models": ModuleType("open_webui.models"),
+        "open_webui.models.groups": SimpleNamespace(
+            Groups=SimpleNamespace(get_groups_by_member_id=get_groups_by_member_id, get_all_groups=get_all_groups)
+        ),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return calls
+
+
+PROFILES = "## Vertrieb\nPreisliste: P:/Vertrieb\n## Personal\nUrlaub über das Portal\n## Lager\n## Einkauf alt\nx"
+
+
+def test_inlet_adds_the_sections_of_the_users_groups(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    calls = stub_groups(monkeypatch, {"u1": ["personal", "Vertrieb", "Admins"], "u2": ["Lager"]})
+    flt = make_filter(cc, language="de", group_profiles=PROFILES)
+    with caplog.at_level(logging.WARNING):
+        note = asyncio.run(flt.inlet({"messages": []}, __user__={"id": "u1", "name": "Ada"}))["messages"][0]["content"]
+        asyncio.run(flt.inlet({"messages": []}, __user__={"id": "u1", "name": "Ada"}))
+    # in the order of the sections, not of the database; groups without a section are not named
+    assert "Informationen für Vertrieb:\nPreisliste: P:/Vertrieb\n\nInformationen für Personal:" in note
+    assert "Der Nutzer gehört zu: Vertrieb, Personal." in note and "Admins" not in note and "Lager" not in note
+    assert calls.count("all") == 1 and calls[-1] == "member u1 {'include_inherited': True}"
+    assert caplog.text.count("names groups that do not exist: Einkauf alt") == 1
+
+    # checked again after GROUP_CHECK_SECONDS, reported again only if the unknown names changed
+    flt._group_check = (PROFILES, flt._group_check[1] - cc.GROUP_CHECK_SECONDS, ["Einkauf alt"])
+    asyncio.run(flt.inlet({"messages": []}, __user__={"id": "u1"}))
+    assert calls.count("all") == 2 and caplog.text.count("do not exist") == 1
+    flt.valves.group_profiles = PROFILES + "\n## Lagr"
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(flt.inlet({"messages": []}, __user__={"id": "u1"}))
+    assert "names groups that do not exist: Einkauf alt, Lagr" in caplog.text
+
+    note = asyncio.run(flt.inlet({"messages": []}, __user__={"id": "u2"}))["messages"][0]["content"]
+    assert "Der Nutzer gehört zu: Lager." in note and "Informationen für" not in note
+    assert cc.TRANSLATIONS["de"]["no_invention"] not in note
+    note = asyncio.run(flt.inlet({"messages": []}, __user__={"name": "API"}))["messages"][0]["content"]
+    assert "gehört zu" not in note
+
+
+def test_inlet_groups_on_open_webui_0_11_and_without_groups(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    calls = stub_groups(monkeypatch, {"u1": ["Vertrieb"]}, nested=False)
+    flt = make_filter(cc, language="de", group_profiles=PROFILES)
+    note = asyncio.run(flt.inlet({"messages": []}, __user__={"id": "u1"}))["messages"][0]["content"]
+    assert "Informationen für Vertrieb:" in note and calls[-1] == "member u1 {}"
+
+    # the groups cannot be read: the chat goes on without them, one warning
+    stub_groups(monkeypatch, {}, fail=True)
+    flt = make_filter(cc, group_profiles=PROFILES)
+    with caplog.at_level(logging.WARNING):
+        for _ in range(2):
+            note = asyncio.run(flt.inlet({"messages": []}, __user__={"id": "u1"}))["messages"][0]["content"]
+    assert "Information for" not in note and note.startswith("[Company context]")
+    assert caplog.text.count("cannot read the user's groups") == 1
+
+    # without sections Open WebUI is not asked at all
+    calls = stub_groups(monkeypatch, {"u1": ["Vertrieb"]})
+    asyncio.run(make_filter(cc, group_profiles="only text").inlet({"messages": []}, __user__={"id": "u1"}))
+    assert calls == []
+
+
+def test_inlet_warns_once_about_a_long_note(caplog: pytest.LogCaptureFixture) -> None:
+    flt = make_filter(cc, company_profile="Fakt. " * 1500)
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            run_inlet(flt, {"messages": []})
+    assert caplog.text.count("every request carries it") == 1
 
 
 def run_inlet(flt: Any, body: dict[str, Any], metadata: dict[str, Any] | None = None) -> dict[str, Any]:

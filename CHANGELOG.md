@@ -2,6 +2,26 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
+## 2026-10-23, second update
+
+Company Context 1.2.0. The other plugins are unchanged.
+
+### Before you update
+
+- **The date and the user's name move to the end of the note**, after the language, the form of
+  address and `extra_rules`. So the start of the note is the same for all users and the model server
+  can share its cached prompt between them. Nothing has to be changed.
+
+### Company Context 1.2.0
+
+- `company_profile`: short facts about the company for every user (sites, departments, abbreviations,
+  who to ask). The model is told not to make up company details that are not given. A note above about
+  2000 tokens (~8000 characters) gives a warning in the log.
+- `group_profiles`: texts for single user groups such as departments, one `## <group name>` section per
+  group. A user gets the sections of their groups (in Open WebUI 0.12 also through a subgroup), and with
+  `include_group_names` (default on) the model learns which of these groups the user belongs to.
+  Section names that match no group are written to the log.
+
 ## 2026-10-23
 
 Office Documents 0.4.0 · Response Export 1.3.0 · Context Guard 1.4.0. The other plugins are unchanged.

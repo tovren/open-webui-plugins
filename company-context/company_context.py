@@ -2,10 +2,10 @@
 title: Company Context
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.1.0
+version: 1.2.0
 license: MIT
 required_open_webui_version: 0.11.4
-description: Adds a short system note to every request with your company name, today's date and calendar week, the response language, the form of address, the user's name and your own house rules - the same for every model and assistant, including newly created ones.
+description: Adds a short system note to every request with your company name, today's date and calendar week, the response language, the form of address, the user's name, your own house rules, a short company profile and texts for single user groups (e.g. departments) - the same for every model and assistant, including newly created ones.
 
 How it works
 - Runs on the "inlet" hook. If the request already has a system message (the chat's or the
@@ -20,21 +20,36 @@ How it works
 - The note contains the date but not the time: it opens the prompt, so it has to stay the same
   all day for the model server to reuse its prompt cache (llama-server, vLLM, Ollama) instead
   of processing the whole chat again on every turn.
+- The parts that are the same for everybody come first (rules, company profile), then the texts
+  of the user's groups, then the date and the user's name. So the model server can share the
+  cached start of the prompt between all users, and between the members of a group.
+- group_profiles holds one section per group, headed "## <group name>". A user gets the sections
+  of the groups they belong to (in Open WebUI 0.12 also through a subgroup), in the order of the
+  sections. Section names that match no group are written to the log once.
 
 Security & privacy
 - No network access, nothing is stored. Only the system message is changed; user messages
-  are left untouched.
+  are left untouched. With group_profiles set, the user's group names are read from Open WebUI's
+  database.
 - If include_user_name is on, the user's display name (as stored in Open WebUI) is sent to
   the model as part of the system note.
 """
 
+import logging
+import re
+import time
 from datetime import datetime, tzinfo
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field
 
+log = logging.getLogger(__name__)
+
 MAX_USER_NAME_CHARS = 100
+NOTE_WARN_CHARS = 8000  # about 2000 tokens; every request carries the note
+GROUP_CHECK_SECONDS = 600  # how often group_profiles is compared with the existing groups
+GROUP_HEADING = re.compile(r"^##[ \t]+(.+?)[ \t#]*$")  # "## Sales"; "###" stays text of the section
 
 TRANSLATIONS: dict[str, dict[str, str]] = {
     "en": {
@@ -55,6 +70,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "letters) should also be informal unless they ask otherwise."
         ),
         "user_name": "The user's name is {name}.",
+        "profile": "Company information:",
+        "group_profile": "Information for {group}:",
+        "groups": "The user belongs to: {groups}.",
+        "no_invention": (
+            "Use this information where it fits the question. Do not make up company details that "
+            "are neither given here nor in the sources of this chat (people, phone numbers, prices, "
+            "deadlines, rules); say that you do not know them instead."
+        ),
     },
     "de": {
         "marker": "[Firmen-Kontext]",
@@ -74,6 +97,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "schreibst du ebenfalls in der Du-Form, sofern er nichts anderes wünscht."
         ),
         "user_name": "Der Nutzer heißt {name}.",
+        "profile": "Informationen zur Firma:",
+        "group_profile": "Informationen für {group}:",
+        "groups": "Der Nutzer gehört zu: {groups}.",
+        "no_invention": (
+            "Nutze diese Angaben, wenn sie zur Frage passen. Erfinde keine Firmendetails, die weder "
+            "hier noch in den Quellen dieses Chats stehen (Personen, Telefonnummern, Preise, Fristen, "
+            "Regeln); sag stattdessen, dass du sie nicht kennst."
+        ),
     },
 }
 WEEKDAYS = {
@@ -105,6 +136,48 @@ def chat_variable(metadata: dict[str, Any] | None, name: str) -> str:
     """A variable the browser sends with every chat request, e.g. {{USER_LANGUAGE}}; '' if missing."""
     variables = (metadata or {}).get("variables")
     return str(variables.get(name) or "") if isinstance(variables, dict) else ""
+
+
+def group_key(name: str) -> str:
+    """A group name for comparison: case and runs of spaces do not matter."""
+    return " ".join(name.split()).casefold()
+
+
+def parse_group_profiles(text: str) -> tuple[list[tuple[str, str]], bool]:
+    """The sections of the group_profiles valve as (group name, text) in their order, and whether
+    there is text before the first heading (it belongs to no group). A name used twice gets one
+    section with both texts."""
+    sections: dict[str, tuple[str, list[str]]] = {}
+    current: list[str] | None = None
+    text_before = False
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if heading := GROUP_HEADING.match(line.strip()):
+            name = " ".join(heading.group(1).split())
+            current = sections.setdefault(group_key(name), (name, []))[1]
+        elif current is not None:
+            current.append(line)
+        elif line.strip():
+            text_before = True
+    return [(name, "\n".join(lines).strip()) for name, lines in sections.values()], text_before
+
+
+async def member_group_names(user_id: str) -> list[str]:
+    """Names of the user's groups, with the parent groups of their groups (0.12). Raises if Open
+    WebUI's groups are not available."""
+    from open_webui.models.groups import Groups
+
+    try:
+        groups = await Groups.get_groups_by_member_id(user_id, include_inherited=True)
+    except TypeError:  # 0.11: no nested groups, no include_inherited
+        groups = await Groups.get_groups_by_member_id(user_id)
+    return [str(getattr(group, "name", "") or "") for group in groups]
+
+
+async def all_group_names() -> list[str]:
+    """Names of all groups. Raises if Open WebUI's groups are not available."""
+    from open_webui.models.groups import Groups
+
+    return [str(getattr(group, "name", "") or "") for group in await Groups.get_all_groups()]
 
 
 def has_marker(content: Any) -> bool:
@@ -158,12 +231,31 @@ class Filter:
         )
         extra_rules: str = Field(
             default="",
-            description="Additional house rules appended to the note, e.g. 'Always write to customers "
+            description="Additional house rules for the note, e.g. 'Always write to customers "
             "in the first person plural.'",
+        )
+        company_profile: str = Field(
+            default="",
+            description="Facts every user may need, e.g. sites, departments, products, internal "
+            "abbreviations, who to ask for what. Every request carries it, so keep it short (at most "
+            "about 2000 tokens, ~8000 characters); longer texts belong in a knowledge base. The model is "
+            "told not to make up company details that are not given.",
+        )
+        group_profiles: str = Field(
+            default="",
+            description="Texts for single user groups (e.g. departments), one section per group headed "
+            "'## <group name>' as in Admin Panel → Users → Groups. A user gets the sections of their "
+            "groups. A heading without text only names the group (include_group_names).",
+        )
+        include_group_names: bool = Field(
+            default=True,
+            description="Tell the model which of the groups in group_profiles the user belongs to.",
         )
 
     def __init__(self) -> None:
         self.valves = self.Valves()
+        self._warned: set[Any] = set()  # warnings already written to the log
+        self._group_check: tuple[str, float, list[str]] = ("", 0.0, [])  # valve text, time, unknown names
 
     def _now(self, metadata: dict[str, Any] | None = None) -> datetime:
         """Now in the valve's time zone, else the browser's, else server time."""
@@ -176,14 +268,39 @@ class Filter:
         locale = chat_variable(metadata, "{{USER_LANGUAGE}}").replace("_", "-").split("-")[0].strip().lower()
         return locale if locale in TRANSLATIONS else "en"
 
-    def build_note(self, user: dict[str, Any] | None, now: datetime, language: str | None = None) -> str:
-        """Compose the system note for the given user and day."""
+    def build_note(
+        self,
+        user: dict[str, Any] | None,
+        now: datetime,
+        language: str | None = None,
+        groups: list[tuple[str, str]] | None = None,
+    ) -> str:
+        """Compose the system note for the given user and day; groups = the sections of
+        group_profiles that apply to the user."""
         language = language or self._language()
         texts = TRANSLATIONS[language]
-        lines = [texts["marker"]]
+        head = [texts["marker"]]
         if company := self.valves.company_name.strip():
-            lines.append(texts["company"].format(company=company))
-        lines.append(
+            head.append(texts["company"].format(company=company))
+        response_language = self.valves.response_language.strip() or texts["response_language"]
+        head.append(texts["language_rule"].format(language=response_language))
+        head.append(texts[self.valves.form_of_address])
+        if extra_rules := self.valves.extra_rules.strip():
+            head.append(extra_rules)
+
+        blocks = []
+        if profile := self.valves.company_profile.strip():
+            blocks.append(f"{texts['profile']}\n{profile}")
+        blocks += [
+            f"{texts['group_profile'].format(group=name)}\n{text}" for name, text in groups or [] if text
+        ]
+        facts = bool(blocks)
+        if groups and self.valves.include_group_names:
+            blocks.append(texts["groups"].format(groups=", ".join(name for name, _ in groups)))
+        if facts:
+            blocks.append(texts["no_invention"])
+
+        tail = [
             texts["date"].format(
                 weekday=WEEKDAYS[language][now.weekday()],
                 day=now.day,
@@ -191,17 +308,60 @@ class Filter:
                 year=now.year,
                 week=now.isocalendar().week,
             )
-        )
-        response_language = self.valves.response_language.strip() or texts["response_language"]
-        lines.append(texts["language_rule"].format(language=response_language))
-        lines.append(texts[self.valves.form_of_address])
+        ]
         if self.valves.include_user_name and (
             user_name := " ".join(str((user or {}).get("name") or "").split())[:MAX_USER_NAME_CHARS]
         ):
-            lines.append(texts["user_name"].format(name=user_name))
-        if extra_rules := self.valves.extra_rules.strip():
-            lines.append(extra_rules)
-        return "\n".join(lines)
+            tail.append(texts["user_name"].format(name=user_name))
+        if not blocks:
+            return "\n".join(head + tail)
+        return "\n\n".join(["\n".join(head), *blocks, "\n".join(tail)])
+
+    def _warn_once(self, key: Any, message: str, *args: Any, exc_info: bool = False) -> None:
+        if key not in self._warned:
+            self._warned.add(key)
+            log.warning(message, *args, exc_info=exc_info)
+
+    async def _check_group_names(self, sections: list[tuple[str, str]]) -> None:
+        """Log sections that match no group (a typo, a renamed or deleted group): when the valve
+        changes and then every GROUP_CHECK_SECONDS, but only if the list of such names changed."""
+        text, checked_at, reported = self._group_check
+        if text == self.valves.group_profiles and time.monotonic() - checked_at < GROUP_CHECK_SECONDS:
+            return
+        try:
+            known = {group_key(name) for name in await all_group_names()}
+        except Exception:
+            return  # reported when the user's groups cannot be read either
+        unknown = [name for name, _ in sections if group_key(name) not in known]
+        if unknown and unknown != reported:
+            log.warning("Company Context: group_profiles names groups that do not exist: %s", ", ".join(unknown))
+        self._group_check = (self.valves.group_profiles, time.monotonic(), unknown)
+
+    async def _user_groups(self, user: dict[str, Any] | None) -> list[tuple[str, str]]:
+        """The sections of group_profiles for the user's groups, in the order of the sections."""
+        sections, text_before = parse_group_profiles(self.valves.group_profiles)
+        if not sections:
+            return []
+        if text_before:
+            self._warn_once(
+                ("text before", self.valves.group_profiles),
+                "Company Context: group_profiles has text before the first '## <group name>' heading; "
+                "it belongs to no group and is left out",
+            )
+        await self._check_group_names(sections)
+        user_id = str((user or {}).get("id") or "")
+        if not user_id:
+            return []
+        try:
+            member_of = {group_key(name) for name in await member_group_names(user_id)}
+        except Exception:
+            self._warn_once(
+                "groups unavailable",
+                "Company Context: cannot read the user's groups, group_profiles is left out",
+                exc_info=True,
+            )
+            return []
+        return [(name, text) for name, text in sections if group_key(name) in member_of]
 
     async def inlet(
         self,
@@ -211,7 +371,16 @@ class Filter:
     ) -> dict[str, Any]:
         """Prepend the note to the system message (or add one); idempotent per request."""
         messages = body.get("messages") or []
-        note = self.build_note(__user__, self._now(__metadata__), self._language(__metadata__))
+        groups = await self._user_groups(__user__)
+        note = self.build_note(__user__, self._now(__metadata__), self._language(__metadata__), groups)
+        if len(note) > NOTE_WARN_CHARS:
+            self._warn_once(
+                ("size", self.valves.company_profile, self.valves.group_profiles, tuple(name for name, _ in groups)),
+                "Company Context: the note has %d characters (about %d tokens) and every request carries "
+                "it; keep company_profile and group_profiles short and put longer texts into a knowledge base",
+                len(note),
+                len(note) // 4,
+            )
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
             messages[0]["content"] = prepend_note(note, messages[0].get("content"))
         else:

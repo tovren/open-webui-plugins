@@ -8,7 +8,7 @@ folder with a README:
 | [Office Documents](office-documents/) | Tool | Lets the model create Word, Excel and PowerPoint files and attaches them to its answer |
 | [Response Export](response-export/) | Action | Adds buttons to export an answer as Word, Excel or PDF, or open it as an e-mail |
 | [Context Guard](context-guard/) | Filter | Warns before the context window overflows and stops the request with a clear message |
-| [Company Context](company-context/) | Filter | Adds company name, date, language and form of address to every request |
+| [Company Context](company-context/) | Filter | Adds company name, date, language, form of address, a short company profile and texts per user group to every request |
 | [Reasoning Toggle](reasoning-toggle/) | Filter (toggle) | Adds a button to the chat input that lets local reasoning models (vLLM, llama-server) think before they answer |
 | [Office File UI](office-file-ui/) | Browser script | Optional: shows files attached to an answer as chips below the text and opens Office files in the preview |
 
@@ -83,6 +83,9 @@ executable, which allows checking several versions:
 python -m venv /tmp/owui-0120 && /tmp/owui-0120/bin/pip install open-webui==0.12.0
 OWUI_BIN=/tmp/owui-0120/bin/open-webui /tmp/owui-test/bin/python -I -m pytest -q tests/integration
 ```
+
+The same folder also checks Company Context's `group_profiles` with real groups (in 0.12 with a
+subgroup).
 
 Optional checks run when the tools are installed:
 
