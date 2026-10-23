@@ -343,6 +343,119 @@ def test_parse_number(text: str, value: Any, number_format: str | None) -> None:
     assert type(result) is type(value)
 
 
+@pytest.mark.parametrize(
+    ("text", "decimal", "value", "number_format"),
+    [
+        ("1.085", ".", 1.085, None),
+        ("1.085", ",", 1085, "#,##0"),
+        ("1,234", ",", 1.234, None),
+        ("1,234", ".", 1234, "#,##0"),
+        ("-3.125 %", ".", -0.03125, "0.0#%"),
+        ("2.000 €", ",", 2000.0, '#,##0.00 "€"'),
+        ("0.125", ",", 0.125, None),  # never a thousands separator after a single 0
+        ("1.234.567", ".", 1234567, "#,##0"),  # unambiguous: the decimal mark does not matter
+        ("1.234,5", ".", 1234.5, "#,##0.0"),
+    ],
+)
+def test_parse_number_with_a_decimal_mark(
+    text: str, decimal: str, value: Any, number_format: str | None
+) -> None:
+    result, fmt = rx.parse_number(text, decimal)
+    assert fmt == number_format
+    assert result == pytest.approx(value) if isinstance(value, float) else result == value
+    assert type(result) is type(value)
+
+
+def xlsx_sheets(content: str, **valves: Any) -> Any:
+    data, _, _ = downloaded(run_action("xlsx", content, **valves))
+    return load_workbook(io.BytesIO(data))
+
+
+def column_values(sheet: Any, column: str) -> list[Any]:
+    return [cell.value for cell in sheet[column][1:]]
+
+
+def test_xlsx_ambiguous_numbers_follow_their_column() -> None:
+    content = (
+        "| Rate | Amount | Mixed | Text |\n|---|---|---|---|\n| 1.085 | 2.000 | 1.250 | a |\n"
+        "| 0.125 | 15.000 | 1,5 | 1.085 |\n| 1.25 | 1.250.000 | 2.5 | b |\n| 3.125 | 800 | | |"
+    )
+    for language in ("en", "de"):  # the column decides, not the language
+        sheet = xlsx_sheets(content, language=language).active
+        assert column_values(sheet, "A") == pytest.approx([1.085, 0.125, 1.25, 3.125])
+        assert column_values(sheet, "B") == [2000, 15000, 1250000, 800]
+        assert sheet["B2"].number_format == "#,##0"
+    # columns that show no or both decimal marks: the one of the language
+    assert xlsx_sheets(content, language="en").active["C2"].value == pytest.approx(1.25)
+    assert xlsx_sheets(content, language="de").active["C2"].value == 1250
+    assert xlsx_sheets(content, language="en").active["D3"].value == pytest.approx(1.085)
+    assert xlsx_sheets(content, language="de").active["D3"].value == 1085
+    assert xlsx_sheets("| x |\n|---|\n| 1,234 |", language="de").active["A2"].value == pytest.approx(1.234)
+    assert xlsx_sheets("| x |\n|---|\n| 1,234 |", language="en").active["A2"].value == 1234
+
+
+@pytest.mark.parametrize(("language", "number_format"), [("en", "yyyy-mm-dd"), ("de", "dd.mm.yyyy")])
+def test_xlsx_dates(language: str, number_format: str) -> None:
+    content = (
+        "| Date |\n|---|\n| 15.03.2024 |\n| 1.3.2024 |\n| 2024-03-12 |\n| 03/12/2024 |\n"
+        "| 31.02.2024 |\n| 01.01.1899 |\n| 2024-3-12 |"
+    )
+    sheet = xlsx_sheets(content, language=language).active
+    dates = [datetime(2024, 3, 15), datetime(2024, 3, 1), datetime(2024, 3, 12)]
+    assert column_values(sheet, "A") == [*dates, "03/12/2024", "31.02.2024", "01.01.1899", "2024-3-12"]
+    assert all(cell.is_date and cell.number_format == number_format for cell in sheet["A"][1:4])
+    assert all(cell.data_type == "s" for cell in sheet["A"][4:])  # month or day first, impossible, too early
+    assert rx.parse_date("12.10.2026") == rx.date(2026, 10, 12) and rx.parse_date("2026") is None
+
+
+def test_xlsx_links() -> None:
+    content = (
+        "| Name | Link |\n|---|---|\n| [Docs](https://example.org/d) | **[bold](http://example.org)** |\n"
+        "| see [a](https://a.example) here | <mailto:x@example.org> |\n"
+        "| [js](javascript:alert(1)) | [attach](mailto:x@example.org?attach=/etc/passwd) |\n"
+        "| [Header link](https://example.org) | ![logo](https://example.org/l.png) |"
+    )
+    sheet = xlsx_sheets(content).active
+    cells = [cell for row in sheet for cell in row if cell.hyperlink]
+    links = {cell.coordinate: (cell.value, cell.hyperlink.target) for cell in cells}
+    assert links == {
+        "A2": ("Docs", "https://example.org/d"),
+        "B2": ("bold", "http://example.org"),
+        "B3": ("mailto:x@example.org", "mailto:x@example.org"),
+        "A5": ("Header link", "https://example.org"),
+        "B5": ("logo", "https://example.org/l.png"),
+    }
+    assert sheet["A2"].font.u == "single" and sheet["A2"].font.color.rgb.endswith(rx.HYPERLINK_COLOR)
+    assert sheet["A2"].font.name == "Calibri" and sheet["A2"].style == "Hyperlink"
+    assert sheet["A3"].value == "see a (https://a.example) here"
+    assert sheet["A4"].value == "js (javascript:alert(1))"
+    assert sheet["B4"].value == "attach (mailto:x@example.org?attach=/etc/passwd)"
+    header = xlsx_sheets("| [Name](https://example.org) |\n|---|\n| x |").active["A1"]
+    assert header.value == "Name (https://example.org)" and not header.hyperlink and header.font.bold
+
+
+def test_xlsx_sheet_names_from_headings() -> None:
+    content = (
+        "# Report\n\n## Prices: 2024/25 [EUR]\n\n| a |\n|---|\n| 1 |\n\nText\n\n| b |\n|---|\n| 2 |\n\n"
+        "## Prices: 2024/25 [EUR]\n| c |\n|---|\n| 3 |\n\n"
+        "### Quarterly figures of all regions\n\n| d |\n|---|\n| 4 |\n\n"
+        "## 'History'\n\n| e |\n|---|\n| 5 |\n\n## Table 2\n\n| f |\n|---|\n| 6 |\n\n"
+        "## *?\n\n| g |\n|---|\n| 7 |"
+    )
+    names = xlsx_sheets(content).sheetnames
+    assert names == [
+        "Prices 2024 25 EUR",
+        "Table 2",
+        "Prices 2024 25 EUR (2)",
+        "Quarterly figures of all region",  # at most 31 characters
+        "History (2)",  # Excel keeps "History" for itself
+        "Table 2 (2)",
+        "Table 7",  # nothing left of the heading
+    ]
+    assert all(len(name) <= 31 for name in names)
+    assert xlsx_sheets(content, language="de").sheetnames[1] == "Tabelle 2"
+
+
 def test_xlsx_values_and_formats() -> None:
     content = SAMPLE + (
         "\n\n| Code | Formula | Total |\n|---|---|---|\n| 01067 | =1+1 | 12% |\n"
@@ -450,6 +563,107 @@ def test_email_subject_line() -> None:
     assert rx.split_email(blocks) == ("Angebot", [rx.Paragraph("Hallo Bob")])
     blocks = rx.parse_blocks("#Subject: not a heading")
     assert rx.split_email(blocks)[0] == ""
+
+
+# As Open WebUI 0.11.4 to 0.12.3 send them with the clicked message (chatActionHandler in Chat.svelte)
+SOURCES = [
+    {
+        "source": {"id": "file-1", "name": "Handbook.pdf", "type": "file"},
+        "document": ["chunk 1", "chunk 2", "chunk 3"],
+        "metadata": [
+            {"source": "file-1", "name": "Handbook%20v2.pdf"},
+            {"source": "file-1"},
+            {"source": "file-2"},
+        ],
+        "distances": [0.8, 0.7, 0.6],
+    },
+    {
+        "source": {"type": "web_search", "name": "web search", "urls": ["https://example.org/a b"]},
+        "document": ["result"],
+        "metadata": [{"source": "https://example.org/a b", "title": "A"}],
+    },
+    {"source": {"name": "Weather tool"}, "document": ["sunny"], "metadata": [{}]},
+    {"source": {"id": "wiki", "name": "Wiki", "url": "https://wiki.example/x"}, "document": ["text"]},
+    {
+        "source": {"name": "News"},
+        "document": ["n"],
+        "metadata": [{"source": "https://news.example/1", "external": True}],
+    },
+    {},
+    "broken",
+    {"source": {"name": "no documents"}},
+]
+
+
+def sources_body(content: str, sources: Any = SOURCES) -> dict[str, Any]:
+    message = {"id": "m2", "role": "assistant", "content": content, "sources": sources}
+    return {"id": "m2", "messages": [message]}
+
+
+def test_message_sources_are_numbered_like_open_webui() -> None:
+    assert rx.message_sources(sources_body("")["messages"][0]) == [
+        ("Handbook v2.pdf", None),  # two chunks of one file are one source
+        ("Handbook.pdf", None),  # another file of the same source
+        ("https://example.org/a b", "https://example.org/a b"),
+        ("Weather tool", None),
+        ("Wiki", "https://wiki.example/x"),
+        ("News", "https://news.example/1"),  # an external source keeps its name (0.12.3)
+    ]
+    assert rx.message_sources({}) == [] and rx.message_sources({"sources": "x"}) == []
+
+
+@pytest.mark.parametrize(("language", "label"), [("en", "Sources"), ("de", "Quellen")])
+def test_sources_are_listed(language: str, label: str) -> None:
+    content = "# Report\n\nSales rose [1][2, 3] and fell [4#page=2].\n\n| a | b |\n|---|---|\n| [5] | 1 |"
+    body = sources_body(content)
+    doc = Document(io.BytesIO(downloaded(run_action("docx", body=body, language=language))[0]))
+    texts = [(p.style.name, p.text) for p in doc.paragraphs if p.text]
+    assert texts[2:] == [
+        ("Normal", label),
+        *[("List Number", text) for text in ("Handbook v2.pdf", "Handbook.pdf", "https://example.org/a%20b",
+                                             "Weather tool", "Wiki – https://wiki.example/x",
+                                             "News – https://news.example/1")],
+    ]  # fmt: skip
+    assert all(run.bold for run in next(p for p in doc.paragraphs if p.text == label).runs)
+    assert [link.address for p in doc.paragraphs for link in p.hyperlinks] == [
+        "https://example.org/a%20b", "https://wiki.example/x", "https://news.example/1"
+    ]  # fmt: skip
+    assert downloaded(run_action("docx", body=body))[1].startswith("Report ")  # still the title
+    if pypdf is not None:
+        data, _, _ = downloaded(run_action("pdf", body=body, language=language))
+        text = " ".join(page_texts(data)[0].split())
+        assert f"{label} 1. Handbook v2.pdf 2. Handbook.pdf" in text
+        assert "6. News – https://news.example/1" in text
+        assert link_targets(data)[-1] == "https://news.example/1"
+    url = js_value(run_action("email", body=body, language=language).code(), "link.href = ")
+    mail_body = parse_qs(urlsplit(url).query)["body"][0]
+    assert f"\r\n\r\n{label}\r\n\r\n1. Handbook v2.pdf\r\n2. Handbook.pdf\r\n" in mail_body
+
+
+@pytest.mark.parametrize(
+    ("content", "sources"),
+    [
+        ("No markers here.", SOURCES),
+        ("Only in code: `a[1]`\n\n```\nb[2]\n```", SOURCES),
+        ("A footnote[^1] and a [link](https://example.org) and [x]", SOURCES),
+        ("Cited [1] without sources", None),
+        ("Cited [1] with empty sources", [{}]),
+    ],
+)
+def test_no_sources_list_without_citations_or_sources(content: str, sources: Any) -> None:
+    doc = Document(io.BytesIO(downloaded(run_action("docx", body=sources_body(content, sources)))[0]))
+    assert not any(p.style.name == "List Number" for p in doc.paragraphs)
+    assert "Sources" not in [p.text for p in doc.paragraphs]
+
+
+@pytest.mark.parametrize(
+    ("content", "listed"),
+    [("Im Jahr [2024] wuchs der Umsatz.", False), ("[0] and [1, 3]", False), ("Er wuchs [2].", True)],
+)
+def test_only_numbers_of_sources_are_citations(content: str, listed: bool) -> None:
+    body = sources_body(content, SOURCES[:1])  # two sources
+    doc = Document(io.BytesIO(downloaded(run_action("docx", body=body))[0]))
+    assert any(p.style.name == "List Number" for p in doc.paragraphs) == listed
 
 
 def test_emphasis_across_lines() -> None:
@@ -618,6 +832,91 @@ def test_nested_details_are_removed() -> None:
     )
     assert rx.clean_markdown(text) == "Answer end"
     assert rx.clean_markdown("<details>open without end\nText") == "<details>open without end\nText"
+    text = '<thinking>a ` b</thinking>A <details type="code_interpreter">\n```python\nx\n```\n</details>B'
+    assert rx.clean_markdown(text) == "A B"  # a backtick in the reasoning does not keep it
+
+
+def test_open_webui_blocks_are_removed_after_a_lone_backtick() -> None:
+    text = (
+        'Ich prüfe das kurz, it`s quick:\n<details type="tool_calls" id="x" done="true" arguments="{}" '
+        'result="&quot;use `ls`&quot;">\n<summary>Tool Executed</summary>\n</details>\nErgebnis'
+    )
+    assert rx.clean_markdown(text) == "Ich prüfe das kurz, it`s quick:\n\nErgebnis"
+
+
+def test_closing_tag_in_code_does_not_close_details() -> None:
+    text = "<details>\n<summary>Hint</summary>\n\nClose it with `</details>`.\n</details>\n\nAfter"
+    assert rx.parse_blocks(rx.clean_markdown(text)) == [
+        rx.Paragraph("**Hint**"),
+        rx.Paragraph("Close it with `</details>`."),
+        rx.Paragraph("After"),
+    ]
+
+
+def test_code_keeps_tags_and_images() -> None:
+    text = (
+        "HTML:\n\n```html\n<details><summary>More</summary>\nHidden text\n</details>\n![x](data:a)\n```\n\n"
+        "~~~\n<think>kept</think>\n~~~\n\nUse `<think>` and `</details>` like <think>this</think> here."
+    )
+    assert rx.clean_markdown(text) == text.replace("<think>this</think>", "")
+    paragraphs = [p.text for p in Document(io.BytesIO(downloaded(run_action("docx", text))[0])).paragraphs]
+    assert "<details><summary>More</summary>\nHidden text\n</details>\n![x](data:a)" in paragraphs
+    assert "<think>kept</think>" in paragraphs and "Use <think> and </details> like  here." in paragraphs
+
+
+def test_details_of_the_model_are_kept() -> None:
+    text = (
+        "Task: 2x = 4\n\n<details>\n<summary>**Solution** 1.</summary>\n\nx = **2**\n"
+        '<details type="reasoning">hidden</details>\n</details>\n\n<details open><p>No summary</p></details>'
+    )
+    assert rx.parse_blocks(rx.clean_markdown(text)) == [
+        rx.Paragraph("Task: 2x = 4"),
+        rx.Paragraph("**Solution 1\\.**"),
+        rx.Paragraph("x = **2**"),
+        rx.Paragraph("<p>No summary</p>"),
+    ]
+    doc = Document(io.BytesIO(downloaded(run_action("docx", text))[0]))
+    summary = next(p for p in doc.paragraphs if p.text == "Solution 1.")
+    assert all(run.bold for run in summary.runs) and "hidden" not in "\n".join(p.text for p in doc.paragraphs)
+
+
+@pytest.mark.parametrize(("language", "placeholder"), [("en", "[Image]"), ("de", "[Bild]")])
+def test_images_without_a_web_address(language: str, placeholder: str) -> None:
+    picture = base64.b64encode(bytes(range(256)) * 1600).decode()  # 400 KB
+    content = (
+        f"# Chart\n\nBefore ![Sales 2025](data:image/png;base64,{picture}) after\n\n"
+        "![](/api/v1/files/1234-abcd/content)\n\n"
+        "![a *b*](./chart.png \"title\") ![web](https://example.org/p.png)"
+    )
+    doc = Document(io.BytesIO(downloaded(run_action("docx", content, language=language))[0]))
+    texts = [p.text for p in doc.paragraphs]
+    assert texts[1:] == ["Before Sales 2025 after", placeholder, "a *b* web"]
+    assert [link.address for p in doc.paragraphs for link in p.hyperlinks] == ["https://example.org/p.png"]
+    if pypdf is not None:
+        data, _, _ = downloaded(run_action("pdf", content, language=language))
+        assert len(read_pdf(data).pages) == 1 and placeholder in page_texts(data)[0]
+
+
+def test_latex_stays_as_written() -> None:
+    text = r"Energy \[ E = mc^2 \] and \(a_1\), $a*b*c$ and $$\frac{1}{2}$$ cost $5 and $10, \$3, **$x$**"
+    runs = rx.parse_inline(text)
+    assert "".join(run.text for run in runs) == (
+        r"Energy \[ E = mc^2 \] and \(a_1\), $a*b*c$ and $$\frac{1}{2}$$ cost $5 and $10, $3, $x$"
+    )
+    assert [run.text for run in runs if run.italic or run.bold] == ["$x$"]
+    assert rx.to_plain("$5-$10 and $ 5 $") == "$5-$10 and $ 5 $"  # amounts, no formulas
+    assert rx.to_plain("$$\nx_1 = *y*\n$$") == "$$\nx_1 = *y*\n$$"
+
+
+def test_html_entities_and_lone_surrogates() -> None:
+    content = "A &amp; B&nbsp;C &lt;tag&gt; &copy; `&amp;` \ud83d end\n\n```\n&lt;\n```"
+    doc = Document(io.BytesIO(downloaded(run_action("docx", content))[0]))
+    assert [p.text for p in doc.paragraphs] == ["A & B C <tag> © &amp;  end", "&lt;"]
+    data, _, _ = downloaded(run_action("email", content, always_eml=True))
+    message = email.message_from_bytes(data, policy=email.policy.default)
+    parts = {part.get_content_type(): part.get_content() for part in message.iter_parts()}
+    assert "A & B C <tag> ©" in parts["text/plain"]
+    assert "A &amp; B C &lt;tag&gt; ©" in parts["text/html"]  # escaped once, shown as written
 
 
 def test_docx_rule_is_a_line() -> None:
@@ -878,11 +1177,26 @@ def test_pdf_german_characters() -> None:
         ("漢字 αβ Жж", "?? ?? ??"),
         ("tab\there\r\x07", "tab here"),
         (GERMAN, GERMAN),
+        ("├── src/\n│   └── main.py\n└── README.md", "+-- src/\n|   +-- main.py\n+-- README.md"),
+        ("┌─┬─┐ ╔═╦═╗ ╭─╮ ┃━┃ ┄┆ ╱╲╳", "+-+-+ +=+=+ +-+ |-| -| /\\X"),
+        ("↑ ↓ ⟶ ⟹ ↳ ▶ ► ◀ ▲ ▼ ➤ ❯ ✕ ✖ ◆ ✦", "^ v -> => -> > > < ^ v > > x x • *"),
     ],
 )
 def test_pdf_characters_outside_the_standard_fonts(text: str, expected: str) -> None:
     assert rx.pdf_safe_text(text) == expected
     rx.pdf_safe_text(expected).encode("cp1252")
+
+
+def test_pdf_box_drawing_covers_the_block() -> None:
+    stand_ins = {rx.pdf_safe_text(chr(code)) for code in rx.BOX_DRAWING}
+    assert stand_ins == {"-", "=", "|", "+", "/", "\\", "X"}  # one character each: trees keep their shape
+
+
+@needs_pypdf
+def test_pdf_directory_tree() -> None:
+    data = make_pdf("```\nproject/\n├── src/\n│   └── main.py\n└── README.md\n```")
+    code = [text for _, font, _, _, _, text in text_pieces(data) if font == "Courier"]
+    assert code == ["project/", "+-- src/", "|   +-- main.py", "+-- README.md"]
 
 
 @needs_pypdf

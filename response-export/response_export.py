@@ -2,7 +2,7 @@
 title: Response Export
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.2.2
+version: 1.3.0
 license: MIT
 required_open_webui_version: 0.11.4
 description: Adds four buttons below every assistant message - export as Word (.docx), export its tables as Excel (.xlsx), download as PDF, and open as an e-mail draft. Files are built in memory and handed straight to the browser; nothing is stored on the server.
@@ -11,15 +11,17 @@ Buttons
 - Word (.docx) with headings, lists (one nesting level), tables, bold/italic/code, clickable links,
   code blocks, quotes and horizontal rules, in the design of Office Documents (accent_color and
   font valves) and optionally on a company template such as a letterhead (word_template valve).
-- Excel (.xlsx) with one sheet per Markdown table, a styled and frozen header row, auto filter,
-  fitted column widths and real numbers (also German and Swiss formats such as "1.234,56 EUR",
-  "12,5 %" or "CHF 1'234.50"); phone numbers such as "+49 711 123456" stay text.
+- Excel (.xlsx) with one sheet per Markdown table (named after a heading directly above it), a
+  styled and frozen header row, auto filter, fitted column widths, clickable links, real dates and
+  real numbers (also German and Swiss formats such as "1.234,56 EUR", "12,5 %" or "CHF 1'234.50");
+  phone numbers such as "+49 711 123456" stay text.
 - PDF (.pdf) with the same content and design as the Word file (accent_color valve), page numbers
   and an optional small footer. The plugin writes the PDF itself with the standard PDF fonts
   (Helvetica, Courier), so no PDF library is needed.
 - E-mail via a mailto link; answers too long for a mailto link are downloaded as an .eml draft
   (marked "X-Unsent", so Outlook opens it as a new editable message).
-Reasoning and tool-call blocks are removed before exporting.
+Reasoning and tool-call blocks are removed before exporting. If the answer cites sources ([1]), Word,
+PDF and e-mail end with the list of its sources.
 
 Security & privacy
 - No network access, no shell, nothing is written to disk or stored on the server. Only the
@@ -33,8 +35,9 @@ Security & privacy
 - The word_template valve reads one Word file from the server (at most 20 MB); its text is removed,
   only header, footer, page size and margins are kept.
 - Raw HTML in the response is always escaped, links are limited to http, https, mailto and tel
-  in the e-mail and to http, https and mailto in Word and PDF, and images are never loaded (they
-  become links). Spreadsheet cells are written as text or numbers, never as formulas.
+  in the e-mail and to http, https and mailto in Word, PDF and Excel, and images are never loaded
+  (web images become links, embedded ones their description). Spreadsheet cells are written as
+  text, numbers or dates, never as formulas.
 """
 
 import asyncio
@@ -48,12 +51,12 @@ import re
 import unicodedata
 import zipfile
 import zlib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field, replace
-from datetime import datetime, tzinfo
+from datetime import date, datetime, tzinfo
 from email.message import EmailMessage
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from docx import Document
@@ -156,9 +159,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "email_draft_name": "E-mail draft",
         "default_subject": "Draft",
         "sheet_name": "Table {n}",
+        "sources": "Sources",
+        "image": "[Image]",
         "print_footer": "Created with the AI assistant on {date}. Please check the content before use.",
         "page_number": "Page {page} of {pages}",
         "date_format": "%Y-%m-%d",
+        "excel_date_format": "yyyy-mm-dd",
+        "decimal_mark": ".",  # how Excel reads "1.250" if the column does not show it
         "paper": "letter",
     },
     "de": {
@@ -179,9 +186,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "email_draft_name": "E-Mail-Entwurf",
         "default_subject": "Entwurf",
         "sheet_name": "Tabelle {n}",
+        "sources": "Quellen",
+        "image": "[Bild]",
         "print_footer": "Erstellt mit dem KI-Assistenten am {date} – Inhalte bitte prüfen.",
         "page_number": "Seite {page} von {pages}",
         "date_format": "%d.%m.%Y",
+        "excel_date_format": "dd.mm.yyyy",
+        "decimal_mark": ",",
         "paper": "a4",
     },
 }
@@ -226,9 +237,26 @@ ACTIONS = {
 
 # ---------------------------------------------------------------------------------- message content --
 
-# innermost block first (no opening tag of the same kind inside), so nested <details> are removed completely
-HIDDEN_BLOCK_RE = re.compile(r"<(details|think)\b[^>]*>(?:(?!<\1\b).)*?</\1>", re.DOTALL | re.IGNORECASE)
-XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+XML_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")  # also lone surrogates
+# Open WebUI's own blocks in a message: reasoning, tool calls and code interpreter runs (processDetails in
+# its utils/index.ts). Other <details> are the model's, e.g. a collapsible solution.
+HIDDEN_DETAILS_TYPES = {"reasoning", "tool_calls", "code_interpreter"}
+TAG_PATTERN = r"<(?P<close>/)?(?P<tag>details|think|thinking)\b(?P<attrs>[^>]*)>"
+TAG_RE = re.compile(TAG_PATTERN, re.IGNORECASE)
+LINK_TARGET = r"(?:[^()\s]|\([^()\s]*\))+"  # one level of parentheses, as in "a_(b)"
+CONTENT_RE = re.compile(  # what clean_markdown looks at: code (left as it is), an image or a tag
+    r"^[ \t]*(?P<fence>(?P<char>[`~])(?P=char){2,}).*?(?:^[ \t]*(?P=fence)(?P=char)*[ \t]*$|\Z)"
+    r"|`(?:[^`\n]|\n(?![ \t]*\n))+`"  # inline code, which cannot span a blank line
+    rf"|!\[(?P<alt>[^\]]*)\]\((?P<src>{LINK_TARGET})(?:\s+\"[^\"]*\")?\)"
+    rf"|{TAG_PATTERN}",
+    re.MULTILINE | re.DOTALL | re.IGNORECASE,
+)
+DETAILS_TYPE_RE = re.compile(r"(?:^|\s)type\s*=\s*[\"']?(?P<type>[\w-]+)", re.IGNORECASE)
+SUMMARY_RE = re.compile(r"\s*<summary\b[^>]*>(?P<summary>.*?)</summary\s*>", re.DOTALL | re.IGNORECASE)
+# Characters that start Markdown formatting; "]" and "()" only matter after "[", and "\(", "\[" would start
+# a formula
+MARKDOWN_SPECIAL_RE = re.compile(r"([\\`*_{}\[#+\-.!|~<>$])")
+WEB_PREFIXES = ("http://", "https://")
 
 
 def find_message(body: dict[str, Any]) -> dict[str, Any]:
@@ -253,21 +281,119 @@ def message_text(message: dict[str, Any]) -> str:
     return ""
 
 
-def clean_markdown(text: str) -> str:
-    """Drop reasoning/tool-call blocks (also nested ones) and characters invalid in XML (docx/xlsx)."""
-    count = 1
-    while count:
-        text, count = HIDDEN_BLOCK_RE.subn("", text)
-    return XML_ILLEGAL_RE.sub("", text).strip()
+def message_sources(message: dict[str, Any]) -> list[tuple[str, str | None]]:
+    """(name, web address or None) of the sources Open WebUI sends with a message, numbered like its citation
+    markers [1], [2] ...: one per distinct document source, as in its Citations.svelte."""
+    found: dict[str, tuple[str, str | None]] = {}
+    for source in message.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        origin = source.get("source") if isinstance(source.get("source"), dict) else {}
+        documents, metadata = source.get("document"), source.get("metadata")
+        for index in range(len(documents) if isinstance(documents, list) else 0):
+            meta = metadata[index] if isinstance(metadata, list) and index < len(metadata) else None
+            meta = meta if isinstance(meta, dict) else {}
+            key = str(next((v for v in (meta.get("source"), origin.get("id")) if v is not None), "N/A"))
+            name, url = meta.get("name") or origin.get("name"), origin.get("url")
+            if key.startswith(WEB_PREFIXES):
+                name, url = name if meta.get("external") else key, key
+            url = url if isinstance(url, str) and url.lower().startswith(WEB_PREFIXES) else None
+            found.setdefault(key, (unquote(str(name or key)), url))
+    return list(found.values())
+
+
+def escape_markdown(text: str) -> str:
+    return MARKDOWN_SPECIAL_RE.sub(r"\\\1", text)
+
+
+def _is_hidden_details(tag: re.Match[str]) -> bool:
+    kind = DETAILS_TYPE_RE.search(tag["attrs"]) if tag["tag"].lower() == "details" else None
+    return bool(kind and kind["type"].lower() in HIDDEN_DETAILS_TYPES)
+
+
+def _drop_hidden_details(text: str) -> str:
+    """Remove Open WebUI's own <details> blocks (also nested ones), also where they look like code: it writes
+    them itself, with escaped attributes, so a backtick in the text before one must not keep it. Each ends at
+    the </details> that closes it, counting all <details> tags in between; one never closed stays."""
+    parts: list[str] = []
+    position = 0
+    for opening in TAG_RE.finditer(text):
+        if opening.start() < position or not _is_hidden_details(opening):  # removed already, or kept
+            continue
+        depth = 0
+        for tag in TAG_RE.finditer(text, opening.start()):
+            if tag["tag"].lower() == "details":
+                depth += -1 if tag["close"] else 1
+                if not depth:
+                    parts.append(text[position : opening.start()])
+                    position = tag.end()
+                    break
+    parts.append(text[position:])
+    return "".join(parts)
+
+
+def _tag_pairs(text: str) -> dict[int, tuple[int, int]]:
+    """Start of each opening tag outside code -> (start, end) of its closing tag, matched by nesting per tag
+    name; tags in code do not count."""
+    pairs: dict[int, tuple[int, int]] = {}
+    open_tags: dict[str, list[int]] = {}
+    for match in CONTENT_RE.finditer(text):
+        if match["tag"] is None:  # code or an image
+            continue
+        starts = open_tags.setdefault(match["tag"].lower(), [])
+        if not match["close"]:
+            starts.append(match.start())
+        elif starts:
+            pairs[starts.pop()] = match.span()
+    return pairs
+
+
+def clean_markdown(text: str, image_label: str = "[Image]") -> str:
+    """Prepare a message for parsing; code stays as it is:
+    - Open WebUI's reasoning and tool-call blocks and <think> blocks (also nested ones) are dropped,
+    - other <details> become their summary (bold) and text,
+    - images that are not on the web (embedded data, files of the chat) become their description or
+      `image_label`; web images stay, they become links,
+    - characters invalid in XML (docx/xlsx) and lone surrogates are dropped."""
+    text = _drop_hidden_details(XML_ILLEGAL_RE.sub("", text))
+    pairs = _tag_pairs(text)
+    kept_ends: set[int] = set()  # closing tags of the model's <details>
+    parts: list[str] = []
+    position = 0
+    while match := CONTENT_RE.search(text, position):
+        parts.append(text[position : match.start()])
+        position = match.end()
+        if match["src"] is not None:
+            web = match["src"].lower().startswith(WEB_PREFIXES)
+            parts.append(match[0] if web else escape_markdown(" ".join(match["alt"].split()) or image_label))
+        elif match["tag"] is None:  # code
+            parts.append(match[0])
+        elif match["close"]:
+            parts.append("\n\n" if match.start() in kept_ends else match[0])
+        elif match.start() not in pairs:  # never closed: text
+            parts.append(match[0])
+        elif match["tag"].lower() != "details" or _is_hidden_details(match):
+            position = pairs[match.start()][1]
+        else:
+            end = pairs[match.start()][0]
+            kept_ends.add(end)
+            summary, label = SUMMARY_RE.match(text, position), ""
+            if summary and summary.end() <= end:
+                position, label = summary.end(), to_plain(summary["summary"])
+            parts.append(f"\n\n**{escape_markdown(label)}**\n\n" if label else "\n\n")
+    parts.append(text[position:])
+    return "".join(parts).strip()
 
 
 # ----------------------------------------------------------------------------------- inline markdown --
 
 INLINE_RE = re.compile(
-    r"\\(?P<escaped>[\\`*_{}\[\]()#+\-.!|~<>])"
+    # LaTeX as Open WebUI shows it: "$5 and $10" is no formula (no space inside the $, no digit after it)
+    r"(?P<math>\$\$.+?\$\$|\\\[.+?\\\]|\\\(.+?\\\)|\$(?![\s$])[^$\n]*?(?<!\s)\$(?!\d))"
+    r"|\\(?P<escaped>[\\`*_{}\[\]()#+\-.!|~<>$])"
     r"|`(?P<code>[^`]+)`"
     r"|(?P<br><br\s*/?>)"
-    r"|!?\[(?P<label>[^\]]*)\]\((?P<url>(?:[^()\s]|\([^()\s]*\))+)(?:\s+\"[^\"]*\")?\)"
+    rf"|!?\[(?P<label>[^\]]*)\]\((?P<url>{LINK_TARGET})(?:\s+\"[^\"]*\")?\)"
     r"|<(?P<autolink>(?:https?://|mailto:)[^>\s]+)>"
     r"|\*\*\*(?P<bold_italic>.+?)\*\*\*"
     r"|\*\*(?P<bold>(?:[^*]|\*[^*\s][^*]*\*|\*)+?)\*\*"  # may contain *italic*
@@ -303,21 +429,24 @@ PLAIN = Run("")
 
 
 def parse_inline(text: str, style: Run = PLAIN) -> list[Run]:
-    """Split inline Markdown into formatted runs (emphasis may be nested)."""
+    """Split inline Markdown into formatted runs (emphasis may be nested); HTML entities such as &amp; in
+    the text are decoded, in code and formulas they stay."""
     runs: list[Run] = []
     position = 0
     for match in INLINE_RE.finditer(text):
         if match.start() > position:
-            runs.append(replace(style, text=text[position : match.start()]))
+            runs.append(replace(style, text=html.unescape(text[position : match.start()])))
         runs.extend(_runs_for_match(match, style))
         position = match.end()
     if position < len(text):
-        runs.append(replace(style, text=text[position:]))
+        runs.append(replace(style, text=html.unescape(text[position:])))
     return runs
 
 
 def _runs_for_match(match: re.Match[str], style: Run) -> list[Run]:
     kind = match.lastgroup or ""
+    if kind == "math":  # with its delimiters, nothing inside is formatting
+        return [replace(style, text=match["math"])]
     if kind == "escaped":
         return [replace(style, text=match["escaped"])]
     if kind == "code":
@@ -376,6 +505,9 @@ QUOTE_RE = re.compile(r"^\s{0,3}>\s?(?P<text>.*)$")
 TABLE_DELIMITER_RE = re.compile(r"^:?-+:?$")
 UNESCAPED_PIPE_RE = re.compile(r"(?<!\\)\|")
 UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]+')
+# Open WebUI's citation markers: [1], [1][2], [1, 2], [1#page] (its citation-extension.ts)
+CITATION_RE = re.compile(r"\[\d+(?:#[^,\]\s]+)?(?:,\s*\d+(?:#[^,\]\s]+)?)*\]")
+URL_SPACE_RE = re.compile(r"[\s<>]")  # would end an autolink
 
 
 @dataclass
@@ -564,6 +696,45 @@ def parse_blocks(markdown_text: str) -> list[Block]:
 def document_title(blocks: list[Block]) -> str:
     """Plain text of the first heading, or '' if there is none."""
     return next((to_plain(b.text) for b in blocks if isinstance(b, Heading)), "")
+
+
+def _inline_texts(blocks: list[Block]) -> Iterator[str]:
+    """The inline Markdown of all blocks except code blocks."""
+    for block in blocks:
+        match block:
+            case Heading(_, text) | Paragraph(text):
+                yield text
+            case List(_, _, items):
+                for item in items:
+                    yield item.text
+                    yield from _inline_texts(item.sublists)
+            case Quote(lines):
+                yield from lines
+            case Table(rows):
+                for row in rows:
+                    yield from row
+
+
+def _cites(marker: str, count: int) -> bool:
+    """Whether a marker like [1, 2#page] is a citation: Open WebUI only shows it as one if every number is
+    one of its `count` sources, so "in [2024]" is text."""
+    return all(1 <= int(part.split("#")[0]) <= count for part in marker[1:-1].split(","))
+
+
+def add_sources(blocks: list[Block], sources: list[tuple[str, str | None]], label: str) -> list[Block]:
+    """The blocks and, if the text cites sources ([1], [2, 3], [1#page] outside code), a numbered list of
+    them under a bold `label`."""
+    runs = (run for text in _inline_texts(blocks) for run in parse_inline(text) if not run.code)
+    markers = (marker for run in runs for marker in CITATION_RE.finditer(run.text))
+    cited = any(_cites(marker[0], len(sources)) for marker in markers)
+    if not (sources and cited):
+        return blocks
+    items = []
+    for name, url in sources:
+        link = f"<{URL_SPACE_RE.sub(lambda m: quote(m[0]), url)}>" if url else ""  # an autolink
+        text = link if url == name else " – ".join(filter(None, (escape_markdown(name), link)))
+        items.append(ListItem(text))
+    return [*blocks, Paragraph(f"**{escape_markdown(label)}**"), List(True, 1, items)]
 
 
 def safe_filename(text: str, fallback: str) -> str:
@@ -1050,20 +1221,40 @@ NUMBER_RE = re.compile(  # thousands separators: . , ' ’ space, no-break space
 )
 
 
-def parse_number(text: str) -> tuple[str | int | float, str | None]:
+DATE_RE = re.compile(  # 15.03.2024, 1.3.2024 or 2024-03-15
+    r"(?P<day>\d{1,2})\.(?P<month>\d{1,2})\.(?P<year>\d{4})"
+    r"|(?P<iso_year>\d{4})-(?P<iso_month>\d{2})-(?P<iso_day>\d{2})"
+)
+MIN_EXCEL_YEAR = 1900
+INVALID_SHEET_TITLE_RE = re.compile(r"[\[\]:*?/\\]")
+MAX_SHEET_TITLE_CHARS = 31
+RESERVED_SHEET_TITLES = {"history"}  # Excel keeps it for its change tracking
+HYPERLINK_COLOR = "0563C1"  # Office's colour for links
+
+
+def _ambiguous(match: re.Match[str]) -> bool:
+    """A single dot or comma before three digits, e.g. "1.250": a thousands separator or the decimal mark."""
+    group = match["group"]
+    return group in (".", ",") and not match["fraction"] and match["int"].count(group) == 1
+
+
+def parse_number(text: str, decimal: str | None = None) -> tuple[str | int | float, str | None]:
     """Convert '1.234,56 €', '1.234,56 EUR', '-3,2 %', '1,234.5' etc. to (number, Excel number format).
 
-    A dot or comma followed by exactly three digits is read as a thousands separator, so
-    "2.000" is 2000 and "1,234" is 1234. Values that do not look like a plain number, integers
-    with leading zeros (postcodes, IDs) and phone numbers ("+49 711 123", "+1 234") are returned
-    unchanged as (text, None).
+    A dot or comma followed by exactly three digits ("2.000", "1,234") is read as the decimal mark
+    `decimal` ("." or ","), else as a thousands separator; in "0.125" it is always the decimal mark.
+    Values that do not look like a plain number, integers with leading zeros (postcodes, IDs) and
+    phone numbers ("+49 711 123", "+1 234") are returned unchanged as (text, None).
     """
     match = NUMBER_RE.fullmatch(text.strip().replace("\u2212", "-"))  # Unicode minus sign
     if not match or (match["prefix"] and match["suffix"]):
         return text, None
     if match["sign"] == "+" and (match["group"] or "").isspace() and not (match["prefix"] or match["suffix"]):
         return text, None  # international phone number
-    digits, fraction = re.sub(r"\D", "", match["int"]), match["fraction"] or ""
+    whole, group, fraction = match["int"], match["group"], match["fraction"] or ""
+    if _ambiguous(match) and (whole.startswith("0") or group == decimal):
+        (whole, fraction), group = whole.split(group), None
+    digits = re.sub(r"\D", "", whole)
     if (len(digits) > 1 and digits.startswith("0")) or len(digits) + len(fraction) > MAX_EXACT_DIGITS:
         return text, None
     number: int | float = (
@@ -1074,32 +1265,118 @@ def parse_number(text: str) -> tuple[str | int | float, str | None]:
         return number / 100, "0%" if float(number).is_integer() else "0.0#%"
     if unit:
         return float(number), CURRENCY_FORMATS[unit]
-    if match["group"]:  # written with thousands separators: Excel shows them too (but not in years or postcodes)
+    if group:  # written with thousands separators: Excel shows them too (but not in years or postcodes)
         return number, "#,##0" + ("." + "0" * len(fraction) if fraction else "")
     return number, None
 
 
-def tables_to_xlsx(tables: list[Table], sheet_name: str, font: str = BODY_FONT) -> bytes:
-    """One worksheet per table; `sheet_name` is a format string with an {n} placeholder."""
+def decimal_mark(text: str) -> str | None:
+    """The decimal mark a number shows: "." in "1.25", "1,234.5", "1,234,567" and "0.125", "," in "1,5" and
+    "1.234.567"; None if it shows none ("1.250", "42") and for text."""
+    match = NUMBER_RE.fullmatch(text.strip().replace("\u2212", "-"))
+    if not match:
+        return None
+    if match["fraction"]:
+        return match["decimal"]
+    group = match["group"]
+    if group not in (".", ","):
+        return None
+    if match["int"].count(group) > 1:
+        return "," if group == "." else "."
+    return group if match["int"].startswith("0") else None
+
+
+def column_decimal(values: list[str], fallback: str) -> str:
+    """The decimal mark of a table column: the one its numbers show, else `fallback` (the language's)."""
+    marks = {mark for text in values if (mark := decimal_mark(text))}
+    return marks.pop() if len(marks) == 1 else fallback
+
+
+def parse_date(text: str) -> date | None:
+    """A date written as 15.03.2024, 1.3.2024 or 2024-03-15; None for anything else, also for 03/15/2024
+    (month or day first?) and dates before 1900, which Excel cannot show."""
+    match = DATE_RE.fullmatch(text.strip())
+    if not match:
+        return None
+    year, month, day = (int(match[part] or match[f"iso_{part}"]) for part in ("year", "month", "day"))
+    try:
+        return date(year, month, day) if year >= MIN_EXCEL_YEAR else None
+    except ValueError:  # 31.02.2024
+        return None
+
+
+def cell_value(text: str, decimal: str, date_format: str) -> tuple[str | int | float | date, str | None]:
+    """Value and Excel number format of a cell below the header: a date, a number (parse_number) or text."""
+    day = parse_date(text)
+    return (day, date_format) if day else parse_number(text, decimal)
+
+
+def tables_with_titles(blocks: list[Block]) -> list[tuple[str, Table]]:
+    """The tables, each with the plain text of a heading directly above it ('' if there is none)."""
+    return [
+        (to_plain(blocks[i - 1].text) if i and isinstance(blocks[i - 1], Heading) else "", block)
+        for i, block in enumerate(blocks)
+        if isinstance(block, Table)
+    ]
+
+
+def sheet_title(title: str, default: str, used: set[str]) -> str:
+    """A valid sheet name not in `used` (compared as Excel does, ignoring case): the title without the
+    characters Excel forbids, at most 31 characters, else `default`; a repeated one gets " (2)" etc."""
+    name = " ".join(INVALID_SHEET_TITLE_RE.sub(" ", title).split())[:MAX_SHEET_TITLE_CHARS]
+    name = name.strip(" '") or default  # Excel does not allow an apostrophe at either end
+    candidate, n = name, 1
+    while candidate.casefold() in used | RESERVED_SHEET_TITLES:
+        n += 1
+        suffix = f" ({n})"
+        candidate = name[: MAX_SHEET_TITLE_CHARS - len(suffix)].rstrip() + suffix
+    used.add(candidate.casefold())
+    return candidate
+
+
+def _cell_link(raw: str) -> str | None:
+    """The target if the cell is exactly one link that Word would make clickable too (http, https, mailto)."""
+    runs = [run for run in parse_inline(raw) if run.text.strip()]
+    if len(runs) == 1 and runs[0].url and is_word_link(runs[0].url):
+        return runs[0].url.strip()
+    return None
+
+
+def tables_to_xlsx(tables: list[tuple[str, Table]], sheet_name: str, font: str = BODY_FONT,
+                   decimal: str = ".", date_format: str = "yyyy-mm-dd") -> bytes:  # fmt: skip
+    """One worksheet per table (see tables_with_titles), named after its title or `sheet_name`, a format
+    string with an {n} placeholder. "1.250" is read with the decimal mark its column shows, else with
+    `decimal`; dates get `date_format`. A cell that is one link is a hyperlink, other links stay
+    visible as 'text (url)'."""
     workbook = Workbook()
     workbook.remove(workbook.active)
     header_fill = PatternFill("solid", fgColor=HEADER_FILL)
     body_font, header_font = Font(name=font), Font(name=font, bold=True)  # a font without a name looks different
-    for n, table in enumerate(tables, start=1):
-        sheet = workbook.create_sheet(title=sheet_name.format(n=n))
+    link_font = Font(name=font, underline="single", color=HYPERLINK_COLOR)
+    used: set[str] = set()
+    for n, (title, table) in enumerate(tables, start=1):
+        sheet = workbook.create_sheet(title=sheet_title(title, sheet_name.format(n=n), used))
         widths = [0] * len(table.aligns)
+        columns = [[to_plain(row[column]) for row in table.rows[1:]] for column in range(len(widths))]
+        marks = [column_decimal(values, decimal) for values in columns]
         for row_index, row in enumerate(table.rows, start=1):
             for column, raw in enumerate(row, start=1):
-                text = to_plain(raw)
-                value, number_format = (text, None) if row_index == 1 else parse_number(text)
+                link = _cell_link(raw) if row_index > 1 else None
+                text = to_plain(raw, with_urls=not link)
+                if row_index == 1 or link:
+                    value, number_format = text, None
+                else:
+                    value, number_format = cell_value(text, marks[column - 1], date_format)
                 cell = sheet.cell(row=row_index, column=column, value=value if value != "" else None)
                 if isinstance(value, str) and value:
                     cell.data_type = "s"  # never let model output become a live formula ("=...")
                 if number_format:
                     cell.number_format = number_format
+                if link:  # Excel's own style for links, in the font of the sheet
+                    cell.hyperlink, cell.style = link, "Hyperlink"
                 if "\n" in text:
                     cell.alignment = Alignment(wrap_text=True, vertical="top")
-                cell.font = header_font if row_index == 1 else body_font
+                cell.font = header_font if row_index == 1 else link_font if link else body_font
                 if row_index == 1:
                     cell.fill = header_fill
                 widths[column - 1] = max(widths[column - 1], *(len(line) for line in text.split("\n")))
@@ -1338,21 +1615,25 @@ PDF_WIDTHS = {
     **dict.fromkeys((name for name in PDF_FONTS.values() if name.startswith("Courier")), (600,) * 256),
 }
 
-# Characters the standard fonts lack (they cover cp1252 only): common ones get a stand-in, emoji are
-# dropped, other characters lose their accents ("č" -> "c") or become "?".
+# Characters the standard fonts lack (they cover cp1252 only): common ones get a stand-in, box-drawing
+# characters an ASCII one (BOX_DRAWING), emoji are dropped, other characters lose their accents ("č" -> "c")
+# or become "?".
 PDF_REPLACEMENTS = {
     "\t": " ", "\u00ad": "", "\u2007": "\u00a0", "\u202f": "\u00a0",  # no-break spaces
     "\u2010": "-", "\u2011": "-", "\u2012": "–", "\u2015": "—", "\u2212": "-", "\u2043": "-",  # dashes
     "′": "'", "″": '"', "⁄": "/", "∕": "/", "∗": "*", "∙": "·", "⋅": "·",
-    "←": "<-", "→": "->", "↔": "<->", "⇐": "<=", "⇒": "=>", "⇔": "<=>",
-    "➡": "->", "➔": "->", "➜": "->", "⬅": "<-",
+    "←": "<-", "→": "->", "↔": "<->", "⇐": "<=", "⇒": "=>", "⇔": "<=>", "↑": "^", "↓": "v",
+    "➡": "->", "➔": "->", "➜": "->", "⬅": "<-", "⮕": "->", "⟶": "->", "⟵": "<-", "⟹": "=>", "↳": "->",
+    "↪": "->", "⇨": "->", "⇦": "<-", "▶": ">", "►": ">", "▸": ">", "➤": ">", "❯": ">", "◀": "<", "◄": "<",
+    "▲": "^", "▼": "v",
     "≤": "<=", "≥": ">=", "≠": "!=", "≈": "~", "≡": "=",
-    "✓": "+", "✔": "+", "✅": "+", "✗": "-", "✘": "-", "❌": "-",
+    "✓": "+", "✔": "+", "✅": "+", "✗": "-", "✘": "-", "❌": "-", "✕": "x", "✖": "x",
     "☐": "[ ]", "☑": "[x]", "☒": "[x]", "★": "*", "☆": "*", "⚠": "!",
-    "●": "•", "▪": "•", "■": "•", "‣": "•", "○": "o", "◦": "o", "□": "[ ]",
+    "●": "•", "▪": "•", "■": "•", "‣": "•", "◆": "•", "♦": "•", "○": "o", "◦": "o", "□": "[ ]", "✦": "*",
     "⌀": "Ø", "μ": "µ", "Ł": "L", "ł": "l", "Đ": "D", "đ": "d", "ı": "i",
 }  # fmt: skip
 EMOJI_RANGES = ((0x1F000, 0x1FAFF), (0x2600, 0x27BF), (0x2B00, 0x2BFF), (0x2300, 0x23FF))
+BOX_DRAWING = range(0x2500, 0x2580)  # ─ │ ┌ ├ └ ═ ║ ╭ ...
 MAX_CACHED_CHARS = 10_000
 
 
@@ -1364,10 +1645,25 @@ def _cp1252(char: str) -> bool:
         return False
 
 
+def _box_drawing(char: str) -> str:
+    """One ASCII character for a box-drawing one, so trees and boxes keep their shape: "├──" -> "+--"."""
+    words = set(unicodedata.name(char).split())
+    if "DIAGONAL" in words:
+        return {"╱": "/", "╲": "\\"}.get(char, "X")
+    across, upright = words & {"HORIZONTAL", "LEFT", "RIGHT"}, words & {"VERTICAL", "UP", "DOWN"}
+    if across and upright:
+        return "+"
+    if upright:
+        return "|"
+    return "=" if "DOUBLE" in words and "DASH" not in words else "-"
+
+
 def _pdf_char(char: str) -> str:
     """The stand-in of one character in the standard fonts (see PDF_REPLACEMENTS)."""
     if char in PDF_REPLACEMENTS:
         return PDF_REPLACEMENTS[char]
+    if ord(char) in BOX_DRAWING:
+        return _box_drawing(char)
     category = unicodedata.category(char)
     if char == "\n":
         return char
@@ -1997,15 +2293,20 @@ class Browser:
 
 @dataclass
 class Export:
-    """What an export needs besides the content: texts in the user's language, time zone and browser."""
+    """What an export needs besides the content: texts in the user's language, time zone, browser and the
+    sources of the message (message_sources)."""
 
     texts: dict[str, str]
     language: str
     timezone: tzinfo | None
     browser: Browser
+    sources: list[tuple[str, str | None]] = field(default_factory=list)
 
     def now(self) -> datetime:
         return datetime.now(self.timezone)
+
+    def with_sources(self, blocks: list[Block]) -> list[Block]:
+        return add_sources(blocks, self.sources, self.texts["sources"])
 
 
 class Action:
@@ -2081,7 +2382,9 @@ class Action:
             language = self.valves.language if self.valves.language != "auto" else "en"
             await browser.notify("error", TRANSLATIONS[language]["browser_failed"])
             return
-        content = clean_markdown(message_text(find_message(body)))
+        message = find_message(body)
+        content = clean_markdown(message_text(message), export.texts["image"])
+        export.sources = message_sources(message)
         if not content:
             await browser.notify("warning", export.texts["empty_message"])
             return
@@ -2118,20 +2421,20 @@ class Action:
 
         def build() -> bytes:
             template = read_word_template(self.valves.word_template)
-            return markdown_to_docx(blocks, self._design(), template, export.texts["paper"])
+            content = export.with_sources(blocks)
+            return markdown_to_docx(content, self._design(), template, export.texts["paper"])
 
         data = await asyncio.to_thread(build)
         await export.browser.download(data, f"{self._file_stem(blocks, export)}.docx", DOCX_MIME)
 
     async def _export_xlsx(self, content: str, export: Export) -> None:
-        blocks = parse_blocks(content)
-        tables = [block for block in blocks if isinstance(block, Table)]
+        blocks, texts = parse_blocks(content), export.texts
+        tables = tables_with_titles(blocks)
         if not tables:
-            await export.browser.notify("warning", export.texts["no_tables"])
+            await export.browser.notify("warning", texts["no_tables"])
             return
-        data = await asyncio.to_thread(
-            tables_to_xlsx, tables, export.texts["sheet_name"], self._design().font
-        )
+        data = await asyncio.to_thread(tables_to_xlsx, tables, texts["sheet_name"], self._design().font,
+                                       texts["decimal_mark"], texts["excel_date_format"])  # fmt: skip
         await export.browser.download(data, f"{self._file_stem(blocks, export)}.xlsx", XLSX_MIME)
 
     async def _export_pdf(self, content: str, export: Export) -> None:
@@ -2145,8 +2448,8 @@ class Action:
         title = document_title(blocks) or texts["default_title"]
 
         def build() -> bytes:
-            return markdown_to_pdf(blocks, design, texts["paper"], footer, texts["page_number"], title,
-                                   export.language, export.now())  # fmt: skip
+            return markdown_to_pdf(export.with_sources(blocks), design, texts["paper"], footer,
+                                   texts["page_number"], title, export.language, export.now())  # fmt: skip
 
         data = await asyncio.to_thread(build)
         await export.browser.download(data, f"{self._file_stem(blocks, export)}.pdf", PDF_MIME)
@@ -2155,6 +2458,7 @@ class Action:
         texts, browser = export.texts, export.browser
         subject, blocks = split_email(parse_blocks(content))
         subject = subject or document_title(blocks)
+        blocks = export.with_sources(blocks)
         body_text = blocks_to_text(blocks)
         if not self.valves.always_eml:
             url = build_mailto(subject, body_text)
