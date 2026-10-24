@@ -2,7 +2,7 @@
 title: Office Documents
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 0.4.1
+version: 0.4.2
 license: MIT
 required_open_webui_version: 0.11.4
 description: Lets the model create Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files. The model only supplies the content as structured JSON; fixed code builds the file, so no model-written code is ever run. The file is attached to the answer, where it can be previewed and downloaded.
@@ -4287,6 +4287,10 @@ def store_values(data: bytes, values: list[dict[str, Any]]) -> bytes:
         elif isinstance(value, str):
             kind, text = ' t="str"', xml_escape(value)
         else:
+            # Viewers that do not compute show the value as it is stored: without what is left of float arithmetic
+            # (180 - 210.4 is -30.400000000000006, a sum of such -4.249999999999986), with at most 15 digits and 10
+            # decimals, as Excel shows numbers (seconds are 0.0000116 days)
+            value = float(f"{round(value, 10):.15g}") + 0.0
             kind, text = "", str(int(value)) if value.is_integer() and abs(value) < 1e15 else repr(value)
         parts = (match["cell"], match["attributes"], kind.encode(), match["formula"], text.encode())
         return b'<c r="%s"%s%s><f>%s</f><v>%s</v></c>' % parts

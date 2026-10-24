@@ -2322,6 +2322,13 @@ def test_formula_values_are_stored() -> None:
     assert ws["D3"].value == ws["D4"].value == datetime(2026, 10, 15)
     formulas = load_workbook(io.BytesIO(excel_data([VALUES_BUDGET])))
     assert formulas.active["D2"].value == "=C2-B2"  # the formulas stay
+    leftovers = sheet([{"header": "Plan", "type": "currency"}, {"header": "Ist", "type": "currency"},
+                       {"header": "Abweichung", "type": "currency", "formula": "=A{row}-B{row}", "total": "sum"}],
+                      [[1200, 1200], [400, 385.5], [180, 210.4], [60, 60], [145, 145], [150, 128], [200, 265.9],
+                       [120, 89.95], [100, 74.5]])  # fmt: skip
+    xml = zipfile.ZipFile(io.BytesIO(excel_data([leftovers]))).read("xl/worksheets/sheet1.xml")
+    # as Excel shows them, not -30.400000000000006 and -4.249999999999986: the preview shows the stored value
+    assert b"<v>-30.4</v>" in xml and b"<v>30.05</v>" in xml and b"<f>SUM(C2:C10)</f><v>-4.25</v>" in xml
 
 
 def test_formula_values_left_to_excel() -> None:

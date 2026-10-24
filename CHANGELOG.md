@@ -4,7 +4,13 @@ Each plugin has its own version (in the header of its file). Earlier changes are
 
 ## 2026-10-24
 
-Office Documents 0.4.1 and Office File UI (no version). The other plugins are unchanged.
+Office Documents 0.4.2 and Office File UI (no version). The other plugins are unchanged.
+
+### Office Documents 0.4.2
+
+- The stored formula results are rounded as Excel shows them (at most 15 digits and 10 decimals): the
+  preview showed `180 - 210.4` as -30.400000000000006 and a sum of such differences as
+  -4.249999999999986 instead of -30.4 and -4.25.
 
 ### Office Documents 0.4.1
 
