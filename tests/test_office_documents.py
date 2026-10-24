@@ -2286,6 +2286,125 @@ def test_new_formulas_compute_in_libreoffice() -> None:
         assert [c.value for c in ws[3]][3:] == [8, "kurz", 8, "Ben-kurz", 8]
 
 
+def excel_data(sheets: list[dict[str, Any]], **kwargs: Any) -> bytes:
+    result, recorder = call("create_excel_file", sheets=sheets, **kwargs)
+    assert result.startswith("Done"), result
+    return recorder.download()[0]
+
+
+VALUES_BUDGET = sheet([{"header": "Position"}, {"header": "Plan", "type": "currency", "total": "sum"},
+                       {"header": "Ist", "type": "currency", "total": "sum"},
+                       {"header": "Abweichung", "type": "currency", "formula": "=C{row}-B{row}", "total": "sum"},
+                       {"header": "Status", "formula": '=IF(C{row}>B{row},"über","ok")'},
+                       {"header": "MwSt", "formula": "=ROUND(C{row}*0.19,2)"},
+                       {"header": "Prüfen", "formula": "=AND(C{row}>0,NOT(D{row}>400))"}],
+                      [["Miete", 1500, 1480], ["Werbung", 3000, 3450.5], ["Sonstiges", 500, None]])  # fmt: skip
+VALUES_BILL = [
+    {"name": "Sätze", "columns": [{"header": "Art"}, {"header": "Satz", "type": "percent"}], "rows": [["MwSt", "19%"]]},
+    {"name": "Rechnung", "columns": [{"header": "Pos"}, {"header": "Netto", "type": "currency"},
+                                     {"header": "Saldo", "type": "currency"}, {"header": "Frist", "type": "date"}],
+     "rows": [["A", 100, "=B2*(1+'Sätze'!$B$2)", "2026-10-01"], ["B", 50, "=C2+B3", "=D2+14"],
+              ["C", 2.5, "=C3+B4", "=MAX(D2:D3)"]]},
+]  # fmt: skip
+
+
+def test_formula_values_are_stored() -> None:
+    """openpyxl writes formulas without their values; viewers that do not compute (Open WebUI's preview) show the
+    values stored next to them, Excel computes them again."""
+    ws = load_workbook(io.BytesIO(excel_data([VALUES_BUDGET])), data_only=True).active
+    assert [c.value for c in ws[2]][3:] == [-20, "ok", 281.2, True]
+    assert [c.value for c in ws[3]][3:] == [450.5, "über", 655.6, False]  # ROUND of 655.595, not of 655.59499...
+    assert [c.value for c in ws[4]][3:] == [-500, "ok", 0, False]  # an empty cell is 0
+    assert [c.value for c in ws[5]][:4] == ["Total", 5000, 4930.5, -69.5]
+    workbook = load_workbook(io.BytesIO(excel_data(VALUES_BILL)), data_only=True)
+    ws = workbook["Rechnung"]
+    assert [ws[f"C{r}"].value for r in (2, 3, 4)] == pytest.approx([119, 169, 171.5])
+    assert ws["D3"].value == ws["D4"].value == datetime(2026, 10, 15)
+    formulas = load_workbook(io.BytesIO(excel_data([VALUES_BUDGET])))
+    assert formulas.active["D2"].value == "=C2-B2"  # the formulas stay
+
+
+def test_formula_values_left_to_excel() -> None:
+    """Formulas whose value is not certain get none: other functions and the formulas that use them, errors, what is
+    left of 0.3 - 0.1 - 0.2, booleans in COUNT (LibreOffice counts them), texts by order, numbers joined to text with
+    a decimal mark."""
+    work = sheet([{"header": "Name"}, {"header": "X", "type": "number"}, {"header": "Y", "type": "number"},
+                  {"header": "Flag"}, {"header": "Suche", "formula": "=VLOOKUP(A{row},$A$2:$B$3,2,FALSE)"},
+                  {"header": "Doppelt", "formula": "=E{row}*2"}, {"header": "Quote", "formula": "=B{row}/C{row}"},
+                  {"header": "Rest", "formula": "=B{row}-C{row}-0.2"}, {"header": "Zahl", "formula": "=COUNT(B$2:D$3)"},
+                  {"header": "Ordnung", "formula": '=A{row}<"m"'}, {"header": "Text", "formula": '=B{row}&" Stück"'}],
+                 [["a", 1, 0, True], ["b", 0.3, 0.1, False]])  # fmt: skip
+    ws = load_workbook(io.BytesIO(excel_data([work])), data_only=True).active
+    assert [c.value for c in ws[2]][4:] == [None, None, None, 0.8, None, None, "1 Stück"]
+    assert [c.value for c in ws[3]][4:] == [None, None, pytest.approx(3), None, None, None, None]
+
+
+def test_formula_values_stop_after_many_range_cells(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A running total reads the rows above it again in every row: after MAX_RANGE_CELLS the rest is left to Excel."""
+    monkeypatch.setattr(od, "MAX_RANGE_CELLS", 10)
+    work = sheet([{"header": "X", "type": "number"}, {"header": "Summe", "formula": "=SUM($A$2:A{row})"}],
+                 [[1], [2], [3], [4], [5]])  # fmt: skip
+    ws = load_workbook(io.BytesIO(excel_data([work])), data_only=True).active
+    assert [ws[f"B{r}"].value for r in range(2, 7)] == [1, 3, 6, 10, None]
+
+    monkeypatch.setattr(od, "MAX_RANGE_CELLS", 3)  # one function at other places of the formulas: read once
+    shared = sheet([{"header": "X", "type": "number"}, {"header": "Anteil", "formula": "=A{row}/SUM($A$2:$A$4)"},
+                    {"header": "Rest", "formula": "=SUM($A$2:$A$4)-A{row}"}], [[1], [2], [5]])  # fmt: skip
+    ws = load_workbook(io.BytesIO(excel_data([shared])), data_only=True).active
+    assert [ws[f"B{r}"].value for r in (2, 3, 4)] == [0.125, 0.25, 0.625] and ws["C4"].value == 3
+
+
+def test_formula_values_never_break_the_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An overflow gets no value (<v>inf</v> is no number), an error in FormulaValues none at all."""
+    huge = sheet([{"header": "X", "type": "number", "total": "sum"}], [[1e308], [1e308]])
+    data = excel_data([huge])
+    assert load_workbook(io.BytesIO(data), data_only=True).active["A4"].value is None
+    assert b"inf" not in zipfile.ZipFile(io.BytesIO(data)).read("xl/worksheets/sheet1.xml")
+
+    def broken(self: Any) -> None:
+        raise TypeError("unexpected")
+
+    monkeypatch.setattr(od.FormulaValues, "all", broken)
+    assert load_workbook(io.BytesIO(excel_data([VALUES_BUDGET])), data_only=True).active["D2"].value is None
+
+
+@pytest.mark.skipif(not shutil.which("soffice"), reason="needs LibreOffice")
+def test_formula_values_match_libreoffice() -> None:
+    """The stored values are the ones LibreOffice computes: it shows stored values as they are."""
+    numbers = sheet([{"header": "A", "type": "number"}, {"header": "B", "type": "number"},
+                     {"header": "Rund", "formula": "=ROUND(A{row}*B{row},2)"},
+                     {"header": "Pot", "formula": "=A{row}^B{row}"}, {"header": "Vgl", "formula": "=A{row}>=B{row}"},
+                     {"header": "Neg", "formula": "=-A{row}%"}, {"header": "Abs", "formula": "=ABS(A{row}-B{row})"},
+                     {"header": "Wenn", "formula": "=IF(A{row}>2,A{row})"},
+                     {"header": "Stat", "formula": "=AVERAGE($A$2:$B$6)+MIN($A$2:$A$6)-COUNT($A$2:$B$6)"}],
+                    [[2.675, 1], [1.005, 1], [0.1, 0.2], [-2.5, 2], [None, 3]], name="Zahlen")  # fmt: skip
+    times = sheet([{"header": "Start", "type": "date"}, {"header": "Von", "type": "time"},
+                   {"header": "Bis", "type": "time"}, {"header": "Frist", "type": "date", "formula": "=A{row}+14"},
+                   {"header": "Std", "formula": "=(C{row}-B{row})*24"}, {"header": "Zeit", "type": "time", "total": "sum"}],
+                  [["2026-10-01", "08:00", "16:30", None, None, "01:30"],
+                   ["2026-10-24 14:30", "22:00", "06:00", None, None, "23:45"]], name="Zeiten")  # fmt: skip
+    data = excel_data([VALUES_BUDGET, numbers, times, *VALUES_BILL])
+    stored, formulas = load_workbook(io.BytesIO(data), data_only=True), load_workbook(io.BytesIO(data))
+    with tempfile.TemporaryDirectory() as tmp:
+        formulas.save(Path(tmp) / "work.xlsx")  # without the values: LibreOffice computes them
+        subprocess.run(
+            ["soffice", f"-env:UserInstallation=file://{tmp}/profile", "--headless", "--convert-to", "xlsx",
+             "--outdir", f"{tmp}/out", "work.xlsx"],
+            cwd=tmp, check=True, capture_output=True, timeout=180,
+        )  # fmt: skip
+        computed = load_workbook(Path(tmp) / "out" / "work.xlsx", data_only=True)
+    compared = 0
+    for ws in stored.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value is not None and formulas[ws.title][cell.coordinate].data_type == "f":
+                    expected = computed[ws.title][cell.coordinate].value
+                    expected = pytest.approx(expected) if isinstance(expected, float) else expected
+                    assert cell.value == expected, (ws.title, cell.coordinate)
+                    compared += 1
+    assert compared >= 50
+
+
 # ----------------------------------------------------------------------------------------- rendering --
 
 

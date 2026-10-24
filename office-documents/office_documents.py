@@ -2,7 +2,7 @@
 title: Office Documents
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 0.4.0
+version: 0.4.1
 license: MIT
 required_open_webui_version: 0.11.4
 description: Lets the model create Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files. The model only supplies the content as structured JSON; fixed code builds the file, so no model-written code is ever run. The file is attached to the answer, where it can be previewed and downloaded.
@@ -39,13 +39,16 @@ import difflib
 import io
 import json
 import logging
+import math
 import re
 import unicodedata
 import zipfile
 from collections.abc import Awaitable, Callable, Collection, Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, ClassVar, Literal, NamedTuple
+from xml.sax.saxutils import escape as xml_escape
 
 from docx import Document
 from docx.enum.section import WD_ORIENT
@@ -69,6 +72,8 @@ from openpyxl.drawing.line import LineProperties
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_to_tuple
+from openpyxl.utils.datetime import to_excel
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.writer.theme import theme_xml
 from openpyxl.worksheet.worksheet import Worksheet
@@ -3987,6 +3992,315 @@ def default_chart_columns(sheet: ExcelSheet) -> dict[str, Any]:
 
 
 CHART_ROWS = 22  # charts below each other next to the table, one every 22 rows
+VALUE_FUNCTIONS = {"SUM", "AVERAGE", "MIN", "MAX", "COUNT", "ROUND", "ABS", "IF", "AND", "OR", "NOT"}
+FORMULA_CELL_RE = re.compile(  # a formula cell as openpyxl writes it, without a value
+    rb'<c r="(?P<cell>[A-Z]+[0-9]+)"(?P<attributes>[^>]*)><f>(?P<formula>[^<]*)</f><v\s*(?:/>|></v>)</c>'
+)
+NEAR_ZERO = 1e-14  # relative to the numbers: what Excel and Python may compute differently
+MAX_RANGE_CELLS = 2_000_000  # cells read for ranges, about half a second: =SUM($B$2:B{row}) in 10,000 rows reads 50 M
+
+
+class Uncomputed(Exception):
+    """A formula whose value FormulaValues leaves to Excel."""
+
+
+class FormulaValues:
+    """The values of the formula cells of a written workbook, to store them with the formulas: openpyxl writes none,
+    so viewers that do not compute (Open WebUI's preview) show empty cells. Excel computes them again when it opens
+    the file (fullCalcOnLoad), LibreOffice shows them as they are; so only values that are certain are computed:
+    numbers, dates, booleans and texts with + - * / ^ %, comparisons, & and the VALUE_FUNCTIONS. Anything else (other
+    functions, text in arithmetic, numbers turned into text, nearly equal numbers) raises Uncomputed, and so does
+    every formula that uses it: these cells stay without a value."""
+
+    def __init__(self, workbook: Workbook, sheets: dict[str, str]) -> None:
+        self.workbook, self.sheets = workbook, sheets  # sheets: see sheet_lookup
+        self.values: dict[tuple[str, str], Any] = {}  # Uncomputed for a formula that is not computed
+        self.pending: set[tuple[str, str]] = set()
+        # The cells of written formulas have their rows: a function gives the same on the same sheet, in every row
+        # (=B2/SUM($B$2:$B$10000) adds up the column once).
+        self.calls: dict[tuple[str, FormulaNode], Any] = {}
+        self.sizes = {ws.title: (ws.max_row, ws.max_column) for ws in workbook.worksheets}  # openpyxl counts each time
+        self.range_cells = 0
+
+    def all(self) -> list[dict[str, Any]]:
+        """The values of the computed formula cells of each sheet, by cell ('D2'). Row by row, so a running balance
+        (=D2+B3-C3) needs no deep recursion."""
+        result = []
+        for ws in self.workbook.worksheets:
+            values = {}
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.data_type == "f":
+                        try:
+                            values[cell.coordinate] = self.cell(ws.title, cell.coordinate)
+                        except Uncomputed:
+                            pass
+            result.append(values)
+        return result
+
+    def cell(self, sheet: str, coordinate: str) -> Any:
+        """A cell's value: a float (dates and times as Excel's numbers), text, boolean, or None for an empty cell."""
+        key = (sheet, coordinate)
+        if key in self.pending:
+            raise Uncomputed  # a circular reference
+        if key not in self.values:
+            row, column = coordinate_to_tuple(coordinate)
+            rows, columns = self.sizes[sheet]
+            cell = self.workbook[sheet].cell(row, column) if row <= rows and column <= columns else None
+            value: Any = cell.value if cell is not None else None
+            self.pending.add(key)
+            try:
+                if cell is not None and cell.data_type == "f":
+                    value = self.evaluate(formula_tree(parse_formula(value, self.sheets)), sheet)
+                    value = 0.0 if value is None else value  # =B9 with B9 empty is 0
+                elif isinstance(value, date):  # times are numbers already
+                    value = float(to_excel(value))
+                elif isinstance(value, int | float) and not isinstance(value, bool):
+                    value = float(value)
+                elif value is not None and not isinstance(value, bool | str):
+                    raise Uncomputed
+                if isinstance(value, float) and not math.isfinite(value):
+                    raise Uncomputed  # 1e308 + 1e308; <v>inf</v> is no number in the file
+            except (Uncomputed, ArithmeticError, ValueError, KeyError, RecursionError):  # 10**400 has no float
+                value = Uncomputed
+            finally:
+                self.pending.discard(key)
+            self.values[key] = value
+        if self.values[key] is Uncomputed:
+            raise Uncomputed
+        return self.values[key]
+
+    def evaluate(self, node: FormulaNode, sheet: str) -> Any:
+        if node.kind == "number":
+            return float(node.text)
+        if node.kind == "string":
+            return node.text[1:-1].replace('""', '"')
+        if node.kind == "bool":
+            return node.text == "TRUE"
+        if node.kind == "cell" and node.cell is not None:
+            return self.cell(*self.address(node.cell, sheet))
+        if node.kind == "unary":
+            value = _number(self.evaluate(node.args[0], sheet))
+            return 0.0 - value if node.text == "-" else value  # not -0.0
+        if node.kind == "percent":
+            return _number(self.evaluate(node.args[0], sheet)) / 100
+        if node.kind == "binary":
+            return _operate(node.text, *(self.evaluate(arg, sheet) for arg in node.args))
+        if node.kind == "call" and node.text in VALUE_FUNCTIONS:
+            key = (sheet, _without_positions(node))
+            if key not in self.calls:
+                try:
+                    self.calls[key] = self.call(node.text, node.args, sheet)
+                except Uncomputed:
+                    self.calls[key] = Uncomputed
+            if self.calls[key] is Uncomputed:
+                raise Uncomputed
+            return self.calls[key]
+        raise Uncomputed  # other functions, a range outside of one, an argument left out
+
+    def address(self, token: FormulaToken, sheet: str) -> tuple[str, str]:
+        if token.row == "{row}":
+            raise Uncomputed
+        return token.sheet or sheet, f"{token.column}{token.row}"
+
+    def references(self, node: FormulaNode, sheet: str) -> list[Any]:
+        """The values of a cell or range; the cells of a range below or right of the sheet's data are empty."""
+        if node.kind == "cell":
+            return [self.evaluate(node, sheet)]
+        first, last = (self.address(arg.cell, sheet) for arg in node.args if arg.cell is not None)
+        size = self.sizes[first[0]]
+        (r1, c1), (r2, c2) = coordinate_to_tuple(first[1]), coordinate_to_tuple(last[1])
+        rows = range(min(r1, r2), min(max(r1, r2), size[0]) + 1)
+        columns = range(min(c1, c2), min(max(c1, c2), size[1]) + 1)
+        self.range_cells += len(rows) * len(columns)
+        if self.range_cells > MAX_RANGE_CELLS:
+            raise Uncomputed  # the rest is left to Excel
+        return [self.cell(first[0], f"{get_column_letter(c)}{r}") for r in rows for c in columns]
+
+    def call(self, name: str, args: tuple[FormulaNode, ...], sheet: str) -> Any:
+        if name in ("SUM", "AVERAGE", "MIN", "MAX", "COUNT"):
+            numbers: list[float] = []
+            for arg in args:
+                if arg.kind in ("cell", "range"):  # text and empty cells do not count
+                    values = self.references(arg, sheet)
+                    if any(isinstance(v, bool) for v in values):
+                        raise Uncomputed  # Excel skips them, LibreOffice counts them as 1 and 0
+                    numbers += [v for v in values if isinstance(v, float)]
+                elif isinstance(value := self.evaluate(arg, sheet), float):
+                    numbers.append(value)
+                else:
+                    raise Uncomputed  # TRUE and "12" written into the function count, in Excel 365 and LibreOffice
+            if name == "COUNT":
+                return float(len(numbers))
+            if name in ("MIN", "MAX"):
+                return (min if name == "MIN" else max)(numbers, default=0.0)
+            if not numbers and name == "AVERAGE":
+                raise Uncomputed  # #DIV/0!
+            total = sum(numbers, 0.0)
+            if total and abs(total) < max(map(abs, numbers)) * NEAR_ZERO:
+                raise Uncomputed  # what is left of 0.1 + 0.2 - 0.3
+            return total / len(numbers) if name == "AVERAGE" else total
+        if name in ("AND", "OR"):
+            conditions = []
+            for arg in args:
+                values = self.references(arg, sheet) if arg.kind in ("cell", "range") else [self.evaluate(arg, sheet)]
+                if arg.kind not in ("cell", "range") and not isinstance(values[0], float | bool):
+                    raise Uncomputed
+                conditions += [_condition(v) for v in values if isinstance(v, float | bool)]  # not text and empty
+            if not conditions:
+                raise Uncomputed  # #VALUE!
+            return all(conditions) if name == "AND" else any(conditions)
+        if name == "NOT":
+            return not _condition(self.evaluate(args[0], sheet))
+        if name == "IF":
+            if _condition(self.evaluate(args[0], sheet)):
+                chosen = args[1]
+            elif len(args) == 3:
+                chosen = args[2]
+            else:
+                return False
+            value = self.evaluate(chosen, sheet)
+            if value is None:
+                raise Uncomputed  # an empty cell: 0, or "" when it is joined to text
+            return value
+        number = _number(self.evaluate(args[0], sheet))
+        if name == "ABS":
+            return abs(number)
+        digits = _number(self.evaluate(args[1], sheet))  # ROUND
+        if not digits.is_integer() or abs(digits) > 15:
+            raise Uncomputed
+        # Excel and LibreOffice round the number as they show it, with 15 digits (2.675 to 2.68, not 2.67, which the
+        # float 2.67499999... would give), half away from 0
+        try:
+            shown = Decimal(f"{number:.15g}").scaleb(int(digits))
+            return float(shown.quantize(Decimal(1), ROUND_HALF_UP).scaleb(-int(digits))) + 0.0  # not -0.0
+        except ArithmeticError:  # more digits than Decimal keeps
+            raise Uncomputed from None
+
+
+def _without_positions(node: FormulaNode) -> FormulaNode:
+    """The node without the positions of its cells in the formula: the same call in another formula."""
+    return node._replace(index=-1, args=tuple(_without_positions(arg) for arg in node.args))
+
+
+def _number(value: Any) -> float:
+    """A value in arithmetic: an empty cell is 0, TRUE 1; text ('12') is read differently by each language."""
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, float):
+        return value
+    if value is None:
+        return 0.0
+    raise Uncomputed
+
+
+def _condition(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return value != 0
+    if value is None:
+        return False
+    raise Uncomputed  # text: #VALUE!
+
+
+def _text(value: Any) -> str:
+    """A value joined with &: whole numbers only, others are written with the language's decimal mark, booleans in
+    the language (WAHR)."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, float) and value.is_integer() and abs(value) < 1e15:
+        return str(int(value))
+    raise Uncomputed
+
+
+def _blank_as(other: Any) -> Any:
+    return False if isinstance(other, bool) else "" if isinstance(other, str) else 0.0
+
+
+def _operate(operator: str, a: Any, b: Any) -> Any:
+    if operator == "&":
+        text = _text(a) + _text(b)
+        if len(text) > 32_767:
+            raise Uncomputed  # #VALUE! in Excel
+        return text
+    if operator in OPERATOR_LEVELS[0]:
+        return _compare(operator, a, b)
+    x, y = _number(a), _number(b)
+    try:
+        match operator:
+            case "+":
+                result = x + y
+            case "-":
+                result = x - y
+            case "*":
+                result = x * y
+            case "/":
+                result = x / y
+            case _:  # ^
+                result = x**y if x or y else math.nan  # 0^0 is #NUM!
+    except (ArithmeticError, ValueError):
+        raise Uncomputed from None
+    if not isinstance(result, float) or not math.isfinite(result):
+        raise Uncomputed  # (-8)^(1/3) is complex in Python, #NUM! in Excel
+    if operator in "+-" and result and abs(result) < max(abs(x), abs(y)) * NEAR_ZERO:
+        raise Uncomputed  # Excel makes 0 of what is left of 0.3 - 0.1 - 0.2, but not always
+    return result
+
+
+def _compare(operator: str, a: Any, b: Any) -> bool:
+    """Excel's comparison: an empty cell is 0, "" or FALSE, whatever the other side is; numbers are less than texts;
+    texts without case, only = and <> (Excel and LibreOffice sort them differently)."""
+    a = _blank_as(b) if a is None else a
+    b = _blank_as(a) if b is None else b
+    ranks = [2 if isinstance(v, bool) else 1 if isinstance(v, str) else 0 for v in (a, b)]
+    if ranks[0] != ranks[1]:
+        if 2 in ranks:
+            raise Uncomputed  # a boolean is more than any number in Excel, 1 or 0 in LibreOffice
+        a, b = ranks
+    elif isinstance(a, str):
+        if operator not in ("=", "<>"):
+            raise Uncomputed
+        a, b = a.lower(), b.lower()
+    elif isinstance(a, float) and a != b and abs(a - b) <= max(abs(a), abs(b)) * NEAR_ZERO:
+        raise Uncomputed  # Excel takes 0.1 + 0.2 = 0.3 as TRUE
+    order = (a > b) - (a < b)
+    return {"=": order == 0, "<>": order != 0, "<": order < 0, ">": order > 0, "<=": order <= 0, ">=": order >= 0}[
+        operator
+    ]
+
+
+def store_values(data: bytes, values: list[dict[str, Any]]) -> bytes:
+    """The written workbook with the values of FormulaValues.all() next to the formulas (sheetN.xml is the Nth
+    sheet, as openpyxl writes them)."""
+    if not any(values):
+        return data
+
+    def with_value(match: re.Match[bytes], sheet: dict[str, Any]) -> bytes:
+        value = sheet.get(match["cell"].decode())
+        if value is None or b" t=" in match["attributes"]:
+            return match[0]
+        if isinstance(value, bool):
+            kind, text = ' t="b"', "1" if value else "0"
+        elif isinstance(value, str):
+            kind, text = ' t="str"', xml_escape(value)
+        else:
+            kind, text = "", str(int(value)) if value.is_integer() and abs(value) < 1e15 else repr(value)
+        parts = (match["cell"], match["attributes"], kind.encode(), match["formula"], text.encode())
+        return b'<c r="%s"%s%s><f>%s</f><v>%s</v></c>' % parts
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as package, zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as out:
+        for item in package.infolist():
+            content = package.read(item)
+            number = re.fullmatch(r"xl/worksheets/sheet([0-9]+)\.xml", item.filename)
+            if number and 0 < int(number[1]) <= len(values):
+                sheet = values[int(number[1]) - 1]
+                content = FORMULA_CELL_RE.sub(lambda match, sheet=sheet: with_value(match, sheet), content)
+            out.writestr(item, content)
+    return buffer.getvalue()
 
 
 class XlsxWriter:
@@ -4017,7 +4331,11 @@ class XlsxWriter:
             self._sheet(self.workbook.create_sheet(title=name), s)
         buffer = io.BytesIO()
         self.workbook.save(buffer)
-        return buffer.getvalue()
+        try:
+            return store_values(buffer.getvalue(), FormulaValues(self.workbook, book.lookup).all())
+        except Exception:  # the values are only for viewers that do not compute: the file works without them
+            log.exception("The values of the formulas could not be stored, the file is written without them")
+            return buffer.getvalue()
 
     def _sheet(self, ws: Worksheet, s: int) -> None:
         """Header row in the accent colour with white text, every second row lightly tinted, thin lines between the

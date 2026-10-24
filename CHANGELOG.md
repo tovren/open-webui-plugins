@@ -4,7 +4,19 @@ Each plugin has its own version (in the header of its file). Earlier changes are
 
 ## 2026-10-24
 
-Office File UI (no version). The other plugins are unchanged.
+Office Documents 0.4.1 and Office File UI (no version). The other plugins are unchanged.
+
+### Office Documents 0.4.1
+
+- Excel files store the results of their formulas, so Open WebUI's preview, which does not compute,
+  shows them instead of empty cells (differences, totals, `IF` texts). Until now openpyxl wrote the
+  formulas only. Values are stored for arithmetic, comparisons, `&` and SUM, AVERAGE, MIN, MAX, COUNT,
+  ROUND, ABS, IF, AND, OR and NOT. LibreOffice shows stored values without computing them again, so only
+  results that are certain are stored: other functions and the formulas that use them, errors such as
+  division by 0, leftovers such as 0.3 − 0.1 − 0.2, booleans in ranges (LibreOffice counts them as 1 and
+  0, Excel skips them) and decimal numbers joined to text stay empty in the preview, as before. Excel
+  computes all formulas when it opens the file. `ROUND` rounds the number as Excel shows it, with 15
+  digits (`ROUND(655.595; 2)` is 655.60).
 
 ### Office File UI
 

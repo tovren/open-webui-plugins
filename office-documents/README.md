@@ -270,10 +270,13 @@ With the `word_template` valve, Word documents are built on a company file, e.g.
 ## Notes and limitations
 
 - **Previews in Open WebUI** use browser libraries that know only part of the formats. Word files are
-  written so that the preview shows their fonts, colours and bullets, too. The Excel preview shows formula
-  cells empty (formulas have no stored results; Excel and LibreOffice calculate them when the file is
-  opened) and dates as numbers, and the slide preview leaves out some formatting such as bullets and the
-  alignment of titles. In Excel, PowerPoint and LibreOffice the files look as intended.
+  written so that the preview shows their fonts, colours and bullets, too. The Excel preview does not
+  compute formulas: it shows the results the tool stores with them, for arithmetic, comparisons, `&` and
+  SUM, AVERAGE, MIN, MAX, COUNT, ROUND, ABS, IF, AND, OR and NOT. Other formulas, and those whose result
+  is not certain (errors such as division by 0, booleans in ranges, decimal numbers joined to text), stay
+  empty there; Excel calculates all formulas when the file is opened, LibreOffice those without a stored
+  result. The preview shows numbers without their format and dates as numbers, and the slide preview
+  leaves out some formatting such as bullets and the alignment of titles. In Excel, PowerPoint and LibreOffice the files look as intended.
 - **Table of contents:** Word fills it in when the document is opened and asks first whether to
   update the fields. LibreOffice needs **Tools → Update → Update All**.
 - **Design:** one calm, modern look for all three formats, in shades of the `accent_color` valve and in the
