@@ -2,6 +2,15 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
+## 2026-10-24
+
+Office File UI (no version). The other plugins are unchanged.
+
+### Office File UI
+
+- A Word, Excel or PowerPoint file opened from an answer no longer shows the "Content" tab (the
+  extracted text, e.g. raw Excel formulas) for a moment before it switches to "Preview".
+
 ## 2026-10-23, second update
 
 Company Context 1.2.0. The other plugins are unchanged.

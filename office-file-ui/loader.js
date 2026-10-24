@@ -433,7 +433,13 @@
 		style.setAttribute(MARK, 'style');
 		style.textContent = STYLE;
 		document.head.appendChild(style);
-		new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true });
+		// While a file view opened from an answer is (about to be) open, it is handled at once: the observer runs
+		// before the browser draws the change, so the view shows "Preview" as soon as its tabs appear (after the
+		// file has loaded) without showing "Content" for a moment first.
+		new MutationObserver(() => {
+			if (openedFromAnswer || document.querySelector(`.modal[${MARK}="answer-file"]`)) adjustFileView();
+			schedule();
+		}).observe(document.body, { childList: true, subtree: true });
 		schedule();
 	};
 
