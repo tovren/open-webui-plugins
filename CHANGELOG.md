@@ -10,6 +10,13 @@ Office File UI (no version). The other plugins are unchanged.
 
 - A Word, Excel or PowerPoint file opened from an answer no longer shows the "Content" tab (the
   extracted text, e.g. raw Excel formulas) for a moment before it switches to "Preview".
+- The chip of a file that was deleted on the server since (by an admin, a cleanup job or retention rules)
+  is greyed out and has no download icon. Pointing at it or clicking it shows "File was deleted" in a
+  small bubble like Open WebUI's tooltips; the click no longer opens an empty file view. The script
+  checks each file of a shown answer once per page load (`/api/v1/files/<id>/process/status`, a small
+  answer), and a download that gets a 404 greys out the chip as well.
+- A failed download shows "Download failed" in the same bubble for a few seconds instead of only
+  turning the icon red.
 
 ## 2026-10-23, second update
 

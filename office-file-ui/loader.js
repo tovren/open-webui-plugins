@@ -4,7 +4,8 @@
 // (e.g. by the Office Documents tool) this script
 // - shows them below the text of the answer instead of above it,
 // - fits each file chip to its name, colours its icon by type (Word, Excel, PowerPoint) and adds a
-//   download icon to it: the icon downloads the file, the rest of the chip opens the preview, and
+//   download icon to it: the icon downloads the file, the rest of the chip opens the preview,
+// - greys out the chip of a file that was deleted on the server since, and
 // - opens Word, Excel and PowerPoint files straight in the "Preview" tab of the file view and hides
 //   the "Content" tab (the extracted text).
 // Files the user uploads and file views elsewhere (workspace, knowledge, chat controls) stay as they are.
@@ -23,6 +24,8 @@
 	const GERMAN = (localStorage.locale || navigator.language || '').toLowerCase().startsWith('de');
 	const LABEL = GERMAN ? 'Herunterladen' : 'Download';
 	const FAILED = GERMAN ? 'Herunterladen fehlgeschlagen' : 'Download failed';
+	const GONE = GERMAN ? 'Datei wurde gelöscht' : 'File was deleted';
+	const BUBBLE_MS = 3000;
 	const downloadIcon = (size) =>
 		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="${size}" aria-hidden="true">` +
 		'<path d="M10.75 2.75a.75.75 0 0 0-1.5 0v8.614L6.295 8.235a.75.75 0 1 0-1.09 1.03l4.25 4.5a.75.75 0 0 0 1.09 0l4.25-4.5a.75.75 0 0 0-1.09-1.03l-2.955 3.129V2.75Z"/>' +
@@ -54,6 +57,16 @@
 		[${MARK}="download"][data-failed] { color: #dc2626 !important; }
 		@keyframes office-file-ui-pulse { to { opacity: 0.3; } }
 		@media (pointer: coarse) { span[${MARK}="download"] { padding: 0.375rem; } }
+		button[${MARK}-gone] { cursor: default; }
+		html:not(.dark) button[${MARK}-gone]:hover { background-color: var(--color-gray-50, #f9f9f9); }
+		.dark button[${MARK}-gone]:hover { background-color: var(--color-gray-850, #262626); }
+		button[${MARK}-gone] > * { opacity: 0.45; }
+		[${MARK}="bubble"] {
+			position: fixed; z-index: 10000; transform: translate(-50%, -100%); pointer-events: none;
+			padding: 0.3125rem 0.5625rem; border-radius: 0.5rem; border: 1px solid #171717;
+			background: #0d0d0d; color: #fff; font-size: 0.75rem; line-height: 1.4; white-space: nowrap;
+			box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+		}
 		html.dark .office-preview { background: transparent; }
 		html.dark .office-preview table th.excel-col-hdr,
 		html.dark .office-preview .excel-row-num { background: var(--color-gray-850, #262626); }
@@ -108,38 +121,86 @@
 	const messageFiles = (messageId) =>
 		(chatCache.messages[messageId]?.files ?? []).filter((file) => file?.id && file.type === 'file');
 
+	// A file can be deleted on the server later (by an admin, a cleanup job or retention rules) while the chat
+	// still shows its chip. Each file of a shown answer is checked once per page: the processing status is a
+	// tiny answer, and a 404 means the file is gone (or not readable for this user, which looks the same).
+	const fileStates = new Map(); // file id → 'checking' | 'ok' | 'gone'
+	const checkFile = async (fileId) => {
+		if (fileStates.has(fileId)) return;
+		fileStates.set(fileId, 'checking');
+		try {
+			const response = await fetch(`/api/v1/files/${encodeURIComponent(fileId)}/process/status`, {
+				headers: authHeaders()
+			});
+			fileStates.set(fileId, response.status === 404 ? 'gone' : 'ok'); // other errors: let the download tell
+		} catch {
+			fileStates.set(fileId, 'ok');
+		}
+		if (fileStates.get(fileId) === 'gone') schedule();
+	};
+
 	// --------------------------------------------------------------------------- download --
+
+	// One small dark bubble above an element, like Open WebUI's tooltips: for a few seconds after a click, or
+	// while the pointer is on the chip of a deleted file. It does not follow the page, so scrolling hides it.
+	let bubble = null;
+	const hideBubble = () => {
+		if (bubble) bubble.hidden = true;
+	};
+	const showBubble = (anchor, text, duration) => {
+		if (!bubble) {
+			bubble = document.createElement('div');
+			bubble.setAttribute(MARK, 'bubble');
+			bubble.setAttribute('role', 'status');
+			document.body.append(bubble);
+			document.addEventListener('scroll', hideBubble, true);
+		}
+		const box = anchor.getBoundingClientRect();
+		bubble.textContent = text;
+		bubble.style.left = `${box.left + box.width / 2}px`;
+		bubble.style.top = `${box.top - 6}px`;
+		bubble.hidden = false;
+		clearTimeout(bubble.timer);
+		if (duration) bubble.timer = setTimeout(hideBubble, duration);
+	};
 
 	const download = async (control) => {
 		const { fileId, fileName } = control.dataset;
 		if (!fileId || control.dataset.busy) return;
 		control.dataset.busy = '1';
-		delete control.dataset.failed;
-		control.title = LABEL;
+		let error = null;
 		try {
 			const response = await fetch(`/api/v1/files/${encodeURIComponent(fileId)}/content?attachment=true`, {
 				headers: authHeaders()
 			});
-			if (!response.ok) throw new Error(`HTTP ${response.status}`);
-			const url = URL.createObjectURL(await response.blob());
-			const link = document.createElement('a');
-			link.href = url;
-			link.download = fileName;
-			document.body.appendChild(link);
-			link.click();
-			link.remove();
-			setTimeout(() => URL.revokeObjectURL(url), 10000);
-		} catch (error) {
-			console.warn('office-file-ui: download failed', error);
-			control.dataset.failed = '1';
-			control.title = FAILED;
-			setTimeout(() => {
-				delete control.dataset.failed;
-				control.title = LABEL;
-			}, 4000);
+			if (response.status === 404) {
+				fileStates.set(fileId, 'gone'); // the chip is greyed out from now on (decorateAnswerFiles)
+				schedule();
+				error = GONE;
+			} else if (!response.ok) {
+				console.warn(`office-file-ui: download failed (HTTP ${response.status})`);
+				error = FAILED;
+			} else {
+				const url = URL.createObjectURL(await response.blob());
+				const link = document.createElement('a');
+				link.href = url;
+				link.download = fileName;
+				document.body.appendChild(link);
+				link.click();
+				link.remove();
+				setTimeout(() => URL.revokeObjectURL(url), 10000);
+			}
+		} catch (failure) {
+			console.warn('office-file-ui: download failed', failure);
+			error = FAILED;
 		} finally {
 			delete control.dataset.busy;
 		}
+		if (!error) return;
+		// in a chip the bubble points at the whole chip: the icon is gone once the chip is greyed out
+		showBubble(control.closest(CHIP) ?? control, error, BUBBLE_MS);
+		control.dataset.failed = '1';
+		setTimeout(() => delete control.dataset.failed, BUBBLE_MS);
 	};
 
 	const downloadControl = (tag) => {
@@ -189,6 +250,22 @@
 		if (type && chip.getAttribute(`${MARK}-type`) !== type) chip.setAttribute(`${MARK}-type`, type);
 	};
 
+	// A chip whose file was deleted on the server is greyed out, without the download icon. Pointing at it or
+	// clicking it shows the bubble; the click does not open the file view, which would stay empty.
+	const markGone = (chip, gone) => {
+		chip.toggleAttribute(`${MARK}-gone`, gone);
+		if (gone) chip.setAttribute('aria-disabled', 'true');
+		else chip.removeAttribute('aria-disabled');
+	};
+	document.addEventListener('mouseover', (event) => {
+		const chip = event.target.closest?.(`button[${MARK}-gone]`);
+		if (chip && !chip.contains(event.relatedTarget)) showBubble(chip, GONE);
+	});
+	document.addEventListener('mouseout', (event) => {
+		const chip = event.target.closest?.(`button[${MARK}-gone]`);
+		if (chip && !chip.contains(event.relatedTarget)) hideBubble();
+	});
+
 	const decorateAnswerFiles = () => {
 		const chatId = currentChatId();
 		if (chatId && chatCache.id !== chatId) {
@@ -214,13 +291,20 @@
 					icon?.remove();
 					continue;
 				}
+				if (chip.dataset.officeFileId !== file.id) chip.dataset.officeFileId = file.id;
+				const gone = fileStates.get(file.id) === 'gone';
+				if (gone !== chip.hasAttribute(`${MARK}-gone`)) markGone(chip, gone);
+				if (gone) {
+					icon?.remove();
+					continue;
+				}
+				checkFile(file.id);
 				if (!icon) {
 					icon = chipDownloadIcon();
 					chip.append(icon);
 				}
 				if (icon.dataset.fileId !== file.id) icon.dataset.fileId = file.id;
 				if (icon.dataset.fileName !== (file.name ?? name)) icon.dataset.fileName = file.name ?? name;
-				if (chip.dataset.officeFileId !== file.id) chip.dataset.officeFileId = file.id;
 			}
 		}
 		// A chip without a known file: the chat was probably saved after the last load, so load it again, a few
@@ -280,6 +364,12 @@
 			if (event.target.closest?.(`[${MARK}="download"]`)) return;
 			const chip = event.target.closest?.(CHIP);
 			if (!chip) return;
+			if (chip.hasAttribute(`${MARK}-gone`)) {
+				event.preventDefault();
+				event.stopPropagation();
+				showBubble(chip, GONE, BUBBLE_MS);
+				return;
+			}
 			openedFromAnswer = chip.closest('.chat-assistant')
 				? { name: chipName(chip), fileId: chip.dataset.officeFileId ?? '' }
 				: null;
