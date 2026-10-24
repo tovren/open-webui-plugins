@@ -24,8 +24,8 @@
 	const GERMAN = (localStorage.locale || navigator.language || '').toLowerCase().startsWith('de');
 	const LABEL = GERMAN ? 'Herunterladen' : 'Download';
 	const FAILED = GERMAN ? 'Herunterladen fehlgeschlagen' : 'Download failed';
-	const GONE = GERMAN ? 'Datei wurde gelöscht' : 'File was deleted';
-	const BUBBLE_MS = 3000;
+	const GONE = GERMAN ? 'Nicht mehr verfügbar' : 'No longer available';
+	const NOTE_MS = 3000; // how long a note in the tooltip stays after a click
 	const downloadIcon = (size) =>
 		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="${size}" aria-hidden="true">` +
 		'<path d="M10.75 2.75a.75.75 0 0 0-1.5 0v8.614L6.295 8.235a.75.75 0 1 0-1.09 1.03l4.25 4.5a.75.75 0 0 0 1.09 0l4.25-4.5a.75.75 0 0 0-1.09-1.03l-2.955 3.129V2.75Z"/>' +
@@ -61,12 +61,6 @@
 		html:not(.dark) button[${MARK}-gone]:hover { background-color: var(--color-gray-50, #f9f9f9); }
 		.dark button[${MARK}-gone]:hover { background-color: var(--color-gray-850, #262626); }
 		button[${MARK}-gone] > * { opacity: 0.45; }
-		[${MARK}="bubble"] {
-			position: fixed; z-index: 10000; transform: translate(-50%, -100%); pointer-events: none;
-			padding: 0.3125rem 0.5625rem; border-radius: 0.5rem; border: 1px solid #171717;
-			background: #0d0d0d; color: #fff; font-size: 0.75rem; line-height: 1.4; white-space: nowrap;
-			box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
-		}
 		html.dark .office-preview { background: transparent; }
 		html.dark .office-preview table th.excel-col-hdr,
 		html.dark .office-preview .excel-row-num { background: var(--color-gray-850, #262626); }
@@ -123,7 +117,14 @@
 
 	// A file can be deleted on the server later (by an admin, a cleanup job or retention rules) while the chat
 	// still shows its chip. Each file of a shown answer is checked once per page: the processing status is a
-	// tiny answer, and a 404 means the file is gone (or not readable for this user, which looks the same).
+	// tiny answer. Open WebUI answers a deleted file and one this user may not read with the same 404, so the
+	// chip says "no longer available". A 404 counts only with Open WebUI's own message: a route that does not
+	// exist (FastAPI's "Not Found") or a proxy's error page must not lock every chip.
+	const isGone = async (response) => {
+		if (response.status !== 404) return false;
+		const detail = await response.json().then((body) => body?.detail, () => null);
+		return typeof detail === 'string' && detail !== 'Not Found';
+	};
 	const fileStates = new Map(); // file id → 'checking' | 'ok' | 'gone'
 	const checkFile = async (fileId) => {
 		if (fileStates.has(fileId)) return;
@@ -132,7 +133,7 @@
 			const response = await fetch(`/api/v1/files/${encodeURIComponent(fileId)}/process/status`, {
 				headers: authHeaders()
 			});
-			fileStates.set(fileId, response.status === 404 ? 'gone' : 'ok'); // other errors: let the download tell
+			fileStates.set(fileId, (await isGone(response)) ? 'gone' : 'ok'); // other errors: let the download tell
 		} catch {
 			fileStates.set(fileId, 'ok');
 		}
@@ -141,41 +142,25 @@
 
 	// --------------------------------------------------------------------------- download --
 
-	// One small dark bubble above an element, like Open WebUI's tooltips: for a few seconds after a click, or
-	// while the pointer is on the chip of a deleted file. It does not follow the page, so scrolling hides it.
-	let bubble = null;
-	const hideBubble = () => {
-		if (bubble) bubble.hidden = true;
-	};
-	const showBubble = (anchor, text, duration) => {
-		if (!bubble) {
-			bubble = document.createElement('div');
-			bubble.setAttribute(MARK, 'bubble');
-			bubble.setAttribute('role', 'status');
-			document.body.append(bubble);
-			document.addEventListener('scroll', hideBubble, true);
-		}
-		const box = anchor.getBoundingClientRect();
-		bubble.textContent = text;
-		bubble.style.left = `${box.left + box.width / 2}px`;
-		bubble.style.top = `${box.top - 6}px`;
-		bubble.hidden = false;
-		clearTimeout(bubble.timer);
-		if (duration) bubble.timer = setTimeout(hideBubble, duration);
-	};
-
 	const download = async (control) => {
 		const { fileId, fileName } = control.dataset;
 		if (!fileId || control.dataset.busy) return;
 		control.dataset.busy = '1';
+		clearTimeout(control.failedTimer); // a new try: no longer red from the last one
+		delete control.dataset.failed;
 		let error = null;
 		try {
 			const response = await fetch(`/api/v1/files/${encodeURIComponent(fileId)}/content?attachment=true`, {
 				headers: authHeaders()
 			});
-			if (response.status === 404) {
-				fileStates.set(fileId, 'gone'); // the chip is greyed out from now on (decorateAnswerFiles)
-				schedule();
+			if (await isGone(response)) {
+				fileStates.set(fileId, 'gone');
+				const chip = control.closest(CHIP);
+				if (chip) {
+					markGone(chip, true); // greyed out from now on, and its tooltip says why
+					showNote(chip, GONE);
+					return;
+				}
 				error = GONE;
 			} else if (!response.ok) {
 				console.warn(`office-file-ui: download failed (HTTP ${response.status})`);
@@ -197,10 +182,14 @@
 			delete control.dataset.busy;
 		}
 		if (!error) return;
-		// in a chip the bubble points at the whole chip: the icon is gone once the chip is greyed out
-		showBubble(control.closest(CHIP) ?? control, error, BUBBLE_MS);
+		// the chip's tooltip says it; the download button of the file view has none, so its title does
+		const chip = control.closest(CHIP);
+		if (!(chip && showNote(chip, error))) control.title = error;
 		control.dataset.failed = '1';
-		setTimeout(() => delete control.dataset.failed, BUBBLE_MS);
+		control.failedTimer = setTimeout(() => {
+			delete control.dataset.failed;
+			control.title = LABEL;
+		}, NOTE_MS);
 	};
 
 	const downloadControl = (tag) => {
@@ -250,21 +239,64 @@
 		if (type && chip.getAttribute(`${MARK}-type`) !== type) chip.setAttribute(`${MARK}-type`, type);
 	};
 
-	// A chip whose file was deleted on the server is greyed out, without the download icon. Pointing at it or
-	// clicking it shows the bubble; the click does not open the file view, which would stay empty.
+	// Open WebUI's tooltip of the chip (a tippy instance on the box around the name) shows the file name. The
+	// script uses it for its notes too, as a second line below the name: one tooltip, in Open WebUI's style and
+	// place, rather than a second one on top of it.
+	const chipTooltip = (chip) => {
+		for (let el = chip.querySelector('.truncate'); el && el !== chip; el = el.parentElement) if (el._tippy) return el._tippy;
+		return null;
+	};
+	const withNote = (name, note) => {
+		const content = document.createElement('div');
+		content.setAttribute(MARK, 'tooltip');
+		content.append(name, document.createElement('br'), note);
+		return content;
+	};
+	// The content it should have when no note is shown: the name, and for a file that is no longer available
+	// that below it. Without the tooltip (Open WebUI changed its markup) the chip's title says it.
+	const syncTooltip = (chip) => {
+		const gone = chip.hasAttribute(`${MARK}-gone`);
+		const tooltip = chipTooltip(chip);
+		if (!tooltip) {
+			if (gone) chip.title = GONE;
+			else chip.removeAttribute('title');
+			return;
+		}
+		if (chip.noteTimer) return;
+		const content = tooltip.props.content;
+		const wanted = gone ? GONE : null;
+		const current = content?.getAttribute?.(MARK) === 'tooltip' ? content.lastChild?.textContent : null;
+		if (current !== wanted) tooltip.setContent(gone ? withNote(chipName(chip), GONE) : chipName(chip));
+	};
+	// Shows the tooltip with a note for NOTE_MS. After a click on the download icon, outside the name, Open WebUI
+	// would hide it only when the pointer leaves the name; while the pointer is on the name it stays.
+	const showNote = (chip, note) => {
+		const tooltip = chipTooltip(chip);
+		if (!tooltip) return false;
+		clearTimeout(chip.noteTimer);
+		tooltip.setContent(withNote(chipName(chip), note));
+		tooltip.show();
+		const end = () => {
+			if (tooltip.reference.matches(':hover')) return (chip.noteTimer = setTimeout(end, 500));
+			tooltip.hide();
+			chip.noteTimer = setTimeout(() => {
+				chip.noteTimer = null;
+				syncTooltip(chip);
+			}, 300); // after it has faded out
+		};
+		chip.noteTimer = setTimeout(end, NOTE_MS);
+		return true;
+	};
+
+	// A chip whose file is no longer available is greyed out, without the download icon, and its tooltip says
+	// so. A click shows the tooltip as well and does not open the file view, which would stay empty.
 	const markGone = (chip, gone) => {
 		chip.toggleAttribute(`${MARK}-gone`, gone);
 		if (gone) chip.setAttribute('aria-disabled', 'true');
 		else chip.removeAttribute('aria-disabled');
+		chip.querySelector(`[${MARK}="download"]`)?.remove();
+		syncTooltip(chip);
 	};
-	document.addEventListener('mouseover', (event) => {
-		const chip = event.target.closest?.(`button[${MARK}-gone]`);
-		if (chip && !chip.contains(event.relatedTarget)) showBubble(chip, GONE);
-	});
-	document.addEventListener('mouseout', (event) => {
-		const chip = event.target.closest?.(`button[${MARK}-gone]`);
-		if (chip && !chip.contains(event.relatedTarget)) hideBubble();
-	});
 
 	const decorateAnswerFiles = () => {
 		const chatId = currentChatId();
@@ -294,10 +326,8 @@
 				if (chip.dataset.officeFileId !== file.id) chip.dataset.officeFileId = file.id;
 				const gone = fileStates.get(file.id) === 'gone';
 				if (gone !== chip.hasAttribute(`${MARK}-gone`)) markGone(chip, gone);
-				if (gone) {
-					icon?.remove();
-					continue;
-				}
+				else if (gone) syncTooltip(chip); // Open WebUI may have set its own content again
+				if (gone) continue;
 				checkFile(file.id);
 				if (!icon) {
 					icon = chipDownloadIcon();
@@ -367,7 +397,7 @@
 			if (chip.hasAttribute(`${MARK}-gone`)) {
 				event.preventDefault();
 				event.stopPropagation();
-				showBubble(chip, GONE, BUBBLE_MS);
+				showNote(chip, GONE);
 				return;
 			}
 			openedFromAnswer = chip.closest('.chat-assistant')

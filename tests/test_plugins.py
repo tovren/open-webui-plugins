@@ -1411,8 +1411,50 @@ def test_loader_reloads_the_chat_only_a_few_times() -> None:
     assert report["scans"] <= 120 / 0.15 + 5  # page changes every 100 ms, handled at most every 150 ms
     report = run_loader("found-file")
     assert report["fetches"] == 1 and report["icon"] == "f1"
+    assert report["checks"] == 1  # the file is checked once, not with every scan
     report = run_loader("flaky-server")  # failed requests do not use up the three tries
     assert report["fetches"] == 4 and report["icon"] == "f1"
+
+
+@node
+@pytest.mark.parametrize(
+    ("scenario", "gone"),
+    [
+        ("gone-file", True),  # Open WebUI's own 404: deleted, or not readable for this user
+        ("missing-route", False),  # FastAPI's "Not Found": the route does not exist (other version, proxy)
+        ("proxy-404", False),  # an error page that is not JSON
+    ],
+)
+def test_loader_greys_out_deleted_files(scenario: str, gone: bool) -> None:
+    report = run_loader(scenario)
+    assert (report["gone"], report["icon"]) == ((True, None) if gone else (False, "f1"))
+    assert report["title"] == ("No longer available" if gone else None)  # no Open WebUI tooltip in the stub
+
+
+@node
+def test_loader_uses_open_webuis_tooltip_for_unavailable_files() -> None:
+    """One tooltip, not Open WebUI's name tooltip with a bubble of the script on top of it."""
+    report = run_loader("gone-file-tooltip")
+    assert report["gone"] and report["tooltip"] == "report.docxNo longer available"  # name, line break, reason
+    assert report["tooltipAfterReset"] == report["tooltip"]  # set again when Open WebUI resets it
+    assert report["shown"] == 1  # a click shows it
+    assert not report["visibleLater"] and report["tooltipLater"] == report["tooltip"]  # hidden, still says why
+
+
+@node
+def test_loader_shows_a_failed_download_in_open_webuis_tooltip() -> None:
+    report = run_loader("download-failed-tooltip")
+    assert report["visible"] and report["tooltip"] == "report.docxDownload failed"
+    assert report["title"] == "Download"  # not a second (native) tooltip with the same message
+    assert not report["visibleLater"] and report["tooltipLater"] == "report.docx"
+
+
+@node
+def test_loader_failed_download_stays_red_for_the_full_time() -> None:
+    report = run_loader("download-retry")
+    assert report["downloads"] == 2
+    assert not report["redWhileRetrying"] and report["redAfterSecondFailure"] and not report["redLater"]
+    assert report["title"] == "Download failed"
 
 
 @node

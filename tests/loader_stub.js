@@ -1,6 +1,8 @@
 // Minimal DOM and virtual clock for running office-file-ui/loader.js in Node.
 // Usage: node loader_stub.js <scenario>   -> prints a JSON report of what the script did.
-// Scenarios: missing-file, found-file, tabs, tabs-no-switch, tabs-reordered
+// Scenarios: missing-file, found-file, flaky-server, gone-file, gone-file-tooltip, missing-route, proxy-404,
+// download-retry, download-failed-tooltip,
+// tabs, tabs-no-switch, tabs-reordered
 
 const fs = require('fs');
 const path = require('path');
@@ -38,7 +40,7 @@ async function advance(ms) {
 }
 
 // --------------------------------------------------------------------------------------- DOM --
-const report = { fetches: 0, scans: 0, clicks: 0 };
+const report = { fetches: 0, checks: 0, downloads: 0, scans: 0, clicks: 0 }; // fetches: chat loads
 
 function parseCompound(text) {
   const tag = text.match(/^[a-z]+/i)?.[0];
@@ -111,6 +113,15 @@ class Element {
   get nextSibling() {
     return null;
   }
+  get title() {
+    return this.getAttribute('title') ?? '';
+  }
+  set title(value) {
+    this.setAttribute('title', value);
+  }
+  get lastChild() {
+    return this.childList[this.childList.length - 1] ?? null;
+  }
   getAttribute(name) {
     if (name === 'class') return [...this.classes].join(' ');
     return this.attrs.has(name) ? this.attrs.get(name) : null;
@@ -120,6 +131,23 @@ class Element {
   }
   hasAttribute(name) {
     return this.attrs.has(name);
+  }
+  removeAttribute(name) {
+    this.attrs.delete(name);
+  }
+  toggleAttribute(name, force) {
+    if (force) this.setAttribute(name, '');
+    else this.removeAttribute(name);
+  }
+  contains(other) {
+    for (let node = other; node; node = node.parentElement) if (node === this) return true;
+    return false;
+  }
+  get isConnected() {
+    return html.contains(this);
+  }
+  getBoundingClientRect() {
+    return { left: 0, top: 0, width: 100, height: 32 };
   }
   set type(value) {
     this.setAttribute('type', value);
@@ -131,7 +159,7 @@ class Element {
     return child;
   }
   append(...children) {
-    children.forEach((c) => this.appendChild(c));
+    children.forEach((c) => this.appendChild(typeof c === 'string' ? new Element('#text', { text: c }) : c));
   }
   prepend(child) {
     child.remove();
@@ -155,6 +183,7 @@ class Element {
     return this.querySelectorAll(selector)[0] ?? null;
   }
   matches(selector) {
+    if (selector === ':hover') return false;
     return matches(this, selector);
   }
   closest(selector) {
@@ -199,21 +228,50 @@ globalThis.MutationObserver = class {
   observe() {}
 };
 let chatFiles = [];
-let failingFetches = 0; // the first requests fail (network blip, 5xx)
+let failingFetches = 0; // the first chat loads fail (network blip, 5xx)
+let fileStatus = { status: 200, body: { status: 'completed' } }; // answer of /api/v1/files/<id>/process/status
+let downloadStatus = 500;
+const respond = (status, body) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  json: async () => (body === undefined ? Promise.reject(new SyntaxError('not JSON')) : body),
+});
 globalThis.fetch = async (url) => {
+  if (url.includes('/process/status')) {
+    report.checks += 1;
+    return respond(fileStatus.status, fileStatus.body);
+  }
+  if (url.includes('/content')) {
+    report.downloads += 1;
+    return respond(downloadStatus, {});
+  }
   report.fetches += 1;
-  if (report.fetches <= failingFetches) return { ok: false, json: async () => ({}) };
-  return { ok: true, json: async () => ({ chat: { history: { messages: { m1: { files: chatFiles } } } } }) };
+  if (report.fetches <= failingFetches) return respond(500, {});
+  return respond(200, { chat: { history: { messages: { m1: { files: chatFiles } } } } });
 };
 const mutate = () => observer && observer([]);
 
 // ---------------------------------------------------------------------------------- scenarios --
-const chip = el(
-  'button',
-  { cls: 'h-8 rounded-xl', attrs: { type: 'button' } },
-  el('div', { cls: 'icon' }),
-  el('div', { cls: 'justify-between' }, el('div', { cls: 'truncate', text: 'report.docx' }))
-);
+const nameBox = el('div', { cls: 'justify-between' }, el('div', { cls: 'truncate', text: 'report.docx' }));
+const chip = el('button', { cls: 'h-8 rounded-xl', attrs: { type: 'button' } }, el('div', { cls: 'icon' }), nameBox);
+// Open WebUI's tooltip on the name (tippy); left out to test the fallback bubble
+const tooltip = {
+  reference: nameBox,
+  props: { content: 'report.docx' },
+  shown: 0,
+  visible: false,
+  setContent(content) {
+    this.props.content = content;
+  },
+  show() {
+    this.shown += 1;
+    this.visible = true;
+  },
+  hide() {
+    this.visible = false;
+  },
+};
+const tooltipText = () => tooltip.props.content.textContent ?? tooltip.props.content;
 body.appendChild(
   el('div', { attrs: { id: 'message-m1' } }, el('div', { cls: 'chat-assistant' }, el('div', {}, el('div', { cls: 'flex-wrap' }, el('div', {}, chip)))))
 );
@@ -235,7 +293,77 @@ function tabBar(selected, onClick) {
 
 async function main(scenario) {
   vm.runInThisContext(fs.readFileSync(path.join(__dirname, '..', 'office-file-ui', 'loader.js'), 'utf8'));
-  if (scenario === 'missing-file' || scenario === 'found-file' || scenario === 'flaky-server') {
+  if (scenario === 'gone-file-tooltip') {
+    // with Open WebUI's tooltip: it gets a second line, a click shows it, and no bubble of our own appears
+    nameBox._tippy = tooltip;
+    fileStatus = { status: 404, body: { detail: "We could not find what you're looking for :/" } };
+    chatFiles = [{ id: 'f1', name: 'report.docx', type: 'file' }];
+    mutate();
+    await advance(5000);
+    report.gone = chip.hasAttribute('data-office-file-ui-gone');
+    report.tooltip = tooltip.props.content.textContent;
+    tooltip.props.content = 'report.docx'; // Open WebUI sets its own content again
+    mutate();
+    await advance(1000);
+    report.tooltipAfterReset = tooltip.props.content.textContent ?? tooltip.props.content;
+    for (const fn of documentListeners.click ?? []) fn({ target: chip, preventDefault() {}, stopPropagation() {} });
+    report.shown = tooltip.shown;
+    await advance(4000);
+    report.visibleLater = tooltip.visible;
+    report.tooltipLater = tooltipText(); // still says why after the click's note has ended
+  } else if (scenario === 'download-failed-tooltip') {
+    // a failed download: the tooltip shows the name and below it the error, then the name alone again
+    nameBox._tippy = tooltip;
+    chatFiles = [{ id: 'f1', name: 'report.docx', type: 'file' }];
+    mutate();
+    await advance(1000);
+    const icon = chip.querySelector('[data-office-file-ui="download"]');
+    icon.click();
+    await advance(10);
+    report.tooltip = tooltipText();
+    report.visible = tooltip.visible;
+    report.title = icon.title;
+    await advance(4000);
+    report.tooltipLater = tooltipText();
+    report.visibleLater = tooltip.visible;
+  } else if (['gone-file', 'missing-route', 'proxy-404'].includes(scenario)) {
+    // Open WebUI's own 404 (file deleted or not readable) greys the chip out; a route that does not exist
+    // (FastAPI's "Not Found") or a proxy's HTML error page does not
+    fileStatus = {
+      'gone-file': { status: 404, body: { detail: "We could not find what you're looking for :/" } },
+      'missing-route': { status: 404, body: { detail: 'Not Found' } },
+      'proxy-404': { status: 404, body: undefined },
+    }[scenario];
+    chatFiles = [{ id: 'f1', name: 'report.docx', type: 'file' }];
+    mutate();
+    await advance(5000);
+    report.gone = chip.hasAttribute('data-office-file-ui-gone');
+    report.icon = chip.querySelector('[data-office-file-ui="download"]')?.dataset.fileId ?? null;
+    report.title = chip.getAttribute('title'); // without Open WebUI's tooltip the title says it
+  } else if (scenario === 'download-retry') {
+    // two failed downloads 2 s apart: the icon is not red while the second one runs, and stays red for the
+    // full time after it (the timer of the first failure must not end it early)
+    chatFiles = [{ id: 'f1', name: 'report.docx', type: 'file' }];
+    mutate();
+    await advance(1000);
+    const icon = chip.querySelector('[data-office-file-ui="download"]');
+    icon.click();
+    await advance(2000);
+    let release;
+    const slow = new Promise((resolve) => (release = resolve));
+    const fetchBefore = globalThis.fetch;
+    globalThis.fetch = async (url) => (await slow, fetchBefore(url));
+    icon.click();
+    await advance(10);
+    report.redWhileRetrying = 'failed' in icon.dataset;
+    release();
+    globalThis.fetch = fetchBefore;
+    await advance(1500); // 3.5 s after the first failure
+    report.redAfterSecondFailure = 'failed' in icon.dataset;
+    report.title = icon.title; // without Open WebUI's tooltip the icon's title says it
+    await advance(2000);
+    report.redLater = 'failed' in icon.dataset;
+  } else if (scenario === 'missing-file' || scenario === 'found-file' || scenario === 'flaky-server') {
     if (scenario === 'flaky-server') failingFetches = 3;
     if (scenario !== 'missing-file') chatFiles = [{ id: 'f1', name: 'report.docx', type: 'file' }];
     for (let t = 0; t < 120000; t += 100) {
