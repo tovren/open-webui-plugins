@@ -2,7 +2,7 @@
 title: Response Export
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.3.0
+version: 1.3.1
 license: MIT
 required_open_webui_version: 0.11.4
 description: Adds four buttons below every assistant message - export as Word (.docx), export its tables as Excel (.xlsx), download as PDF, and open as an e-mail draft. Files are built in memory and handed straight to the browser; nothing is stored on the server.
@@ -198,11 +198,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
 }
 
 
+# Open WebUI shows action icons as <img>, where currentColor is black, and inverts SVG icons by 80% in
+# dark mode. This grey ends up close to its own buttons in both modes (gray-600 light, gray-500 dark),
+# and the stroke matches their 1.5 in a 28-unit box (0.12.3+).
+ICON_COLOR = "#5c5c5c"
+ICON_STROKE = 1.3
+
+
 def _svg_icon(paths: str) -> str:
     """Return a stroke-style 24x24 SVG icon as a base64 data URI."""
     svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
-        f'stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">{paths}</svg>'
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{ICON_COLOR}" '
+        f'stroke-width="{ICON_STROKE}" stroke-linecap="round" stroke-linejoin="round">{paths}</svg>'
     )
     return "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
 

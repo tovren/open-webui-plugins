@@ -227,7 +227,8 @@ def test_action_buttons_are_language_neutral() -> None:
     for item in action.actions:
         svg = base64.b64decode(item["icon_url"].split(",", 1)[1]).decode()
         assert item["icon_url"].startswith("data:image/svg+xml;base64,")
-        assert 'fill="none"' in svg and 'stroke="currentColor"' in svg and 'stroke-width="1.5"' in svg
+        # grey, not currentColor: in an <img> that is black, and Open WebUI only inverts it in dark mode
+        assert 'fill="none"' in svg and 'stroke="#5c5c5c"' in svg and 'stroke-width="1.3"' in svg
 
 
 def test_docx_structure() -> None:

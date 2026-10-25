@@ -4,12 +4,15 @@ Each plugin has its own version (in the header of its file). Earlier changes are
 
 ## 2026-10-25
 
-Open WebUI 0.12.4: no code changes needed. The test suite passes with 0.12.4 (Python 3.12 and its
+Open WebUI 0.12.4: only Response Export changes (icons). The test suite passes with 0.12.4 (Python 3.12 and its
 bundled packages), and the integration tests of Context Guard and Company Context pass against it.
 
 - Reasoning Toggle (text only, version unchanged): from 0.12.4 on, Open WebUI's Model Controls are open
   to everyone who can use the model, without the Chat Controls permissions. The README says when the
   built-in Thinking control is enough and when the filter still helps.
+- Response Export 1.3.1: the icons of the Word, Excel, PDF and e-mail buttons are drawn in grey with a
+  thinner line, like Open WebUI's own buttons since 0.12.3. They were black (light mode) or light grey
+  (dark mode) and looked bold next to them.
 - Context Guard (text only, version unchanged): the README notes that 0.12.4 also compacts temporary
   and short chats and shows the summary in the chat.
 
