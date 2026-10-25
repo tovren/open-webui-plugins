@@ -12,7 +12,8 @@ bundled packages), and the integration tests of Context Guard and Company Contex
   built-in Thinking control is enough and when the filter still helps.
 - Response Export 1.3.1: the icons of the Word, Excel, PDF and e-mail buttons are drawn in grey with a
   thinner line, like Open WebUI's own buttons since 0.12.3. They were black (light mode) or light grey
-  (dark mode) and looked bold next to them.
+  (dark mode) and looked bold next to them. In Open WebUI 0.11.4 to 0.12.2, whose own icons are still
+  bold, they now look a little lighter than those.
 - Context Guard (text only, version unchanged): the README notes that 0.12.4 also compacts temporary
   and short chats and shows the summary in the chat.
 
