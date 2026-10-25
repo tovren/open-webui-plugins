@@ -48,7 +48,8 @@ orders several filters on the same hook.
 
 - Tested with **Open WebUI 0.11.4** (the version in `required_open_webui_version`). Context Guard
   needs at least 0.11 because it uses the `request` filter hook. Context Guard was also tested with
-  0.12.0, with and without Context Compaction.
+  0.12.0, 0.12.3 and 0.12.4, with and without Context Compaction. The whole test suite passes with
+  Open WebUI 0.12.4 (Python 3.12 and the packages it bundles).
 - Python 3.11 and 3.12. Response Export was tested with python-docx 1.1.2 and newer, and
   openpyxl 3.1. Office Documents was tested with python-docx 1.2.0, openpyxl 3.1.5 and
   python-pptx 1.0.2, the versions bundled with Open WebUI 0.11.4.

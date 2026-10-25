@@ -60,15 +60,19 @@ Workspace models use the entry of their base model unless they have one of their
 ## Why not Open WebUI's Model Controls?
 
 Since 0.12.0, Open WebUI has **Model Controls**: a Thinking control in the model editor whose options
-set custom parameters, picked from a knobs button in the chat input. They only show for users with
-both **Allow Chat Controls** and **Allow Chat Params** (`USER_PERMISSIONS_CHAT_CONTROLS`,
-`USER_PERMISSIONS_CHAT_PARAMS`), and the server ignores the choice otherwise. Those two permissions
-also open the Chat Controls side panel, where users can change temperature, max tokens, context size
-and the other advanced parameters. There is no permission for Model Controls alone.
+set custom parameters, picked from a knobs button in the chat input.
 
-A toggle filter needs neither permission. If your users get no chat controls, this filter is the way
-to let them switch thinking on. If they may use chat controls anyway, Model Controls are the built-in
-alternative.
+- **From 0.12.4 on**, everyone who can use a model can pick its Model Controls, without the Chat
+  Controls permissions. If a Thinking control with fixed options (e.g. off / low / medium) is all you
+  need, use Model Controls: they are built in and remember the choice per model.
+- **In 0.12.0 to 0.12.3**, Model Controls only show for users with both **Allow Chat Controls** and
+  **Allow Chat Params** (`USER_PERMISSIONS_CHAT_CONTROLS`, `USER_PERMISSIONS_CHAT_PARAMS`), which also
+  open the Chat Controls side panel with temperature, max tokens, context size and the other advanced
+  parameters. A toggle filter needs neither permission, so there it is the way to let users without
+  chat controls switch thinking on.
+
+The filter stays useful in Open WebUI 0.11 to 0.12.3, and where a plain on/off switch is wanted,
+with the effort level and thinking budget per model set by the admin in the valves.
 
 ## Security & privacy
 

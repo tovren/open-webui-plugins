@@ -286,7 +286,7 @@ class Compaction:
 async def compaction_settings(metadata: dict[str, Any] | None) -> Compaction | None:
     """Open WebUI's Context Compaction for this request, None if it is off.
 
-    Resolved like open_webui.utils.context_compaction (0.11.4 to 0.12.3): the model's
+    Resolved like open_webui.utils.context_compaction (0.11.4 to 0.12.4): the model's
     compact_token_threshold or the global threshold (default 80000), capped by the token cap; the
     summary is written by the compaction model if one is set, with the task model parameters."""
     try:

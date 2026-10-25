@@ -104,6 +104,9 @@ with the guard:
   The guard then stops the request with its message.
 - Long tool-call loops: Open WebUI 0.12.0 also compacts between the rounds, before the guard checks
   each round. In 0.11.4 only the guard covers a loop that keeps growing.
+- Since 0.12.4, compaction also runs in temporary chats and in short chats that are already over the
+  threshold (before, chats with up to three messages were never compacted), and the chat shows a
+  "Context compacted" line with the summary. The guard needs no change for this.
 - The summary request contains the whole chat plus the summary prompt (about 500 tokens) and room
   for the summary (`max_tokens` of the task model parameters, 1000 if they set none), so it needs
   about 1500 tokens more than the threshold. It goes to the compaction model if one is set

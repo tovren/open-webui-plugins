@@ -2,6 +2,17 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
+## 2026-10-25
+
+Open WebUI 0.12.4: no code changes needed. The test suite passes with 0.12.4 (Python 3.12 and its
+bundled packages), and the integration tests of Context Guard and Company Context pass against it.
+
+- Reasoning Toggle (text only, version unchanged): from 0.12.4 on, Open WebUI's Model Controls are open
+  to everyone who can use the model, without the Chat Controls permissions. The README says when the
+  built-in Thinking control is enough and when the filter still helps.
+- Context Guard (text only, version unchanged): the README notes that 0.12.4 also compacts temporary
+  and short chats and shows the summary in the chat.
+
 ## 2026-10-24
 
 Office Documents 0.4.2 and Office File UI (no version). The other plugins are unchanged.

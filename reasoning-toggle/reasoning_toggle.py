@@ -12,8 +12,9 @@ How it works
   chat input). While it is on, a lightbulb shows in the chat input; clicking it switches it off.
   While it is off, the filter does not run at all and the model behaves as configured, so make
   "no thinking" the model's default where needed (see README).
-- Works without the Chat Controls side panel: unlike Open WebUI's Model Controls (0.12+), a
-  toggle filter needs neither the "Allow Chat Controls" nor the "Allow Chat Params" permission.
+- Works without the Chat Controls side panel: unlike Open WebUI's Model Controls in 0.12.0 to
+  0.12.3, a toggle filter needs neither the "Allow Chat Controls" nor the "Allow Chat Params"
+  permission. From 0.12.4 on, Model Controls are open to everyone (see README).
 - When the button is on, the request gets chat_template_kwargs.enable_thinking = true. Both
   vLLM and llama-server hand this to the chat template (Qwen3.x, Gemma 4, GLM and others).
 - Optional effort level per model, sent as reasoning_effort, e.g. low/medium/xhigh for Qwen3.8
