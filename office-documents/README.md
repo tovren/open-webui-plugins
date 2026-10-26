@@ -99,7 +99,7 @@ A short example for a slide deck (the model sees the full schema with descriptio
   the cells. Allowed are cell references of the same workbook, numbers, quoted text, operators and these
   functions: `SUM`, `AVERAGE`, `MIN`, `MAX`, `MEDIAN`, `COUNT`, `COUNTA`, `COUNTIF`, `COUNTIFS`, `SUMIF`,
   `SUMIFS`, `AVERAGEIF`, `AVERAGEIFS`, `IF`, `IFERROR`, `AND`, `OR`, `NOT`, `ROUND`, `ROUNDUP`, `ROUNDDOWN`,
-  `ABS`, `PRODUCT`, `POWER`, `SQRT`, `MOD`, `INT`, `VLOOKUP`, `INDEX`, `MATCH`, `DATE`, `TODAY`, `YEAR`,
+  `ABS`, `PRODUCT`, `SUMPRODUCT`, `POWER`, `SQRT`, `MOD`, `INT`, `VLOOKUP`, `INDEX`, `MATCH`, `DATE`, `TODAY`, `YEAR`,
   `MONTH`, `DAY`, `EDATE`, `EOMONTH`, `NETWORKDAYS`, `WEEKDAY`, `TIME`, `HOUR`, `MINUTE`, `LEFT`, `RIGHT`,
   `LEN`, `CONCATENATE`, `ISBLANK`, `ISNUMBER`, `ISTEXT`, and the newer `XLOOKUP`, `IFS`, `MAXIFS`, `MINIFS`,
   `CONCAT`, `TEXTJOIN` (written with Excel's `_xlfn.` prefix; they need Excel 2019 or later, `XLOOKUP` Excel
@@ -108,11 +108,15 @@ A short example for a slide deck (the model sees the full schema with descriptio
   (`„ja“`) are translated. Formulas Excel cannot read are sent back with the place: an operator without a
   value (`=B2*`, `=B2*/2`, `==B2`), a missing argument, or a wrong number of arguments (`=ROUND(B2)`,
   `=SUM()`; the message shows how the function is written). Functions models often try get an alternative
-  (`TIMEVALUE`: a `time` column; `SUMPRODUCT`: a product column). The total row's `count` counts all
+  (`TIMEVALUE`: a `time` column). `SUMPRODUCT` takes cells and ranges of the same size
+  (`=SUMPRODUCT($B$2:$B$9;$C$2:$C$9)`); conditions or products inside it (`(A2:A9="x")*C2:C9`) are sent back
+  with `SUMIFS` as the way to sum with a condition. The total row's `count` counts all
   filled cells (`COUNTA`). Formulas may also be written into single cells, e.g. a balance row `=B2-B3`,
   `=C2-C3` … when the months are columns; they are checked against the same whitelist, and one that is not
   allowed is sent back (only one with a function such as `HYPERLINK` stays text, see Security). In columns
-  the model marks as `text`, values that start with `=` stay text.
+  the model marks as `text`, a formula that gives text (`=IF(F11>0;"Nachzahlung";"Guthaben")`, a label of
+  another sheet) is a formula too; values that do not look like one (`=1+1`, `= Summe`, `=> siehe unten`)
+  stay text. A `'` before the `=` writes the rest as text, as in Excel (`'=SUMME(B2:B9)`).
 - **Sum rows below the items** (net, VAT, gross, subtotals per cost centre) are rows with their own
   formulas. A formula sent in a row of a formula column replaces the column formula in that row
   (`=SUM(F2:F6)` below `=D{row}*E{row}`), and the column formulas that have nothing to compute in such a row
@@ -272,7 +276,7 @@ With the `word_template` valve, Word documents are built on a company file, e.g.
 - **Previews in Open WebUI** use browser libraries that know only part of the formats. Word files are
   written so that the preview shows their fonts, colours and bullets, too. The Excel preview does not
   compute formulas: it shows the results the tool stores with them, for arithmetic, comparisons, `&` and
-  SUM, AVERAGE, MIN, MAX, COUNT, ROUND, ABS, IF, AND, OR and NOT. Other formulas, and those whose result
+  SUM, AVERAGE, MIN, MAX, COUNT, SUMPRODUCT, ROUND, ABS, IF, AND, OR and NOT. Other formulas, and those whose result
   is not certain (errors such as division by 0, booleans in ranges, decimal numbers joined to text), stay
   empty there; Excel calculates all formulas when the file is opened, LibreOffice those without a stored
   result. The preview shows numbers without their format and dates as numbers, and the slide preview

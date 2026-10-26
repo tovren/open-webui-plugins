@@ -1870,18 +1870,91 @@ def test_rows_as_objects_written_into_the_chart() -> None:
 
 
 def test_rejected_formulas_in_cells() -> None:
-    """A formula in a cell that is merely not allowed or broken comes back (it would be written as text); one that
-    reaches outside (HYPERLINK ...) stays text, a column of type text keeps everything as text."""
-    broken = sheet(["A", "B"], [["x", "=SUMMENPRODUKT(B2:B3;C2:C3)"]])
+    """A formula in a cell that is merely not allowed or broken comes back (it would be written as text), in a column
+    of type text too; one that reaches outside (HYPERLINK ...) stays text, and so does a ' before the =."""
+    broken = sheet(["A", "B"], [["x", "=DATEDIF(B2;C2;\"d\")"]])
     assert (
-        "sheets[0].rows[0]: the formula '=SUMMENPRODUKT(B2:B3;C2:C3)' in 'B' is not allowed: the function "
-        "SUMMENPRODUKT is not allowed: add a column with the product" in invalid("create_excel_file", sheets=[broken])
+        "sheets[0].rows[0]: the formula '=DATEDIF(B2;C2;\"d\")' in 'B' is not allowed: the function "
+        "DATEDIF is not allowed: subtract the dates" in invalid("create_excel_file", sheets=[broken])
     )
+    text = sheet(["A", {"header": "C", "type": "text"}], [["x", "=SUMME(B2:"]])
+    sent = invalid("create_excel_file", sheets=[text])
+    assert "is not allowed: the parentheses in the formula do not match" in sent
+    assert "text that starts with = gets a ' before it: '=…" in sent
     safe = sheet(["A", "B", {"header": "C", "type": "text"}],
-                 [["x", '=HYPERLINK("http://x")', "=SUMME(B2:"], ["y", "=> siehe unten", "=foo("]])  # fmt: skip
+                 [["x", '=HYPERLINK("http://x")', "'=SUMME(B2:"], ["y", "=> siehe unten", "'=A1*B1*C1"]])  # fmt: skip
     ws = excel([safe])[0]["S"]
     assert ws["B2"].value == '=HYPERLINK("http://x")' and ws["B2"].data_type == "s"
-    assert (ws["B3"].value, ws["C2"].value, ws["C2"].data_type) == ("=> siehe unten", "=SUMME(B2:", "s")
+    assert ws["B3"].value == "=> siehe unten"
+    assert (ws["C2"].value, ws["C2"].data_type, ws["C2"].quotePrefix) == ("=SUMME(B2:", "s", True)
+    assert ws["C3"].value == "=A1*B1*C1"  # as written, no Markdown
+
+
+def test_formulas_in_text_columns() -> None:
+    """A column of type text holds formulas that give text (IF with words, a label of another sheet); a value that
+    does not look like a formula stays text."""
+    costs = {"name": "Kosten 2025", "columns": [{"header": "Position"}, {"header": "Betrag", "type": "currency"}],
+             "rows": [["Grundsteuer", 410.2], ["Müll", 380]]}  # fmt: skip
+    columns = [{"header": "Position", "type": "text"}, {"header": "Anteil", "type": "currency"},
+               {"header": "Ergebnis", "type": "text"}]  # fmt: skip
+    rows = [["='Kosten 2025'!A2", "='Kosten 2025'!B2*0.25", '=IF(B2>100,"Nachzahlung","Guthaben")'],
+            ["= DB III Gartenmöbel", 20, "=Zeile A + B"], ["=1+1", 5, "==== Abschnitt"]]  # fmt: skip
+    data = excel_data([costs, {"name": "Yilmaz", "columns": columns, "rows": rows}])
+    ws = load_workbook(io.BytesIO(data))["Yilmaz"]
+    assert ws["A2"].value == "='Kosten 2025'!A2" and ws["A2"].data_type == "f"
+    assert ws["C2"].value == '=IF(B2>100,"Nachzahlung","Guthaben")' and ws["C2"].alignment.horizontal == "left"
+    assert [(ws[c].value, ws[c].data_type) for c in ("A3", "C3", "A4", "C4")] == [
+        ("= DB III Gartenmöbel", "s"), ("=Zeile A + B", "s"), ("=1+1", "s"), ("==== Abschnitt", "s")]  # fmt: skip
+    values = load_workbook(io.BytesIO(data), data_only=True)["Yilmaz"]
+    assert (values["A2"].value, values["C2"].value) == ("Grundsteuer", "Nachzahlung")
+    total = sheet([{"header": "Art", "type": "text", "formula": '=IF(B{row}>0,"plus","minus")'},
+                   {"header": "Wert", "type": "number"}],
+                  [[None, 1], [None, -1], ['=IF(SUM(B2:B3)>0,"ja","nein")', None]])  # fmt: skip
+    assert excel([total])[0]["S"]["A4"].value == '=IF(SUM(B2:B3)>0,"ja","nein")'  # a sum row keeps its formula
+
+
+SUMME = {"header": "Summe", "type": "currency"}
+
+
+def test_sumproduct() -> None:
+    """SUMPRODUCT of ranges of the same size; conditions, products of ranges, other sizes and text where the numbers
+    belong come back."""
+    products = {"name": "Produkte", "columns": ARTICLES,
+                "rows": [["Stuhl", 6, 240], ["Tisch", 2, 890], ["Lampe", 3, 45.5]]}  # fmt: skip
+    order = sheet(["Posten", {"header": "Betrag", "type": "currency"}],
+                  [["Summe", "=SUMMENPRODUKT('Produkte'!B2:B4;'Produkte'!C2:C4)"],
+                   ["Netto", "=SUMPRODUCT(Produkte!B:B,Produkte!C:C)"]])  # fmt: skip
+    data = excel_data([products, order])
+    ws = load_workbook(io.BytesIO(data))["S"]
+    assert ws["B2"].value == "=SUMPRODUCT('Produkte'!B2:B4,'Produkte'!C2:C4)"
+    assert ws["B2"].number_format == ws["B3"].number_format
+    values = load_workbook(io.BytesIO(data), data_only=True)["S"]
+    assert values["B2"].value == values["B3"].value == pytest.approx(3356.5)
+    running = {**SUMME, "formula": "=SUMPRODUCT($B$2:B{row},$C$2:C{row})"}
+    data = excel_data([sheet([*ARTICLES, running], [["Stuhl", 6, 240], ["Tisch", 2, None]])])
+    values = load_workbook(io.BytesIO(data), data_only=True).active
+    assert [values["D2"].value, values["D3"].value] == [1440, 1440]  # an empty cell is 0
+
+    def order_with(formula: str, columns: list[Any] = ARTICLES, quantity: Any = 2) -> dict[str, Any]:
+        rows = [["Stuhl", 6, 240, None], ["Tisch", quantity, 890, None], ["Summe", None, None, formula]]
+        return sheet([*columns, SUMME], rows)
+
+    def sent(formula: str, **kwargs: Any) -> str:
+        return invalid("create_excel_file", sheets=[order_with(formula, **kwargs)])
+
+    assert "no conditions: for a sum with a condition write SUMIFS" in sent('=SUMPRODUCT(($A$2:$A$3="Stuhl")*C2:C3)')
+    assert "a condition on a computed value" in sent("=SUMPRODUCT((ROUND(C2:C3,2)=240)*B2:B3)")
+    assert "write them as arguments" in sent("=SUMPRODUCT(B2:B3*C2:C3)")
+    assert "of the same size: B2:B3 (2 rows), C2:C4 (3 rows)" in sent("=SUMPRODUCT(B2:B3,C2:C4)")
+    assert "is the column letter right?" in sent("=SUMPRODUCT(A2:A3,C2:C3)")  # the article names count as 0
+    as_text = [ARTICLES[0], {"header": "Menge", "type": "text"}, ARTICLES[2]]
+    assert "has '6' there as text, which SUMPRODUCT counts as 0" in sent("=SUMPRODUCT(B2:B3,C2:C3)", columns=as_text,
+                                                                        quantity="6")  # fmt: skip
+    dash = excel_data([order_with("=SUMPRODUCT(B2:B3,C2:C3)", quantity="-")])  # '-' is 0, as meant
+    assert load_workbook(io.BytesIO(dash), data_only=True).active["D4"].value is None  # Excel computes it
+    twice = sheet([*ARTICLES, {**SUMME, "total": "sum"}],
+                  [["Stuhl", 6, 240, 1440], ["Tisch", 2, 890, 1780], ["Alles", None, None, "=SUMPRODUCT(D2:D3,D2:D3)"]])
+    assert "counts twice" in invalid("create_excel_file", sheets=[twice])
 
 
 def test_dates_and_times() -> None:
@@ -2383,7 +2456,8 @@ def test_formula_values_match_libreoffice() -> None:
                      {"header": "Pot", "formula": "=A{row}^B{row}"}, {"header": "Vgl", "formula": "=A{row}>=B{row}"},
                      {"header": "Neg", "formula": "=-A{row}%"}, {"header": "Abs", "formula": "=ABS(A{row}-B{row})"},
                      {"header": "Wenn", "formula": "=IF(A{row}>2,A{row})"},
-                     {"header": "Stat", "formula": "=AVERAGE($A$2:$B$6)+MIN($A$2:$A$6)-COUNT($A$2:$B$6)"}],
+                     {"header": "Stat", "formula": "=AVERAGE($A$2:$B$6)+MIN($A$2:$A$6)-COUNT($A$2:$B$6)"},
+                     {"header": "SP", "formula": "=SUMPRODUCT($A$2:A{row},$B$2:B{row})"}],
                     [[2.675, 1], [1.005, 1], [0.1, 0.2], [-2.5, 2], [None, 3]], name="Zahlen")  # fmt: skip
     times = sheet([{"header": "Start", "type": "date"}, {"header": "Von", "type": "time"},
                    {"header": "Bis", "type": "time"}, {"header": "Frist", "type": "date", "formula": "=A{row}+14"},

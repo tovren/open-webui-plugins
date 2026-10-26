@@ -2,7 +2,7 @@
 title: Office Documents
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 0.4.2
+version: 0.4.3
 license: MIT
 required_open_webui_version: 0.11.4
 description: Lets the model create Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files. The model only supplies the content as structured JSON; fixed code builds the file, so no model-written code is ever run. The file is attached to the answer, where it can be previewed and downloaded.
@@ -2088,9 +2088,9 @@ GERMAN_FUNCTIONS = {
     "MONATSENDE": "EOMONTH", "NETTOARBEITSTAGE": "NETWORKDAYS", "WOCHENTAG": "WEEKDAY", "ZEIT": "TIME",
     "STUNDE": "HOUR", "LINKS": "LEFT", "RECHTS": "RIGHT", "LÄNGE": "LEN", "VERKETTEN": "CONCATENATE",
     "TEXTKETTE": "CONCAT", "TEXTVERKETTEN": "TEXTJOIN", "ISTLEER": "ISBLANK", "ISTZAHL": "ISNUMBER",
-    "ISTTEXT": "ISTEXT",
+    "ISTTEXT": "ISTEXT", "SUMMENPRODUKT": "SUMPRODUCT",
     # not allowed, named in English in the message
-    "ZEITWERT": "TIMEVALUE", "DATWERT": "DATEVALUE", "SUMMENPRODUKT": "SUMPRODUCT", "INDIREKT": "INDIRECT",
+    "ZEITWERT": "TIMEVALUE", "DATWERT": "DATEVALUE", "INDIREKT": "INDIRECT",
     "BEREICH.VERSCHIEBEN": "OFFSET", "ZELLE": "CELL", "WEBDIENST": "WEBSERVICE", "XMLFILTERN": "FILTERXML",
 }  # fmt: skip
 # The whitelist: (fewest arguments, most arguments, how the function is written); a wrong count gets the last back.
@@ -2121,6 +2121,7 @@ FUNCTION_ARGUMENTS: dict[str, tuple[int, int, str]] = {
     "ROUNDDOWN": (2, 2, "ROUNDDOWN(value, digits)"),
     "ABS": (1, 1, "ABS(value)"),
     "PRODUCT": (1, 255, "PRODUCT(B{row}, C{row})"),
+    "SUMPRODUCT": (1, 255, "SUMPRODUCT($C$2:$C$9, $D$2:$D$9)"),
     "POWER": (2, 2, "POWER(number, power)"),
     "SQRT": (1, 1, "SQRT(number)"),
     "MOD": (2, 2, "MOD(number, divisor)"),
@@ -2163,7 +2164,6 @@ FUNCTION_ALTERNATIVES = {  # for functions models often try
     "TIMEVALUE": "give the column with the times the type time, its cells hold them as numbers: =C{row}-B{row}",
     "DATEVALUE": "give the column with the dates the type date, its cells hold them as numbers: =C{row}-B{row}",
     "TEXT": "the column type sets how a value is shown (date, time, currency, percent)",
-    "SUMPRODUCT": "add a column with the product of each row (=B{row}*C{row}) and SUM it",
     "DATEDIF": "subtract the dates: =C{row}-B{row} gives the days between them",
     "SWITCH": "use IFS or IF",
 }
@@ -2505,7 +2505,56 @@ class _FormulaParser:
         if not fewest <= len(args) <= most or (before_pairs is not None and (len(args) - before_pairs) % 2):
             count = f"{len(args)} argument{'' if len(args) == 1 else 's'}" if args else "no arguments"
             raise ValueError(f"{name} has {count} here; write it as {usage}")
+        if name == "SUMPRODUCT":
+            _check_sumproduct(args)
         return FormulaNode("call", name, tuple(args))
+
+
+def _check_sumproduct(args: list[FormulaNode]) -> None:
+    """SUMPRODUCT takes cells and ranges of the same size only: Excel counts text in them as 0, which the checks of
+    the columns catch; a condition or a product inside ((C2:C9="x")*D2:D9) would compute with arrays, which they do
+    not see."""
+    for arg in args:
+        if arg.kind not in ("cell", "range"):
+            parts = list(walk(arg))
+            if any(node.kind == "binary" and node.text in OPERATOR_LEVELS[0] for node in parts):
+                raise ValueError(
+                    "SUMPRODUCT takes ranges only, no conditions: for a sum with a condition write SUMIFS(sum_range, "
+                    'range1, criterion1, ...), e.g. SUMIFS($F$2:$F$12, $C$2:$C$12, "x"); a condition on a computed '
+                    "value (ROUND(…)=0.19) needs a column with that value"
+                )
+            if any(node.kind == "range" for node in parts):
+                raise ValueError("SUMPRODUCT multiplies its ranges itself: write them as arguments, "
+                                 "SUMPRODUCT($C$2:$C$9, $D$2:$D$9), not $C$2:$C$9*$D$2:$D$9")  # fmt: skip
+            raise ValueError("SUMPRODUCT takes cells and ranges only, e.g. SUMPRODUCT($C$2:$C$9, $D$2:$D$9)")
+    shapes = [(_range_size(arg), arg) for arg in args]
+    if len({size for size, _ in shapes}) > 1:
+        listed = ", ".join(f"{_range_text(arg)} ({_size_text(size)})" for size, arg in shapes)
+        raise ValueError(f"the ranges of SUMPRODUCT have to be of the same size: {listed}")
+
+
+def _range_size(node: FormulaNode) -> tuple[tuple[int, int], int]:
+    """(rows, columns) of a cell or range; a row with {row} counts as (1, 0), so B2:B{row} and C2:C{row} match."""
+    cells = [node.cell] if node.kind == "cell" else [arg.cell for arg in node.args]
+    assert all(cell is not None for cell in cells)
+    first, last = cells[0], cells[-1]
+
+    def row(token: FormulaToken) -> tuple[int, int]:
+        return (1, 0) if token.row == "{row}" else (0, int(token.row))
+
+    (a1, b1), (a2, b2) = row(first), row(last)
+    rows = (a2 - a1, abs(b2 - b1) if a1 == a2 else b2 - b1)
+    return rows, abs(_column_number(last.column) - _column_number(first.column))
+
+
+def _range_text(node: FormulaNode) -> str:
+    return node.text if node.kind == "cell" else ":".join(arg.text for arg in node.args)
+
+
+def _size_text(size: tuple[tuple[int, int], int]) -> str:
+    (moving, rows), columns = size
+    height = f"{rows + 1} rows" if not moving else "rows up to the current one"
+    return height if not columns else f"{height} × {columns + 1} columns"
 
 
 def normalize_formula(
@@ -2725,10 +2774,12 @@ def convert_value(
 
     JSON numbers stay numbers in text columns too, so sums and charts over them work; true and false are Excel's
     TRUE and FALSE (WAHR, FALSCH in German Excel), which are no numbers. A time is the fraction of a day, as in
-    Excel.
+    Excel. A ' before = + - @ makes the rest text, as in Excel ('=SUM(B2:B9) shows the formula).
     """
     if blank(value):
         return None, True
+    if isinstance(value, str) and value[:1] == "'" and value[1:2] in ("=", "+", "-", "@"):
+        return clean_text(value[1:]), column_type == "text"
     if isinstance(value, bool):
         return value, column_type == "text"
     if column_type == "text":
@@ -3023,6 +3074,7 @@ class FormulaUse(NamedTuple):
     token: FormulaToken
     target: tuple[int, int]  # the cell's sheet and column
     rows: list[int]  # the data rows it reads (from 0; -1 is the header row)
+    zero: bool = False  # in SUMPRODUCT, which counts text as 0 instead of giving #VALUE!
 
 
 class Book:
@@ -3057,11 +3109,12 @@ class Book:
         return f"columns of '{self.names[s]}': " + ", ".join(listed) + (", …" if len(columns) > 26 else "")
 
     def add_cell_formula(self, s: int, r: int, c: int, value: str) -> str | None:
-        """Check a formula written into a cell and keep it; returns a message if it is sent back. In a column of type
-        text it stays text, and so does a formula that reaches outside (HYPERLINK, ...) unless the column takes
-        numbers. A formula that is merely not allowed or broken is sent back, so the model can rewrite it."""
+        """Check a formula written into a cell and keep it; returns a message if it is sent back. A formula that
+        reaches outside (HYPERLINK, ...) stays text unless the column takes numbers; so does, in a column of type
+        text, a value that does not look like a formula ('=1+1', '= DB III'). A formula that is merely not allowed or
+        broken is sent back, so the model can rewrite it, or write it as text with a ' before it."""
         column = self.sheets[s].columns[c]
-        if column.type == "text" and "type" in column.model_fields_set:
+        if column.type == "text" and "type" in column.model_fields_set and not FORMULA_LIKE_RE.match(value.strip()):
             return None
         try:
             place = (self.names[s], c + 1, r + 2)
@@ -3071,7 +3124,8 @@ class Book:
                 return f"the formula '{value.strip()[:60]}' is not allowed: {e}"
         except ValueError as e:
             if column.type in NUMBER_TYPES or FORMULA_LIKE_RE.match(value.strip()):
-                return f"the formula '{value.strip()[:60]}' in '{column.header.strip()}' is not allowed: {e}"
+                text = "" if column.type in NUMBER_TYPES else "; text that starts with = gets a ' before it: '=…"
+                return f"the formula '{value.strip()[:60]}' in '{column.header.strip()}' is not allowed: {e}{text}"
         return None
 
     def has_inputs(self, s: int, r: int, c: int) -> bool:
@@ -3159,10 +3213,14 @@ class Book:
         return used
 
     def arithmetic_uses(self) -> list[FormulaUse]:
-        """The cells that formulas compute with: operands of + - * / ^, also -B2 and B2%."""
+        """The cells that formulas compute with: operands of + - * / ^, also -B2 and B2%, and the cells of the ranges
+        of SUMPRODUCT."""
         uses = []
         for s, _, r, place, formula in self.formulas():
             for node in walk(self.parsed(formula)[1]):
+                if node.kind == "call" and node.text == "SUMPRODUCT":
+                    for arg in node.args:
+                        uses += self._range_uses(arg, s, r, place)
                 if node.kind in ("unary", "percent") or (node.kind == "binary" and node.text in ARITHMETIC):
                     for arg in node.args:
                         if arg.kind == "cell" and arg.cell is not None:
@@ -3172,6 +3230,26 @@ class Book:
                                 rows = [int(arg.cell.row) - 2]
                             uses.append(FormulaUse(place, s, arg.cell, self.target(arg.cell, s), rows))
         return uses
+
+    def _range_uses(self, node: FormulaNode, s: int, r: int | None, place: str) -> list[FormulaUse]:
+        """A use of each column of a cell or range of SUMPRODUCT, with its rows; r is the formula's data row, None for
+        a column formula (whose {row} is every row)."""
+        cells = [node.cell] if node.kind == "cell" else [arg.cell for arg in node.args]
+        if any(cell is None for cell in cells):
+            return []
+        first, last = cells[0], cells[-1]
+        t, a = self.target(first, s)
+        b = _column_number(last.column) - 1
+        count = len(self.sheets[t].rows)
+
+        def row(token: FormulaToken) -> list[int]:  # the rows the token stands for, from 0
+            if token.row != "{row}":
+                return [int(token.row) - 2]
+            return list(range(count)) if r is None else [r]
+
+        ends = row(first) + row(last)
+        rows = list(range(max(min(ends), 0), max(ends) + 1))  # the header's text counts as 0, which does no harm
+        return [FormulaUse(place, s, first, (t, c), rows, zero=True) for c in range(min(a, b), max(a, b) + 1)]
 
     def kind(self, s: int, c: int) -> str:
         """What the cells of a column hold: its type; for a formula column without a type what the formula gives;
@@ -3184,8 +3262,9 @@ class Book:
                 kind = column.type
             elif key in self.columns:
                 kind = self.expression_kind(self.parsed(self.columns[key])[1], s)
-            else:
-                kind = text_kind([self.value(s, r, c) for r in range(len(self.sheets[s].rows))])
+            else:  # its formulas give what they give, their text is no value
+                rows = range(len(self.sheets[s].rows))
+                kind = text_kind([self.value(s, r, c) for r in rows if (s, r, c) not in self.cells])
             self._kinds[key] = kind
         return self._kinds[key]
 
@@ -3249,6 +3328,11 @@ class Book:
             t, c = self.target(first, s)
             column = c + int(index) - 1
             return self.kind(t, column) if 0 <= column < len(self.sheets[t].columns) else "unknown"
+        if name == "SUMPRODUCT":  # the sum of the products of the rows
+            kind = self.expression_kind(args[0], s)
+            for arg in args[1:]:
+                kind = operation_kind("*", kind, self.expression_kind(arg, s), args[0], arg)
+            return kind
         return "number" if name in ("POWER", "SQRT") else "unknown"
 
     def evaluate(self, node: FormulaNode, s: int, r: int) -> float | None:
@@ -3681,7 +3765,7 @@ def _row_formula_problems(book: Book) -> list[str]:
         if (
             sheet.columns[c].total != "none"
             and tree.kind == "call"
-            and tree.text in ("SUM", "SUMIF", "SUMIFS")
+            and tree.text in ("SUM", "SUMIF", "SUMIFS", "SUMPRODUCT")
             and any(a <= c <= b for a, b, _, _ in spans)
         ):  # a subtotal; a discount row (=-ROUND(SUM(…)*0.05,2)) is meant to be in the total
             problems.append(
@@ -3744,10 +3828,12 @@ def _row_labels(book: Book, s: int) -> str:
     those), for messages about row numbers."""
     sheet = book.sheets[s]
     texts = [c for c, column in enumerate(sheet.columns) if column.type == "text" and (s, c) not in book.columns]
-    count = {c: sum(isinstance(row[c], str) and bool(row[c].strip()) for row in sheet.rows) for c in texts}
+    count = {c: sum(isinstance(row[c], str) and bool(row[c].strip()) and (s, r, c) not in book.cells
+                    for r, row in enumerate(sheet.rows)) for c in texts}  # fmt: skip
     c = max(texts, key=lambda c: (count[c], -c)) if texts else 0
     labels = [
-        f"{r + 2}={to_plain(str(row[c]).strip())[:20]}" for r, row in enumerate(sheet.rows[:30]) if not blank(row[c])
+        f"{r + 2}={to_plain(str(row[c]).strip())[:20]}" for r, row in enumerate(sheet.rows[:30])
+        if not blank(row[c]) and (s, r, c) not in book.cells
     ]
     more = ", …" if len(sheet.rows) > 30 else ""
     return "rows: " + ", ".join(labels) + more if labels else "the rows have no labels"
@@ -3766,6 +3852,11 @@ def _arithmetic_problems(book: Book) -> list[str]:
         if column >= len(target.columns) or use.target in book.columns or key in reported:
             continue
         header, name = target.columns[column].header.strip(), book.cell_name(use.token)
+        if use.zero:  # SUMPRODUCT: a word or '-' among numbers is 0, as meant; a column of text or a number as text not
+            if problem := _sumproduct_text_problem(book, use, header, name):
+                reported.add(key)
+                problems.append(problem)
+            continue
         if -1 in use.rows:
             reported.add(key)
             problems.append(
@@ -3798,6 +3889,29 @@ def _arithmetic_problems(book: Book) -> list[str]:
                 f"'{value}' there{more}, which gives #VALUE!: send a number, or null for an empty cell"
             )
     return problems
+
+
+def _sumproduct_text_problem(book: Book, use: FormulaUse, header: str, name: str) -> str | None:
+    t, column = use.target
+    target = book.sheets[t]
+    values = [(r, book.value(t, r, column)) for r in use.rows if 0 <= r < len(target.rows)
+              and (t, r, column) not in book.cells]  # fmt: skip
+    texts = [(r, v) for r, v in values if isinstance(v, str)]
+    if not texts:
+        return None
+    if not any(isinstance(v, int | float | date) and not isinstance(v, bool) for _, v in values):
+        return (
+            f"{use.place}: SUMPRODUCT multiplies '{header}' ({name}), which holds text (e.g. '{texts[0][1]}'), so "
+            f"it counts as 0; is the column letter right? ({book.columns_hint(t)})"
+        )
+    numbers = [(r, v) for r, v in texts if computable(v)]
+    if numbers:
+        r, value = numbers[0]
+        return (
+            f"{use.place}: SUMPRODUCT multiplies '{header}' ({name}), but {book.where(t)}.rows[{r}] has '{value}' "
+            "there as text, which SUMPRODUCT counts as 0: send it as a number, or give the column a number type"
+        )
+    return None
 
 
 def _kind_problems(book: Book) -> list[str]:
@@ -3992,7 +4106,7 @@ def default_chart_columns(sheet: ExcelSheet) -> dict[str, Any]:
 
 
 CHART_ROWS = 22  # charts below each other next to the table, one every 22 rows
-VALUE_FUNCTIONS = {"SUM", "AVERAGE", "MIN", "MAX", "COUNT", "ROUND", "ABS", "IF", "AND", "OR", "NOT"}
+VALUE_FUNCTIONS = {"SUM", "AVERAGE", "MIN", "MAX", "COUNT", "SUMPRODUCT", "ROUND", "ABS", "IF", "AND", "OR", "NOT"}
 FORMULA_CELL_RE = re.compile(  # a formula cell as openpyxl writes it, without a value
     rb'<c r="(?P<cell>[A-Z]+[0-9]+)"(?P<attributes>[^>]*)><f>(?P<formula>[^<]*)</f><v\s*(?:/>|></v>)</c>'
 )
@@ -4117,7 +4231,46 @@ class FormulaValues:
             raise Uncomputed  # the rest is left to Excel
         return [self.cell(first[0], f"{get_column_letter(c)}{r}") for r in rows for c in columns]
 
+    def grid(self, node: FormulaNode, sheet: str, height: int, width: int) -> list[Any]:
+        """The values of the first height × width cells of a cell or range, row by row."""
+        if node.kind == "cell":
+            return [self.evaluate(node, sheet)]
+        first, last = (self.address(arg.cell, sheet) for arg in node.args if arg.cell is not None)
+        (r1, c1), (r2, c2) = coordinate_to_tuple(first[1]), coordinate_to_tuple(last[1])
+        top, left = min(r1, r2), min(c1, c2)
+        self.range_cells += height * width
+        if self.range_cells > MAX_RANGE_CELLS:
+            raise Uncomputed
+        return [self.cell(first[0], f"{get_column_letter(left + j)}{top + i}") for i in range(height)
+                for j in range(width)]  # fmt: skip
+
+    def sumproduct(self, args: tuple[FormulaNode, ...], sheet: str) -> float:
+        """The ranges have the same size (_check_sumproduct); cells below or right of a sheet's data are empty, so
+        only the rows and columns inside all of them count."""
+        height, width = MAX_EXCEL_ROW, MAX_EXCEL_COLUMN
+        for arg in args:
+            if arg.kind == "range":
+                first, last = (self.address(cell.cell, sheet) for cell in arg.args if cell.cell is not None)
+                rows, columns = self.sizes[first[0]]
+                (r1, c1), (r2, c2) = coordinate_to_tuple(first[1]), coordinate_to_tuple(last[1])
+                height = min(height, max(min(max(r1, r2), rows) - min(r1, r2) + 1, 0))
+                width = min(width, max(min(max(c1, c2), columns) - min(c1, c2) + 1, 0))
+            else:
+                height, width = min(height, 1), min(width, 1)
+        products = [1.0] * (height * width)
+        for arg in args:
+            for k, value in enumerate(self.grid(arg, sheet, height, width)):
+                if isinstance(value, bool | str):
+                    raise Uncomputed  # Excel counts them as 0, LibreOffice may read "12" as 12
+                products[k] *= 0.0 if value is None else value
+        total = sum(products, 0.0)
+        if total and abs(total) < max(map(abs, products)) * NEAR_ZERO:
+            raise Uncomputed
+        return total
+
     def call(self, name: str, args: tuple[FormulaNode, ...], sheet: str) -> Any:
+        if name == "SUMPRODUCT":
+            return self.sumproduct(args, sheet)
         if name in ("SUM", "AVERAGE", "MIN", "MAX", "COUNT"):
             numbers: list[float] = []
             for arg in args:
@@ -4382,7 +4535,9 @@ class XlsxWriter:
                     formula = ""  # a sum row: the line item formula would show 0 there
                 if formula:  # checked against the whitelist
                     cell.value = formula.replace("{row}", str(r))
-                    cell.alignment = ALIGN["date" if column.type in TIME_TYPES else "number"]
+                    gives = self.book.expression_kind(self.book.parsed(formula)[1], s) if column.type == "text" else ""
+                    kind = "date" if column.type in TIME_TYPES else "text" if gives == "text" else "number"
+                    cell.alignment = ALIGN[kind]
                     widths[c - 1] = max(widths[c - 1], 12)
                     continue
                 value, typed = convert_value(raw, column.type, self.book.decimal_comma_of(s, c - 1))

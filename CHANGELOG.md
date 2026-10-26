@@ -2,6 +2,25 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
+## 2026-10-26
+
+Office Documents 0.4.3. The other plugins are unchanged.
+
+### Office Documents 0.4.3
+
+- Formulas in columns of type `text` are formulas: a formula that gives text, such as
+  `=IF(F11>0;"Nachzahlung";"Guthaben")` or `='Kosten 2025'!A2`, was written as text without a word to the
+  model, so the file showed the formula instead of its result. Values that do not look like a formula
+  (`=1+1`, `= DB III`, `=> siehe unten`) stay text, and so do formulas with a function such as `HYPERLINK`. A
+  formula that is broken or not allowed is sent back, as in the other columns, and the message says how to
+  write text that starts with `=`: with a `'` before it, as in Excel (`'=SUMME(B2:B9)` shows the formula).
+  Formulas that give text are aligned left, like the text next to them.
+- `SUMPRODUCT` (`SUMMENPRODUKT`) is allowed, with cells and ranges of the same size:
+  `=SUMPRODUCT($B$2:$B$9;$C$2:$C$9)`. The preview shows its result. Ranges of different sizes and conditions or
+  products inside it (`SUMPRODUCT((A2:A9="x")*C2:C9)`) are sent back, the conditions with `SUMIFS` as the
+  way to sum with a condition. A range with text where numbers belong (the article names instead of the
+  quantities, or `'12'` as text) is sent back too, because SUMPRODUCT counts text as 0 without an error.
+
 ## 2026-10-25
 
 Open WebUI 0.12.4: only Response Export changes (icons). The test suite passes with 0.12.4 (Python 3.12 and its
