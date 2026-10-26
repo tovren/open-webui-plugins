@@ -4,7 +4,16 @@ Each plugin has its own version (in the header of its file). Earlier changes are
 
 ## 2026-10-26
 
-Office Documents 0.4.3. The other plugins are unchanged.
+Office Documents 0.4.3 and Company Context 1.3.0. The other plugins are unchanged.
+
+### Company Context 1.3.0
+
+- Each user can pick the form of address (Sie/du) per model, with Open WebUI's Model Controls: an option
+  sets the custom parameter `company_context`, e.g. `{"address": "informal"}`, which the filter takes out of
+  the request. From Open WebUI 0.12.4 on every user of the model can pick it, without the Valves
+  permission. See the [README](company-context/#each-users-choice-form-of-address) for the control to add.
+- The line comes at the end of the note, in front of the date, so the company profile at the start stays
+  the same for all users and the model server can keep sharing its cache.
 
 ### Office Documents 0.4.3
 

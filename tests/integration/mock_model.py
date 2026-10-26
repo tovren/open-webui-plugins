@@ -81,6 +81,7 @@ class Handler(BaseHTTPRequestHandler):
             "max_tokens": body.get("max_tokens") or body.get("max_completion_tokens"),
             "has_summary": "[CONVERSATION SUMMARY]" in all_text,
             "system": text_of(messages[0].get("content")) if messages and messages[0].get("role") == "system" else "",
+            "keys": sorted(body),
         }
         needed = entry["prompt_tokens"] + (int(entry["max_tokens"] or 0) if MODE == "vllm" else 0)
         if needed > N_CTX:

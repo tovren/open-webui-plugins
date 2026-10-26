@@ -111,11 +111,13 @@ class OpenWebUI:
         calls, self.log_pos = [json.loads(line) for line in lines[self.log_pos :]], len(lines)
         return calls
 
-    def send(self, content: str, tools: bool = False, params: dict[str, Any] | None = None) -> Turn:
+    def send(
+        self, content: str, tools: bool = False, params: dict[str, Any] | None = None, model: str = MODEL
+    ) -> Turn:
         user_id, assistant_id = str(uuid.uuid4()), str(uuid.uuid4())
         user_message = {"id": user_id, "parentId": self.parent, "childrenIds": [], "role": "user",
-                        "content": content, "timestamp": int(time.time()), "models": [MODEL]}
-        body = {"model": MODEL, "stream": tools, "messages": [{"role": "user", "content": content}],
+                        "content": content, "timestamp": int(time.time()), "models": [model]}
+        body = {"model": model, "stream": tools, "messages": [{"role": "user", "content": content}],
                 "id": assistant_id, "parent_id": self.parent, "user_message": user_message, "params": params or {}}
         if self.chat_id:
             body["chat_id"] = self.chat_id

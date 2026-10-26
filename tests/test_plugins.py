@@ -2175,6 +2175,42 @@ def test_inlet_handles_list_system_content_and_missing_messages() -> None:
     assert run_inlet(flt, {})["messages"][0]["role"] == "system"
 
 
+def test_note_user_choice_goes_before_the_date() -> None:
+    flt = make_filter(cc, language="de", company_profile="Standorte: Ulm", include_user_name=False)
+    plain = flt.build_note(None, MONDAY)
+    note = flt.build_note(None, MONDAY, choices={"address": "informal"})
+    paragraphs = note.split("\n\n")
+    assert cc.TRANSLATIONS["de"]["formal"] not in note and cc.TRANSLATIONS["de"]["informal"] not in paragraphs[0]
+    assert paragraphs[-1].splitlines() == [
+        cc.TRANSLATIONS["de"]["informal"],
+        "Heute ist Montag, 12. Oktober 2026 (Kalenderwoche 42).",
+    ]
+    # the profile stays the same for all users, whatever they picked
+    assert paragraphs[1:3] == plain.split("\n\n")[1:3]
+    # without a choice the valve's form of address stays in the head
+    assert flt.build_note(None, MONDAY, choices={}) == plain
+    assert cc.TRANSLATIONS["de"]["formal"] in plain.split("\n\n")[0]
+
+
+def test_inlet_takes_the_choices_out_of_the_request(caplog: pytest.LogCaptureFixture) -> None:
+    flt = make_filter(cc, language="en")
+    body = run_inlet(flt, {"company_context": {"address": "informal"}, "messages": []})
+    assert "company_context" not in body
+    assert cc.TRANSLATIONS["en"]["informal"] in body["messages"][0]["content"]
+    # Ollama models get custom parameters in options
+    body = run_inlet(flt, {"options": {"company_context": {"address": "informal"}, "num_ctx": 8192}, "messages": []})
+    assert body["options"] == {"num_ctx": 8192} and cc.TRANSLATIONS["en"]["informal"] in body["messages"][0]["content"]
+    # wrong values are left out and logged once; the valve applies
+    with caplog.at_level(logging.WARNING):
+        for _ in range(2):
+            body = run_inlet(flt, {"company_context": {"address": "du", "length": "short"}, "messages": []})
+            run_inlet(flt, {"company_context": "informal", "messages": []})
+    assert cc.TRANSLATIONS["en"]["formal"] in body["messages"][0]["content"]
+    assert caplog.text.count("unknown company_context.address = 'du'") == 1
+    assert caplog.text.count("unknown company_context.length = 'short'") == 1
+    assert caplog.text.count("must be an object") == 1
+
+
 def test_unknown_timezone_falls_back_to_the_browser() -> None:
     flt = make_filter(cc, timezone="Mars/Olympus")  # loading a stored typo must not fail every chat
     now = flt._now({"variables": {"{{CURRENT_TIMEZONE}}": "Asia/Tokyo"}})

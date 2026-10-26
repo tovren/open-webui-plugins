@@ -2,7 +2,7 @@
 title: Company Context
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.2.0
+version: 1.3.0
 license: MIT
 required_open_webui_version: 0.11.4
 description: Adds a short system note to every request with your company name, today's date and calendar week, the response language, the form of address, the user's name, your own house rules, a short company profile and texts for single user groups (e.g. departments) - the same for every model and assistant, including newly created ones.
@@ -23,6 +23,11 @@ How it works
 - The parts that are the same for everybody come first (rules, company profile), then the texts
   of the user's groups, then the date and the user's name. So the model server can share the
   cached start of the prompt between all users, and between the members of a group.
+- Each user can pick the form of address per model, through Open WebUI's Model Controls (0.12.0,
+  for every user from 0.12.4): an option sets the custom parameter company_context, e.g.
+  {"address": "informal"}. The filter takes it out of the request, so it never reaches the model
+  server, and writes that line at the end of the note, in front of the date: the start of the prompt
+  stays the same for all users.
 - group_profiles holds one section per group, headed "## <group name>". A user gets the sections
   of the groups they belong to (in Open WebUI 0.12 also through a subgroup), in the order of the
   sections. Section names that match no group are written to the log once.
@@ -122,6 +127,8 @@ MONTHS = {
     ),
 }  # fmt: skip
 MARKERS = tuple(texts["marker"] for texts in TRANSLATIONS.values())
+CHOICES_PARAM = "company_context"  # custom parameter set by Model Controls, removed from the request
+CHOICES = {"address": ("formal", "informal")}
 
 
 def zone(name: str) -> tzinfo | None:
@@ -136,6 +143,15 @@ def chat_variable(metadata: dict[str, Any] | None, name: str) -> str:
     """A variable the browser sends with every chat request, e.g. {{USER_LANGUAGE}}; '' if missing."""
     variables = (metadata or {}).get("variables")
     return str(variables.get(name) or "") if isinstance(variables, dict) else ""
+
+
+def pop_choices(body: dict[str, Any]) -> Any:
+    """Remove the custom parameter from the request: top level, or Ollama's options."""
+    value = body.pop(CHOICES_PARAM, None)
+    options = body.get("options")
+    if isinstance(options, dict) and (in_options := options.pop(CHOICES_PARAM, None)) is not None:
+        value = in_options if value is None else value
+    return value
 
 
 def group_key(name: str) -> str:
@@ -274,9 +290,10 @@ class Filter:
         now: datetime,
         language: str | None = None,
         groups: list[tuple[str, str]] | None = None,
+        choices: dict[str, str] | None = None,
     ) -> str:
         """Compose the system note for the given user and day; groups = the sections of
-        group_profiles that apply to the user."""
+        group_profiles that apply to the user, choices = the user's validated Model Controls picks."""
         language = language or self._language()
         texts = TRANSLATIONS[language]
         head = [texts["marker"]]
@@ -284,7 +301,9 @@ class Filter:
             head.append(texts["company"].format(company=company))
         response_language = self.valves.response_language.strip() or texts["response_language"]
         head.append(texts["language_rule"].format(language=response_language))
-        head.append(texts[self.valves.form_of_address])
+        choices = choices or {}
+        if "address" not in choices:
+            head.append(texts[self.valves.form_of_address])
         if extra_rules := self.valves.extra_rules.strip():
             head.append(extra_rules)
 
@@ -300,7 +319,10 @@ class Filter:
         if facts:
             blocks.append(texts["no_invention"])
 
-        tail = [
+        tail = []
+        if address := choices.get("address"):
+            tail.append(texts[address])
+        tail.append(
             texts["date"].format(
                 weekday=WEEKDAYS[language][now.weekday()],
                 day=now.day,
@@ -308,7 +330,7 @@ class Filter:
                 year=now.year,
                 week=now.isocalendar().week,
             )
-        ]
+        )
         if self.valves.include_user_name and (
             user_name := " ".join(str((user or {}).get("name") or "").split())[:MAX_USER_NAME_CHARS]
         ):
@@ -336,6 +358,34 @@ class Filter:
         if unknown and unknown != reported:
             log.warning("Company Context: group_profiles names groups that do not exist: %s", ", ".join(unknown))
         self._group_check = (self.valves.group_profiles, time.monotonic(), unknown)
+
+    def _choices(self, value: Any) -> dict[str, str]:
+        """The user's picks from the company_context parameter; unknown values are left out (logged once)."""
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            self._warn_once(
+                ("choices", repr(value)[:200]),
+                "Company Context: the custom parameter %s must be an object such as "
+                '{"address": "informal"}, got %r',
+                CHOICES_PARAM,
+                value,
+            )
+            return {}
+        choices = {}
+        for key, choice in value.items():
+            if choice in CHOICES.get(key, ()):
+                choices[key] = choice
+            else:
+                self._warn_once(
+                    ("choice", str(key), repr(choice)[:200]),
+                    "Company Context: unknown %s.%s = %r is left out (allowed: %s)",
+                    CHOICES_PARAM,
+                    key,
+                    choice,
+                    ", ".join(f"{name}: {'/'.join(values)}" for name, values in CHOICES.items()),
+                )
+        return choices
 
     async def _user_groups(self, user: dict[str, Any] | None) -> list[tuple[str, str]]:
         """The sections of group_profiles for the user's groups, in the order of the sections."""
@@ -370,9 +420,10 @@ class Filter:
         __metadata__: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Prepend the note to the system message (or add one); idempotent per request."""
+        choices = self._choices(pop_choices(body))
         messages = body.get("messages") or []
         groups = await self._user_groups(__user__)
-        note = self.build_note(__user__, self._now(__metadata__), self._language(__metadata__), groups)
+        note = self.build_note(__user__, self._now(__metadata__), self._language(__metadata__), groups, choices)
         if len(note) > NOTE_WARN_CHARS:
             self._warn_once(
                 ("size", self.valves.company_profile, self.valves.group_profiles, tuple(name for name, _ in groups)),

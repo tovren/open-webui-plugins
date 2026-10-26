@@ -89,6 +89,32 @@ Holiday requests go through the HR portal; questions to hr@example.com.
 - Groups are the same ones that decide who may use which model or knowledge base. The note is no
   access control of its own: anything in a section reaches every member of that group.
 
+## Each user's choice: form of address
+
+With Open WebUI's **Model Controls** each user can pick the form of address (*Sie* or *du*) for a
+model, with a knobs button next to the model selector. Model Controls came with Open WebUI
+0.12.0; from 0.12.4 on every user of the model can use them, without the Chat Controls permissions or
+the Valves permission (`chat.valves`, which would open the user valves of all plugins). The choice is
+remembered per user and model.
+
+Add the controls in **Workspace → Models → (model) → Edit → Model Controls**. Each option sets the custom
+parameter `company_context`:
+
+| Control | Option | Parameters |
+|---|---|---|
+| Anrede | Sie (default) | `{"company_context": {"address": "formal"}}` |
+| | Du | `{"company_context": {"address": "informal"}}` |
+
+- `address` is `formal` or `informal` and replaces the `form_of_address` valve.
+- The filter takes the parameter out of the request, so it does not reach the model server. If the
+  filter is not active for the model, the parameter is sent along: vLLM ignores unknown fields, other
+  servers may reject the request.
+- The line of a user's choice comes at the end of the note, in front of the date, so the start of the
+  prompt with the company profile stays the same for every user.
+- Values the plugin does not know are left out, with a warning in the log; the valve applies then.
+- Model Controls cannot be set on pipe, direct connection or arena models and are not applied to
+  automation runs. There the valve applies.
+
 ## Install
 
 File: [`company_context.py`](company_context.py). Install it under **Admin Panel → Functions** and
@@ -103,7 +129,7 @@ and `timezone` if all users should get the date of one time zone.
 | `language` | `auto` | Language of the note and date format: `auto` (the user's interface language, English if there is no translation), `en` or `de` |
 | `company_name` | _(empty)_ | Your company name. Empty leaves out the company line |
 | `response_language` | _(empty)_ | Language the assistant should answer in, written in the note's language (e.g. `English`, `Deutsch`, `French`). Empty means the note's language |
-| `form_of_address` | `formal` | `formal` or `informal` (German: *Sie* / *du*), also for texts written for the user |
+| `form_of_address` | `formal` | `formal` or `informal` (German: *Sie* / *du*), also for texts written for the user. A user's choice in the [Model Controls](#each-users-choice-form-of-address) replaces it |
 | `timezone` | _(empty)_ | IANA time zone that determines today's date, e.g. `Europe/Berlin`. Empty means the user's browser time zone, or the server's if the browser sends none (API requests). An unknown name counts as empty |
 | `include_user_name` | `true` | Tell the model the user's display name, e.g. for e-mail signatures |
 | `extra_rules` | _(empty)_ | Additional house rules for the note |
