@@ -38,7 +38,7 @@ from openpyxl import load_workbook
 
 REPO = Path(__file__).resolve().parent.parent
 STUB_JS = Path(__file__).resolve().parent / "browser_stub.js"
-PLUGIN_FILES = ("response_export.py", "context_guard.py", "company_context.py", "reasoning_toggle.py")
+PLUGIN_FILES = ("response_export.py", "context_guard.py", "company_context.py")
 ALLOWED_THIRD_PARTY = {"docx", "openpyxl", "pydantic"}
 LAZY_IMPORTS = {"open_webui"}  # only imported inside functions, when running in Open WebUI
 FRONTMATTER_KEYS = {
@@ -68,7 +68,6 @@ def load_plugin(file_name: str) -> ModuleType:
 rx = load_plugin("response_export.py")
 cg = load_plugin("context_guard.py")
 cc = load_plugin("company_context.py")
-rt = load_plugin("reasoning_toggle.py")
 
 SAMPLE = """<details type="reasoning" done="true"><summary>Thought for 3 seconds</summary>
 SECRET REASONING
@@ -201,7 +200,7 @@ def test_frontmatter(file_name: str) -> None:
     assert set(meta) == FRONTMATTER_KEYS
     assert re.fullmatch(r"\d+\.\d+\.\d+", meta["version"])
     assert meta["license"] == "MIT"
-    assert meta["required_open_webui_version"] == "0.11.4"
+    assert meta["required_open_webui_version"] == "0.12.4"
     assert "Security & privacy" in "\n".join(lines[: lines.index('"""', 1)])
 
 
@@ -1625,8 +1624,7 @@ def test_guard_counts_reasoning_sent_back() -> None:
 MODEL_PROMPT = "You are the e-mail assistant of Example Ltd.\nAlways sign with the company name." * 100
 
 
-@pytest.mark.parametrize("key", ["system_prompt", "base_system_prompt"])  # Open WebUI 0.11.4, 0.12.x
-def test_guard_counts_the_model_system_prompt(key: str) -> None:
+def test_guard_counts_the_model_system_prompt() -> None:
     """Open WebUI adds the model's system prompt only after the request hook (in the router)."""
     chat_prompt = "Answer briefly.\nUse bullet points."
     user = {"role": "user", "content": "Hi"}
@@ -1660,17 +1658,17 @@ def test_guard_counts_the_model_system_prompt(key: str) -> None:
         ([user], None, 0),
     ]
     for messages, prompt, expected in cases:
-        assert cg.missing_system_prompt_chars(messages, {key: prompt}) == expected, (messages, prompt)
+        assert cg.missing_system_prompt_chars(messages, {"base_system_prompt": prompt}) == expected, (messages, prompt)
     assert cg.missing_system_prompt_chars([user], None) == 0
     body = {"model": "m", "messages": [user]}
-    assert cg.estimate_tokens(body, 3.5, 300, {key: MODEL_PROMPT}) - cg.estimate_tokens(
+    assert cg.estimate_tokens(body, 3.5, 300, {"base_system_prompt": MODEL_PROMPT}) - cg.estimate_tokens(
         body, 3.5, 300
     ) == pytest.approx((len(MODEL_PROMPT) + 1) / 3.5, abs=1)
     # blocked only because of the model's prompt
     flt = make_filter(cg, context_tokens=4000, answer_reserve_tokens=2000)  # usable 2000 tokens
     run_guard(flt, body_with_chars(1000))
     with pytest.raises(cg.ContextLimitError):
-        run_guard(flt, body_with_chars(1000), {key: MODEL_PROMPT})
+        run_guard(flt, body_with_chars(1000), {"base_system_prompt": MODEL_PROMPT})
 
 
 def test_guard_workspace_model_uses_base_model_size() -> None:
@@ -1815,15 +1813,11 @@ def test_guard_detects_the_fallback_summary(
     assert "Question one" not in caplog.text and "tiny" not in caplog.text  # no message content
 
 
-@pytest.mark.parametrize(
-    "metadata",
-    [{"base_user_prompt": "x" * 26000}, {"user_message": {"role": "user", "content": "x" * 26000}}],
-)
-def test_guard_names_a_long_pasted_message(metadata: dict[str, Any]) -> None:
-    # 0.12 keeps the typed text in base_user_prompt, 0.11 in user_message
+def test_guard_names_a_long_pasted_message() -> None:
+    # Open WebUI keeps the typed text in base_user_prompt
     flt = make_filter(cg, context_tokens=10000, answer_reserve_tokens=2000, language="de")
     with pytest.raises(cg.ContextLimitError) as error:
-        run_guard(flt, body_with_chars(30000), metadata)
+        run_guard(flt, body_with_chars(30000), {"base_user_prompt": "x" * 26000})
     assert str(error.value).startswith("Ihre Nachricht ist zu lang für das KI-Modell (zusammen mit dem Chat ca. 108 %")
 
 
@@ -2039,15 +2033,12 @@ def test_note_group_sections() -> None:
 
 
 def stub_groups(
-    monkeypatch: pytest.MonkeyPatch, members: dict[str, list[str]], nested: bool = True, fail: bool = False
+    monkeypatch: pytest.MonkeyPatch, members: dict[str, list[str]], fail: bool = False
 ) -> list[str]:
-    """Stands in for open_webui.models.groups.Groups; nested=False behaves like 0.11 (no
-    include_inherited). Returns the list of calls."""
+    """Stands in for open_webui.models.groups.Groups. Returns the list of calls."""
     calls: list[str] = []
 
     async def get_groups_by_member_id(user_id: str, **kwargs: Any) -> list[Any]:
-        if kwargs and not nested:
-            raise TypeError("unexpected keyword argument 'include_inherited'")
         if fail:
             raise RuntimeError("database gone")
         calls.append(f"member {user_id} {kwargs}")
@@ -2102,14 +2093,7 @@ def test_inlet_adds_the_sections_of_the_users_groups(
     assert "gehört zu" not in note
 
 
-def test_inlet_groups_on_open_webui_0_11_and_without_groups(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    calls = stub_groups(monkeypatch, {"u1": ["Vertrieb"]}, nested=False)
-    flt = make_filter(cc, language="de", group_profiles=PROFILES)
-    note = asyncio.run(flt.inlet({"messages": []}, __user__={"id": "u1"}))["messages"][0]["content"]
-    assert "Informationen für Vertrieb:" in note and calls[-1] == "member u1 {}"
-
+def test_inlet_without_groups(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     # the groups cannot be read: the chat goes on without them, one warning
     stub_groups(monkeypatch, {}, fail=True)
     flt = make_filter(cc, group_profiles=PROFILES)
@@ -2290,65 +2274,3 @@ def test_note_language_auto(locale: str, marker: str) -> None:
     assert run_inlet(make_filter(cc), {"messages": []})["messages"][0]["content"].startswith(
         "[Company context]"
     )
-
-
-# ------------------------------------------------------------------------------ reasoning toggle --
-
-
-def run_toggle(flt: Any, body: dict[str, Any], model: dict[str, Any] | None = None) -> dict[str, Any]:
-    return asyncio.run(flt.inlet(body, __model__=model))
-
-
-def test_toggle_button() -> None:
-    flt = rt.Filter()
-    assert flt.toggle is True
-    prefix = "data:image/svg+xml;base64,"
-    assert flt.icon.startswith(prefix)
-    assert base64.b64decode(flt.icon[len(prefix) :]).decode() == rt.ICON_SVG
-
-
-def test_toggle_enables_thinking_and_keeps_other_kwargs() -> None:
-    body = {"model": "m", "messages": [], "chat_template_kwargs": {"enable_thinking": False, "custom": 1}}
-    result = run_toggle(make_filter(rt), body)
-    assert result == {
-        "model": "m",
-        "messages": [],
-        "chat_template_kwargs": {"enable_thinking": True, "custom": 1},
-    }
-    assert run_toggle(make_filter(rt), {"model": "m", "chat_template_kwargs": "broken"})[
-        "chat_template_kwargs"
-    ] == {"enable_thinking": True}
-
-
-@pytest.mark.parametrize(("default", "expected"), [("none", None), ("low", "low")])
-def test_toggle_clears_only_a_none_default(default: str, expected: str | None) -> None:
-    body = run_toggle(make_filter(rt), {"model": "m", "reasoning_effort": default})
-    assert "reasoning_effort" in body and body["reasoning_effort"] == expected
-
-
-def test_toggle_per_model_effort_and_budget(caplog: pytest.LogCaptureFixture) -> None:
-    flt = make_filter(
-        rt,
-        model_reasoning_effort="qwen=XHigh, broken, gemma=none, x=ultra",
-        thinking_budget=2000,
-        model_thinking_budget="qwen=8000, gemma=0, y=abc",
-    )
-    body = run_toggle(flt, {"model": "qwen", "reasoning_effort": "none"})
-    assert body["reasoning_effort"] == "xhigh"
-    assert body["thinking_budget_tokens"] == body["thinking_token_budget"] == 8000
-    # workspace model: settings of its base model apply
-    workspace = {"id": "emails", "info": {"base_model_id": "qwen"}}
-    assert run_toggle(flt, {"model": "emails"}, workspace)["reasoning_effort"] == "xhigh"
-    # per-model budget 0 = no limit, despite the global budget
-    body = run_toggle(flt, {"model": "gemma"})
-    assert not {"reasoning_effort", "thinking_budget_tokens", "thinking_token_budget"} & body.keys()
-    body = run_toggle(flt, {"model": "other"})
-    assert body["thinking_budget_tokens"] == 2000 and "reasoning_effort" not in body
-    for entry in ("broken", "gemma=none", "x=ultra", "y=abc"):
-        assert repr(entry) in caplog.text
-
-
-def test_toggle_model_ids() -> None:
-    assert rt.model_ids({"model": "a"}, {"id": "a", "info": {"base_model_id": "b"}}) == ["a", "b"]
-    assert rt.model_ids({}, None) == []
-    assert rt.model_ids({"model": "a"}, {"info": None}) == ["a"]

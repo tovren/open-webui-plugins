@@ -2,9 +2,9 @@
 title: Response Export
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.3.1
+version: 1.3.2
 license: MIT
-required_open_webui_version: 0.11.4
+required_open_webui_version: 0.12.4
 description: Adds four buttons below every assistant message - export as Word (.docx), export its tables as Excel (.xlsx), download as PDF, and open as an e-mail draft. Files are built in memory and handed straight to the browser; nothing is stored on the server.
 
 Buttons
@@ -200,7 +200,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
 
 # Open WebUI shows action icons as <img>, where currentColor is black, and inverts SVG icons by 80% in
 # dark mode. This grey ends up close to its own buttons in both modes (gray-600 light, gray-500 dark),
-# and the stroke matches their 1.5 in a 28-unit box (0.12.3+).
+# and the stroke matches their 1.5 in a 28-unit box.
 ICON_COLOR = "#5c5c5c"
 ICON_STROKE = 1.3
 

@@ -3,7 +3,7 @@
 An Open WebUI **filter** that estimates the prompt size right before each request is sent to the model
 and warns or stops before the context window overflows.
 
-- Runs on the `request` hook (new in Open WebUI 0.11). It runs **after** document excerpts
+- Runs on the `request` hook. It runs **after** document excerpts
   (RAG/files) have been injected and again after every tool-call round, so everything the model
   will see is counted: also the model's system prompt (Workspace → Models), which Open WebUI only
   adds after this hook, and earlier reasoning that is sent back to the model (`reasoning_content`
@@ -66,9 +66,9 @@ llama-server reports no context size that fits (only the training size), so set 
 At most half the context size is kept free for the answer, so a model with a small context (an
 Ollama `num_ctx` of 4096, say) still gets a check with the default `answer_reserve_tokens` of 6000.
 
-## Built-in tools of Open WebUI 0.12
+## Built-in tools of Open WebUI
 
-From 0.12 on, Open WebUI sends the definitions of its built-in tools (knowledge, memories, notes,
+Open WebUI sends the definitions of its built-in tools (knowledge, memories, notes,
 chats, skills, automations, calendar …) with every chat that is started in the browser: 39 tools
 with about 27,000 characters of JSON in 0.12.0. How many tokens that is depends on the model and its
 chat template. Measured with the same request:
@@ -102,11 +102,10 @@ with the guard:
 - The guard stays the safety net. Compaction skips a turn when no earlier message can be cut off,
   and the summary request contains the whole chat, so after a large paste it can overflow itself.
   The guard then stops the request with its message.
-- Long tool-call loops: Open WebUI 0.12.0 also compacts between the rounds, before the guard checks
-  each round. In 0.11.4 only the guard covers a loop that keeps growing.
-- Since 0.12.4, compaction also runs in temporary chats and in short chats that are already over the
-  threshold (before, chats with up to three messages were never compacted), and the chat shows a
-  "Context compacted" line with the summary. The guard needs no change for this.
+- Long tool-call loops: Open WebUI also compacts between the rounds, before the guard checks each
+  round.
+- Compaction also runs in temporary chats and in short chats that are already over the threshold,
+  and the chat shows a "Context compacted" line with the summary.
 - The summary request contains the whole chat plus the summary prompt (about 500 tokens) and room
   for the summary (`max_tokens` of the task model parameters, 1000 if they set none), so it needs
   about 1500 tokens more than the threshold. It goes to the compaction model if one is set
@@ -123,7 +122,7 @@ the context size**, e.g. `16000` for a 32k model. Compaction is only checked at 
 and the summary request is about as large as the whole chat, so a threshold close to the limit
 leaves too little room.
 
-In Open WebUI 0.11.4 and 0.12.0, running `/compact` right after the guard stopped a request does
+In Open WebUI 0.12.0, running `/compact` right after the guard stopped a request does
 not help: Open WebUI stores the summary on the empty error message and skips that message when it
 builds the next request. That is why the stop message suggests a new chat, not `/compact`.
 

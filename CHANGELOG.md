@@ -2,6 +2,33 @@
 
 Each plugin has its own version (in the header of its file). Earlier changes are in the git history.
 
+## 2026-10-27
+
+All plugins need Open WebUI 0.12.4 or newer (`required_open_webui_version`), which fixes security issues.
+On 0.12.4 nothing changes for users. Reasoning Toggle is removed.
+
+### Before you update
+
+- **Open WebUI 0.11.4 to 0.12.3 are no longer supported.** On those versions, keep the previous
+  versions of the plugins (Office Documents 0.4.3, Response Export 1.3.1, Context Guard 1.4.0, Company
+  Context 1.3.0, Reasoning Toggle 1.0.0), which are in the git history.
+- **Reasoning Toggle is removed.** Since 0.12.4, every user of a model can pick its Model Controls
+  without the Chat Controls permissions, so Open WebUI's own Thinking control does the same job. Add a
+  Thinking control in **Workspace → Models → (model) → Edit → Model Controls**, then switch the filter
+  off or delete it.
+
+### Changes
+
+- Context Guard 1.4.1: reads the model's system prompt and the typed message only where 0.12 keeps
+  them (`base_system_prompt`, `base_user_prompt`); the 0.11 fallbacks are gone.
+- Company Context 1.3.1: always asks Open WebUI for the user's groups including the parent groups of
+  subgroups; the fallback for 0.11 (no subgroups) is gone.
+- Office Documents 0.4.4 and Response Export 1.3.2: only the required version.
+- Office File UI (no version): the two fixes for Open WebUI's previews are gone, because 0.12.4 does it
+  itself: titles and subtitles the file aligns left are shown on the left
+  ([open-webui#32873](https://github.com/open-webui/open-webui/issues/32873)), and the spreadsheet
+  preview is grey in dark mode (fixed in 0.12.3).
+
 ## 2026-10-26
 
 Office Documents 0.4.3 and Company Context 1.3.0. The other plugins are unchanged.

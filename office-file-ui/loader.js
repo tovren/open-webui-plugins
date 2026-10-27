@@ -1,4 +1,4 @@
-// Office File UI for Open WebUI (tested with 0.11.4, 0.12.0 and 0.12.1)
+// Office File UI for Open WebUI (tested with 0.12.4)
 //
 // Open WebUI loads /static/loader.js on every page. For files attached to an answer of the assistant
 // (e.g. by the Office Documents tool) this script
@@ -61,12 +61,7 @@
 		html:not(.dark) button[${MARK}-gone]:hover { background-color: var(--color-gray-50, #f9f9f9); }
 		.dark button[${MARK}-gone]:hover { background-color: var(--color-gray-850, #262626); }
 		button[${MARK}-gone] > * { opacity: 0.45; }
-		html.dark .office-preview { background: transparent; }
-		html.dark .office-preview table th.excel-col-hdr,
-		html.dark .office-preview .excel-row-num { background: var(--color-gray-850, #262626); }
 	`;
-	// In dark mode Open WebUI draws the spreadsheet preview in a blue-violet (#1a1a2e, headers #2a2a3e) instead
-	// of the greys of the rest of the page; the rules above (one element more, so they win) use the greys.
 
 	const decode = (text) => {
 		try {
@@ -473,60 +468,6 @@
 			}
 		}
 	};
-
-	// ------------------------------------------------------------------ PowerPoint preview --
-
-	// Open WebUI's PowerPoint preview draws every paragraph of a title or subtitle placeholder centred unless
-	// it says "ctr" or "r": an explicit "l" (left) is drawn centred as well. The preview reads the slides with
-	// DOMParser, so the slides are corrected right after parsing: a title or subtitle shape with its own
-	// position whose paragraphs all give their alignment is marked as a body placeholder, which the preview
-	// draws as the paragraphs say. The preview only uses the type for the default font size (kept by writing it
-	// into each paragraph) and for the position when the shape has none (such shapes are left alone).
-	const DRAWING_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main';
-	const TITLE_TYPES = { title: 3400, ctrTitle: 3400, subTitle: 2200 }; // the preview's default sizes
-
-	const keepFontSize = (doc, para, size) => {
-		let pPr = para.getElementsByTagName('a:pPr')[0];
-		let defRPr = pPr && pPr.getElementsByTagName('a:defRPr')[0];
-		if (!defRPr) {
-			// the preview takes the paragraph's style from defRPr, else endParaRPr: copy that one
-			defRPr = doc.createElementNS(DRAWING_NS, 'a:defRPr');
-			const end = para.getElementsByTagName('a:endParaRPr')[0];
-			if (end) {
-				for (const attr of Array.from(end.attributes)) defRPr.setAttribute(attr.name, attr.value);
-				for (const child of Array.from(end.childNodes)) defRPr.appendChild(child.cloneNode(true));
-			}
-			pPr.appendChild(defRPr);
-		}
-		if (!defRPr.hasAttribute('sz')) defRPr.setAttribute('sz', String(size));
-	};
-
-	const alignTitles = (doc) => {
-		for (const ph of Array.from(doc.getElementsByTagName('p:ph'))) {
-			const size = TITLE_TYPES[ph.getAttribute('type')];
-			const shape = ph.closest('sp');
-			const body = shape && shape.getElementsByTagName('p:txBody')[0];
-			if (!size || !body || !shape.querySelector('spPr > xfrm')) continue;
-			const paras = Array.from(body.getElementsByTagName('a:p'));
-			const aligned = (para) => para.getElementsByTagName('a:pPr')[0]?.hasAttribute('algn');
-			if (!paras.length || !paras.every(aligned)) continue;
-			for (const para of paras) keepFontSize(doc, para, size);
-			ph.setAttribute('type', 'body');
-		}
-	};
-
-	if (typeof DOMParser !== 'undefined') {
-		const parseFromString = DOMParser.prototype.parseFromString;
-		DOMParser.prototype.parseFromString = function (text, type) {
-			const doc = parseFromString.call(this, text, type);
-			try {
-				if (doc.documentElement?.nodeName === 'p:sld') alignTitles(doc);
-			} catch (error) {
-				console.warn('office-file-ui: slide not adjusted', error);
-			}
-			return doc;
-		};
-	}
 
 	// ------------------------------------------------------------------------------- driver --
 

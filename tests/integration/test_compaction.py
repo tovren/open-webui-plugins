@@ -146,9 +146,6 @@ class OpenWebUI:
     def play(self, contents: list[str]) -> list[Turn]:
         return [self.send(content) for content in contents]
 
-    def version(self) -> tuple[int, ...]:
-        return tuple(int(part) for part in self.api("GET", "/api/version")[1]["version"].split(".")[:3])
-
     def server_log(self) -> str:
         return self.log.read_text(errors="replace")
 
@@ -241,9 +238,6 @@ def test_tool_loop_is_compacted_between_rounds(start) -> None:
     owui.play(turns(2))
     turn = owui.send("Read sections 1 to 8 and summarize them. [tool:8]", tools=True)
     assert not any(call.get("rejected") for call in owui.calls)
-    if owui.version() < (0, 12, 0):  # 0.11 compacts only at the start of a turn: the guard stops the loop
-        assert not turn.kinds("summary") and turn.error.startswith("This request is too large")
-        return
     assert turn.kinds("summary") and not turn.error and not turn.status
     assert len(turn.kinds("chat")) == 9
 

@@ -9,13 +9,11 @@ folder with a README:
 | [Response Export](response-export/) | Action | Adds buttons to export an answer as Word, Excel or PDF, or open it as an e-mail |
 | [Context Guard](context-guard/) | Filter | Warns before the context window overflows and stops the request with a clear message |
 | [Company Context](company-context/) | Filter | Adds company name, date, language, form of address, a short company profile and texts per user group to every request |
-| [Reasoning Toggle](reasoning-toggle/) | Filter (toggle) | Adds a button to the chat input that lets local reasoning models (vLLM, llama-server) think before they answer |
 | [Office File UI](office-file-ui/) | Browser script | Optional: shows files attached to an answer as chips below the text and opens Office files in the preview |
 
 Response Export, Context Guard, Company Context and Office Documents include English and German
 texts (`language` valve); Response Export, Context Guard and Company Context follow the user's
-interface language by default (`auto`). Reasoning Toggle shows no texts of its own. All of
-them use only the Python standard library and libraries that already ship with Open WebUI, so nothing
+interface language by default (`auto`). All of them use only the Python standard library and libraries that already ship with Open WebUI, so nothing
 has to be installed.
 
 What changed in each version, and what to check before updating, is in the [changelog](CHANGELOG.md).
@@ -31,9 +29,7 @@ What changed in each version, and what to check before updating, is in the [chan
 4. Make it active:
    - **Global:** in the function's **⋯** menu, enable **Global** to apply it to all models.
    - **Per model:** in **Workspace → Models → (model) → Edit**, tick the plugin under
-     *Actions* (Response Export) or *Filters* (Context Guard, Company Context, Reasoning Toggle).
-   - Reasoning Toggle is best enabled **per model**, only for models that can reason. Enabled
-     globally, its button also shows up for models where it does nothing.
+     *Actions* (Response Export) or *Filters* (Context Guard, Company Context).
 5. Click the gear icon of the function to set its **Valves** (language, context size, company name …).
 
 Office Documents is a tool, not a function: install it under **Workspace → Tools → +**, set its
@@ -46,21 +42,20 @@ orders several filters on the same hook.
 
 ## Compatibility
 
-- Tested with **Open WebUI 0.11.4** (the version in `required_open_webui_version`). Context Guard
-  needs at least 0.11 because it uses the `request` filter hook. Context Guard was also tested with
-  0.12.0, 0.12.3 and 0.12.4, with and without Context Compaction. The whole test suite passes with
-  Open WebUI 0.12.4 (Python 3.12 and the packages it bundles).
+- Needs **Open WebUI 0.12.4** or newer (the version in `required_open_webui_version`). The whole
+  test suite passes with 0.12.4 (Python 3.12 and the packages it bundles), Context Guard also with
+  Context Compaction. For older versions, use the plugins from before 2026-10-27 (see the
+  [changelog](CHANGELOG.md)).
 - Python 3.11 and 3.12. Response Export was tested with python-docx 1.1.2 and newer, and
   openpyxl 3.1. Office Documents was tested with python-docx 1.2.0, openpyxl 3.1.5 and
-  python-pptx 1.0.2, the versions bundled with Open WebUI 0.11.4.
+  python-pptx 1.0.2, the versions bundled with Open WebUI 0.12.4.
 - No extra packages: everything used is bundled with Open WebUI. The plugins do not depend on
   `ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS`.
 
 ## Tests
 
 The `tests/` folder contains a pytest suite for all plugins (document structure, number formats,
-e-mail/mailto/.eml, PDF layout, both languages, warn/block thresholds, idempotence, reasoning
-parameters per model …):
+e-mail/mailto/.eml, PDF layout, both languages, warn/block thresholds, idempotence …):
 
 ```bash
 python -m venv /tmp/owui-test && /tmp/owui-test/bin/pip install python-docx openpyxl python-pptx pydantic pytest pypdf
@@ -81,12 +76,12 @@ tests take about 40 seconds. They are skipped unless `OWUI_BIN` points to an `op
 executable, which allows checking several versions:
 
 ```bash
-python -m venv /tmp/owui-0120 && /tmp/owui-0120/bin/pip install open-webui==0.12.0
-OWUI_BIN=/tmp/owui-0120/bin/open-webui /tmp/owui-test/bin/python -I -m pytest -q tests/integration
+python -m venv /tmp/owui-0124 && /tmp/owui-0124/bin/pip install open-webui==0.12.4
+OWUI_BIN=/tmp/owui-0124/bin/open-webui /tmp/owui-test/bin/python -I -m pytest -q tests/integration
 ```
 
-The same folder also checks Company Context's `group_profiles` with real groups (in 0.12 with a
-subgroup).
+The same folder also checks Company Context's `group_profiles` with real groups (with a subgroup)
+and its form of address through Model Controls.
 
 Optional checks run when the tools are installed:
 

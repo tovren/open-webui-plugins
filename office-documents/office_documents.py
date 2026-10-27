@@ -2,9 +2,9 @@
 title: Office Documents
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 0.4.3
+version: 0.4.4
 license: MIT
-required_open_webui_version: 0.11.4
+required_open_webui_version: 0.12.4
 description: Lets the model create Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) files. The model only supplies the content as structured JSON; fixed code builds the file, so no model-written code is ever run. The file is attached to the answer, where it can be previewed and downloaded.
 
 Tools
@@ -5350,7 +5350,7 @@ class Context:
 async def attach_file(data: bytes, filename: str, mime: str, ctx: Context, text: str = "") -> None:
     """Store the file in Open WebUI's file storage for the user and attach it to the current answer.
 
-    Uses the same internal functions as Open WebUI's built-in image generation (0.11.4).
+    Uses the same internal functions as Open WebUI's built-in image generation (0.12.4).
     """
     from open_webui.models.chats import Chats
     from open_webui.models.files import Files

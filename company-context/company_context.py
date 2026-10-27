@@ -2,9 +2,9 @@
 title: Company Context
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.3.0
+version: 1.3.1
 license: MIT
-required_open_webui_version: 0.11.4
+required_open_webui_version: 0.12.4
 description: Adds a short system note to every request with your company name, today's date and calendar week, the response language, the form of address, the user's name, your own house rules, a short company profile and texts for single user groups (e.g. departments) - the same for every model and assistant, including newly created ones.
 
 How it works
@@ -23,13 +23,13 @@ How it works
 - The parts that are the same for everybody come first (rules, company profile), then the texts
   of the user's groups, then the date and the user's name. So the model server can share the
   cached start of the prompt between all users, and between the members of a group.
-- Each user can pick the form of address per model, through Open WebUI's Model Controls (0.12.0,
-  for every user from 0.12.4): an option sets the custom parameter company_context, e.g.
+- Each user can pick the form of address per model, through Open WebUI's Model Controls (open to
+  every user of the model): an option sets the custom parameter company_context, e.g.
   {"address": "informal"}. The filter takes it out of the request, so it never reaches the model
   server, and writes that line at the end of the note, in front of the date: the start of the prompt
   stays the same for all users.
 - group_profiles holds one section per group, headed "## <group name>". A user gets the sections
-  of the groups they belong to (in Open WebUI 0.12 also through a subgroup), in the order of the
+  of the groups they belong to (also through a subgroup), in the order of the
   sections. Section names that match no group are written to the log once.
 
 Security & privacy
@@ -178,14 +178,11 @@ def parse_group_profiles(text: str) -> tuple[list[tuple[str, str]], bool]:
 
 
 async def member_group_names(user_id: str) -> list[str]:
-    """Names of the user's groups, with the parent groups of their groups (0.12). Raises if Open
-    WebUI's groups are not available."""
+    """Names of the user's groups, with the parent groups of their groups. Raises if Open WebUI's
+    groups are not available."""
     from open_webui.models.groups import Groups
 
-    try:
-        groups = await Groups.get_groups_by_member_id(user_id, include_inherited=True)
-    except TypeError:  # 0.11: no nested groups, no include_inherited
-        groups = await Groups.get_groups_by_member_id(user_id)
+    groups = await Groups.get_groups_by_member_id(user_id, include_inherited=True)
     return [str(getattr(group, "name", "") or "") for group in groups]
 
 

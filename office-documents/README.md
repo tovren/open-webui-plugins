@@ -320,5 +320,5 @@ With the `word_template` valve, Word documents are built on a company file, e.g.
   once with the 31B model via an API. The tool rejects such calls, so the model sends them again instead of
   a file with missing text.
 - **Uses Open WebUI internals.** Attaching the file relies on the same internal functions as Open
-  WebUI's built-in image generation (0.11.4). If they change in a later version, the tool falls back
+  WebUI's built-in image generation (0.12.4). If they change in a later version, the tool falls back
   to a browser download.

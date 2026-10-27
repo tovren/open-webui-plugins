@@ -2,13 +2,13 @@
 title: Context Guard
 author: tovren
 author_url: https://github.com/tovren/open-webui-plugins
-version: 1.4.0
+version: 1.4.1
 license: MIT
-required_open_webui_version: 0.11.4
+required_open_webui_version: 0.12.4
 description: Estimates the prompt size right before each request is sent to the model - after document excerpts and tool results have been added - and shows a warning or stops with a clear, friendly message before the model's context window overflows.
 
 How it works
-- Runs on the "request" hook (new in Open WebUI 0.11), i.e. after file/RAG context has been
+- Runs on the "request" hook, i.e. after file/RAG context has been
   injected and again after every tool-call round. The model's system prompt, which Open WebUI only
   adds after this hook, and earlier reasoning sent back to the model are counted too.
 - Shows a status hint above the answer once the prompt uses warn_percent of the usable context
@@ -62,7 +62,7 @@ SUMMARY_MARKER = "[CONVERSATION SUMMARY]\n"
 # Open WebUI's fallback when the summary request fails: "- role: first 500 characters" per message
 FALLBACK_SUMMARY_LINE = re.compile(r"^- (?:user|assistant|system|tool): ", re.MULTILINE)
 
-# The error box of Open WebUI (0.11, 0.12) shows plain text without line breaks, so the messages are
+# The error box of Open WebUI shows plain text without line breaks, so the messages are
 # written as flowing text.
 TRANSLATIONS: dict[str, dict[str, str]] = {
     "en": {
@@ -138,11 +138,10 @@ def _text(content: Any) -> str:
 def missing_system_prompt_chars(messages: list[Any], metadata: dict[str, Any] | None) -> int:
     """Characters of the model's system prompt that Open WebUI adds only after the request hook.
 
-    Before the hook Open WebUI stores "model prompt\nsystem message" in the metadata (0.11:
-    system_prompt, 0.12: base_system_prompt); the router puts the model prompt in front of the
-    system message later. In tool-call rounds the body already contains it."""
-    metadata = metadata or {}
-    prompt = metadata.get("base_system_prompt") or metadata.get("system_prompt")
+    Before the hook Open WebUI stores "model prompt\nsystem message" in the metadata
+    (base_system_prompt); the router puts the model prompt in front of the system message later.
+    In tool-call rounds the body already contains it."""
+    prompt = (metadata or {}).get("base_system_prompt")
     if not isinstance(prompt, str) or not prompt:
         return 0
     system = next((m for m in messages if isinstance(m, dict) and m.get("role") == "system"), None)
@@ -185,13 +184,8 @@ def estimate_tokens(
 
 def typed_message_chars(metadata: dict[str, Any] | None) -> int:
     """Characters of the message the user typed, before Open WebUI added document excerpts to it
-    (0.12: base_user_prompt, 0.11: user_message); 0 if unknown."""
-    metadata = metadata or {}
-    user_message = metadata.get("user_message")
-    content = metadata.get("base_user_prompt") or (
-        user_message.get("content") if isinstance(user_message, dict) else None
-    )
-    return _content_size(content)[0]
+    (base_user_prompt); 0 if unknown."""
+    return _content_size((metadata or {}).get("base_user_prompt"))[0]
 
 
 def has_fallback_summary(messages: list[Any]) -> bool:
@@ -286,7 +280,7 @@ class Compaction:
 async def compaction_settings(metadata: dict[str, Any] | None) -> Compaction | None:
     """Open WebUI's Context Compaction for this request, None if it is off.
 
-    Resolved like open_webui.utils.context_compaction (0.11.4 to 0.12.4): the model's
+    Resolved like open_webui.utils.context_compaction (0.12.4): the model's
     compact_token_threshold or the global threshold (default 80000), capped by the token cap; the
     summary is written by the compaction model if one is set, with the task model parameters."""
     try:

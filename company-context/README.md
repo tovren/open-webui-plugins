@@ -78,8 +78,8 @@ Holiday requests go through the HR portal; questions to hr@example.com.
 ## Warehouse
 ```
 
-- A user gets the sections of the groups they belong to, in the order of the sections. In Open WebUI
-  0.12 a member of a subgroup also gets the section of its parent group.
+- A user gets the sections of the groups they belong to, in the order of the sections. A member of a
+  subgroup also gets the section of its parent group.
 - Group names are compared without regard to case and extra spaces.
 - A heading without text only tells the model that the user belongs to the group (with
   `include_group_names` on), which already helps it to fit its answers to the department.
@@ -92,9 +92,8 @@ Holiday requests go through the HR portal; questions to hr@example.com.
 ## Each user's choice: form of address
 
 With Open WebUI's **Model Controls** each user can pick the form of address (*Sie* or *du*) for a
-model, with a knobs button next to the model selector. Model Controls came with Open WebUI
-0.12.0; from 0.12.4 on every user of the model can use them, without the Chat Controls permissions or
-the Valves permission (`chat.valves`, which would open the user valves of all plugins). The choice is
+model, with a knobs button next to the model selector. Every user of the model can use them, without
+the Chat Controls permissions or the Valves permission (`chat.valves`, which would open the user valves of all plugins). The choice is
 remembered per user and model.
 
 Add the controls in **Workspace → Models → (model) → Edit → Model Controls**. Each option sets the custom

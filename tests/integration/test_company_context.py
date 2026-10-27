@@ -1,5 +1,5 @@
-"""Company Context's group_profiles with the groups of a real Open WebUI (0.11: flat groups,
-0.12: subgroups count for their parent group). Uses the harness of test_compaction.py:
+"""Company Context's group_profiles with the groups of a real Open WebUI (subgroups count for
+their parent group). Uses the harness of test_compaction.py:
 
     OWUI_BIN=/path/to/venv/bin/open-webui python -I -m pytest -q tests/integration
 """
@@ -45,9 +45,9 @@ def test_group_profiles_follow_the_users_groups(start) -> None:
     system = owui.send("Hallo").kinds("chat")[0]["system"]
     assert "Informationen zur Firma:\nStandorte: Stuttgart, Ulm" in system and "Informationen für" not in system
 
-    sales = create_group(owui, "Vertrieb", [] if owui.version() >= (0, 12) else [user_id])
-    if owui.version() >= (0, 12):  # a member of a subgroup counts as a member of its parent group
-        create_group(owui, "Vertrieb Süd", [user_id], parent=sales)
+    sales = create_group(owui, "Vertrieb", [])
+    # a member of a subgroup counts as a member of its parent group
+    create_group(owui, "Vertrieb Süd", [user_id], parent=sales)
     create_group(owui, "personal", [user_id])
     system = owui.send("Noch einmal").kinds("chat")[0]["system"]
     assert "Informationen für Vertrieb:\nPreisliste: P:/Vertrieb\n\nInformationen für Personal:" in system
@@ -73,8 +73,6 @@ CONTROLS = {
 
 def test_model_controls_pick_the_form_of_address(start) -> None:
     owui = start()
-    if owui.version() < (0, 12):
-        return  # Model Controls came with 0.12.0
     install_company_context(owui)
     owui.api("GET", "/api/models")  # fills the model list the model check needs
     model = {"id": "assistent", "base_model_id": "mock-8k", "name": "Assistent", "meta": {},
